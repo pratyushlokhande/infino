@@ -11,8 +11,9 @@
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
 use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
-use crate::superfile::vector::distance::{Metric, distance_bytes};
+use crate::superfile::vector::distance::{Metric, Sq8Kernel, distance_bytes, distance_bytes_codec};
 use crate::superfile::vector::quant::BitQuantizer;
+use crate::superfile::vector::rerank_codec::RerankCodec;
 use crate::superfile::vector::rotation::RandomRotation;
 use crate::superfile::{ReadError, error::VectorError};
 use bytes::Bytes;
@@ -28,15 +29,45 @@ const DIR_ENTRY_SIZE: usize = 64;
 const SUB_HEADER_SIZE: usize = 56;
 
 /// JSON-deserialized form of one entry in `inf.vec.columns`. The KV
-/// value is a JSON array of these in declaration order.
+/// value is a JSON array of these in declaration order. Mirrors
+/// the build-time [`VectorConfig`] but with `metric` as a string
+/// so serde can read it straight from the KV blob.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VectorColumnConfig {
-    pub name: String,
+    pub column: String,
     pub dim: usize,
     pub n_cent: usize,
     pub rot_seed: u64,
     /// `"l2sq"`, `"cosine"`, or `"negdot"`.
     pub metric: String,
+}
+
+/// Sq8 quantizer state materialised from the on-disk `codec_meta`
+/// region at open time. The reader picks the candidate's cluster
+/// slice of `scale` / `offset` and passes it into [`Sq8Kernel::new`]
+/// once per (query, cluster) pair to build the per-query precomputes.
+///
+/// Per-cluster (not per-column) quantizer: each IVF cluster
+/// owns its own `(scale[dim], offset[dim])` pair, packed
+/// contiguously cluster-by-cluster. Per-cluster quantization avoids
+/// stretching 256 buckets over the whole column when the rerank signal
+/// lives inside much narrower IVF clusters.
+#[derive(Debug, Clone)]
+pub(super) struct Sq8ColumnMeta {
+    /// Per-cluster, per-dim quantizer scale. Length =
+    /// `n_cent × dim`, laid out cluster-major: cluster `c`'s
+    /// scale array is `scale[c·dim .. (c+1)·dim]`.
+    /// `x_decoded[d] = code[d] * scale[c·dim + d] + offset[c·dim + d]`
+    /// for a doc in cluster `c`.
+    pub scale: Vec<f32>,
+    /// Per-cluster, per-dim quantizer offset. Same layout as `scale`.
+    pub offset: Vec<f32>,
+    /// Per-doc `Σ_d x_decoded²`, length == n_docs, indexed by
+    /// position-in-full (matches the rerank shortlist's `pos`
+    /// field). `Some` for L2Sq columns; `None` for Cosine /
+    /// NegDot (the `Σx²` term cancels out of those distance
+    /// formulas).
+    pub per_doc_norms: Option<Vec<f32>>,
 }
 
 /// Per-column reader state; cached at open time.
@@ -48,6 +79,11 @@ pub struct ColumnReader {
     pub n_docs: u32,
     pub metric: Metric,
     pub rot_seed: u64,
+    /// On-disk rerank codec for this column.
+    pub rerank_codec: RerankCodec,
+    /// `Sq8`-only quantizer metadata, materialised at open time from
+    /// the `codec_meta` region. `None` for every other codec.
+    pub(super) sq8_meta: Option<Sq8ColumnMeta>,
     /// Byte range of this column's subsection within the outer blob.
     subsection_range: Range<usize>,
     /// Offsets relative to the subsection start.
@@ -56,6 +92,10 @@ pub struct ColumnReader {
     centroids_off: usize,
     cluster_idx_off: usize,
     codes_off: usize,
+    /// Relative offset of the per-column `codec_meta` region inside
+    /// the subsection. `0` means "no codec_meta in this subsection".
+    #[allow(dead_code)]
+    codec_meta_off: usize,
     full_off: usize,
     doc_ids_off: usize,
     quant: BitQuantizer,
@@ -408,20 +448,36 @@ impl VectorReader {
             let rot_seed = read_u64_le(&dir_bytes[entry_off + 16..entry_off + 24]);
             let subsection_off = read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
             let subsection_len = read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
-            // bytes [40..48] = summary_offset (absolute), [48..52] = summary_length, then padding
+            // bytes [40..48] = summary_offset (absolute), [48..52] = summary_length,
+            // [52..56] = codec_id (1) + reserved (3)
             let _summary_off_abs = read_u64_le(&dir_bytes[entry_off + 40..entry_off + 48]);
+            let codec_id = dir_bytes[entry_off + 52];
+            let rerank_codec = RerankCodec::from_codec_id(codec_id).ok_or_else(|| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' has unknown rerank-codec id {codec_id} \
+                     (known ids: 0=fp32, 1=bf16, 2=sq8, 3=none)",
+                    cfg.column
+                )))
+            })?;
+            if !rerank_codec.is_implemented() {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' uses rerank codec {} which is not implemented by this version",
+                    cfg.column,
+                    rerank_codec.name()
+                ))));
+            }
 
             // Validate against JSON.
             if dim != cfg.dim {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' dim mismatch: dir={dim} json={}",
-                    cfg.name, cfg.dim
+                    cfg.column, cfg.dim
                 ))));
             }
             if rot_seed != cfg.rot_seed {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' rot_seed mismatch",
-                    cfg.name
+                    cfg.column
                 ))));
             }
             let metric = match metric_id {
@@ -431,7 +487,7 @@ impl VectorReader {
                 _ => {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "unknown metric_id {metric_id} for column '{}'",
-                        cfg.name
+                        cfg.column
                     ))));
                 }
             };
@@ -461,7 +517,8 @@ impl VectorReader {
 
             // Sub-header parse (SUB_HEADER_SIZE = 56 bytes):
             //   [8..12]  version  (cross-checked against outer header)
-            //   [12..16] reserved
+            //   [12..16] codec_meta_off (former reserved slot; zero
+            //            for Fp32 and legacy fp32 segments).
             //   [16..24] summary_centroid_offset (relative to sub start)
             //   [24..28] summary_radius_x100
             //   [28..32] reserved
@@ -469,12 +526,30 @@ impl VectorReader {
             //   [40..48] cluster_idx_offset
             //   [48..52] codes_offset
             //   [52..56] full_offset
+            let codec_meta_off = read_u32_le(&sub[12..16]) as usize;
             let summary_off = read_u64_le(&sub[16..24]) as usize;
             let summary_radius_x100 = read_u32_le(&sub[24..28]);
             let centroids_off = read_u64_le(&sub[32..40]) as usize;
             let cluster_idx_off = read_u64_le(&sub[40..48]) as usize;
             let codes_off = read_u32_le(&sub[48..52]) as usize;
             let full_off = read_u32_le(&sub[52..56]) as usize;
+            // Fp32 + Bf16 + RabitqOnly all keep zero-byte codec_meta; Sq8
+            // emits per-cluster scale/offset (+ per-doc
+            // norms for L2Sq/Cosine). The per-codec layout check below
+            // validates the declared `codec_meta_off` against the
+            // codec's expected size once `col_n_docs` is known.
+            let codec_meta_required_zero = matches!(
+                rerank_codec,
+                RerankCodec::Fp32 | RerankCodec::Bf16 | RerankCodec::RabitqOnly
+            );
+            if codec_meta_required_zero && codec_meta_off != 0 {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' has codec_meta_off={codec_meta_off} for codec {}; \
+                     fp32/bf16/rabitq_only must write codec_meta_off=0 (zero-byte meta region)",
+                    cfg.column,
+                    rerank_codec.name()
+                ))));
+            }
 
             let summary_radius = (summary_radius_x100 as f32) / 100.0;
 
@@ -484,25 +559,83 @@ impl VectorReader {
             // cluster_idx + codes + full + doc_ids.
             let quant = BitQuantizer::new(dim);
             let code_bytes = quant.code_bytes();
-            // We can derive n_docs from the cluster index: sum of counts
-            // across clusters. Or from the layout: doc_ids region size
-            // / 4. Let's compute from doc_ids region:
-            //   doc_ids_size = sub.len() - 4 - doc_ids_off
-            // But we need doc_ids_off first. Use full_off + full_size:
-            // that requires n_docs, circular. Instead derive from
-            // codes region: codes region size = full_off - codes_off,
-            // and codes region size = n_docs * code_bytes.
-            let codes_size = full_off - codes_off;
+            // Derive `n_docs` from the codes region size. The codes
+            // region is [codes_off, end_of_codes), where end_of_codes
+            // is either `codec_meta_off` (Sq8) or `full_off` (Fp32 /
+            // Bf16 — no codec_meta region between codes and full).
+            let end_of_codes = if codec_meta_off != 0 {
+                if codec_meta_off <= codes_off || codec_meta_off > full_off {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "column '{}' has codec_meta_off={codec_meta_off} outside \
+                         (codes_off={codes_off}, full_off={full_off}]",
+                        cfg.column
+                    ))));
+                }
+                codec_meta_off
+            } else {
+                full_off
+            };
+            let codes_size = end_of_codes - codes_off;
             if code_bytes == 0 || !codes_size.is_multiple_of(code_bytes) {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' codes size {codes_size} not divisible by {code_bytes}",
-                    cfg.name
+                    cfg.column
                 ))));
             }
             let col_n_docs = (codes_size / code_bytes) as u32;
 
-            let full_size = (col_n_docs as usize) * dim * 4;
+            // `full[]` byte stride depends on the column's rerank codec.
+            // Centroids stay fp32 regardless (only the per-doc rerank
+            // region compresses).
+            let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
+            let full_size = (col_n_docs as usize) * per_vec_bytes;
             let doc_ids_off = full_off + full_size;
+
+            let expected_codec_meta_size =
+                rerank_codec.codec_meta_bytes(dim, col_n_docs as usize, n_cent as usize, metric);
+            let actual_codec_meta_size = if codec_meta_off != 0 {
+                full_off - codec_meta_off
+            } else {
+                0
+            };
+            if actual_codec_meta_size != expected_codec_meta_size {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' codec_meta region is {actual_codec_meta_size} bytes \
+                     on disk, but codec {} / metric {metric:?} expects \
+                     {expected_codec_meta_size} bytes",
+                    cfg.column,
+                    rerank_codec.name()
+                ))));
+            }
+
+            // Materialise Sq8 codec_meta (per-cluster scale + offset
+            // plus optional per-doc norms) at open time. Parse through
+            // `f32::from_le_bytes` because the codec_meta region is not
+            // guaranteed to be 4-byte aligned for all dimensions.
+            let sq8_meta = if rerank_codec == RerankCodec::Sq8 {
+                let meta_start = codec_meta_off;
+                let meta_end = meta_start + actual_codec_meta_size;
+                let meta_bytes = &sub[meta_start..meta_end];
+                let so_block_bytes = (n_cent as usize) * dim * 4;
+                let scale_end = so_block_bytes;
+                let offset_end = scale_end + so_block_bytes;
+                let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
+                let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
+                let per_doc_norms = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
+                    let norms_end = offset_end + (col_n_docs as usize) * 4;
+                    debug_assert_eq!(norms_end, actual_codec_meta_size);
+                    Some(parse_f32_le_vec(&meta_bytes[offset_end..norms_end]))
+                } else {
+                    None
+                };
+                Some(Sq8ColumnMeta {
+                    scale,
+                    offset,
+                    per_doc_norms,
+                })
+            } else {
+                None
+            };
 
             // Bounds-check the cluster_idx + doc_ids regions without
             // reading them. Search carries `pos = off + i` inline
@@ -513,14 +646,14 @@ impl VectorReader {
             if cluster_idx_end > sub_crc_pos {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' cluster index runs past subsection",
-                    cfg.name
+                    cfg.column
                 ))));
             }
             let doc_ids_size = (col_n_docs as usize) * 4;
             if doc_ids_off + doc_ids_size > sub_crc_pos {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' doc_ids region runs past subsection",
-                    cfg.name
+                    cfg.column
                 ))));
             }
 
@@ -536,29 +669,32 @@ impl VectorReader {
             {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' metric mismatch: dir={metric:?} json={}",
-                    cfg.name, cfg.metric
+                    cfg.column, cfg.metric
                 ))));
             }
 
             columns.push(ColumnReader {
-                name: cfg.name.clone(),
+                name: cfg.column.clone(),
                 dim,
                 n_cent,
                 n_docs: col_n_docs,
                 metric,
                 rot_seed,
+                rerank_codec,
+                sq8_meta,
                 subsection_range: subsection_off..sub_end,
                 summary_off,
                 summary_radius,
                 centroids_off,
                 cluster_idx_off,
                 codes_off,
+                codec_meta_off,
                 full_off,
                 doc_ids_off,
                 quant,
                 rot: RandomRotation::new(dim, rot_seed),
             });
-            column_id_by_name.insert(cfg.name.clone(), i as u32);
+            column_id_by_name.insert(cfg.column.clone(), i as u32);
         }
 
         Ok(VectorReader {
@@ -641,7 +777,10 @@ impl VectorReader {
         if !validated {
             return Ok(Vec::new());
         }
-        let dim_bytes = col.dim * 4;
+        // Centroids are always fp32 (4 bytes/dim) regardless of codec.
+        // `full[]` (rerank candidates) is codec-dependent.
+        let centroid_stride = col.dim * 4;
+        let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
         let sub_start = col.subsection_range.start;
 
         // 1. Centroids region. `n_cent × dim × 4` bytes,
@@ -651,7 +790,7 @@ impl VectorReader {
         //    Source::Lazy bridges to async range() via the
         //    sync→async pattern in Source::get_range.
         let centroids_start = sub_start + col.centroids_off;
-        let centroids_end = centroids_start + (col.n_cent as usize) * dim_bytes;
+        let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
         let centroids = self
             .source
             .get_range(centroids_start..centroids_end)
@@ -676,10 +815,14 @@ impl VectorReader {
         col.rot.apply(query, &mut q_rot);
 
         // 5. Per-cluster fetches (codes + doc_ids) and shortlist
-        //    build. Shortlist tuple is (doc_id, estimate, pos);
-        //    pos = off + i is captured inline.
+        //    build. Shortlist tuple is (doc_id, estimate, pos,
+        //    cluster_id); pos = off + i and cluster_id are
+        //    captured inline at no extra fetch cost. cluster_id
+        //    is consumed by the per-cluster Sq8 rerank dispatch to
+        //    pick each candidate's quantizer; Fp32/Bf16/None
+        //    rerank paths ignore it.
         let cb = col.quant.code_bytes();
-        let mut shortlist: Vec<(u32, f32, u32)> = Vec::new();
+        let mut shortlist: Vec<(u32, f32, u32, u32)> = Vec::new();
         for &(c, _) in &centroid_scores {
             let (off, cnt) = read_cluster_entry(&cluster_idx, c);
             if cnt == 0 {
@@ -702,10 +845,34 @@ impl VectorReader {
                 &doc_ids,
                 cnt,
                 off,
+                c as u32,
                 &col.quant,
                 &q_rot,
                 &mut shortlist,
             );
+        }
+
+        if shortlist.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // `None` columns have no `full[]` region to refine against:
+        // the 1-bit shortlist is the final ranking. Return sign-flipped
+        // estimates so the public `(doc_id, distance)` convention still
+        // means smaller is closer.
+        if !col.rerank_codec.writes_full() {
+            let _ = rerank_mult;
+            if shortlist.len() > k {
+                shortlist.select_nth_unstable_by(k - 1, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                });
+                shortlist.truncate(k);
+            }
+            shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            return Ok(shortlist
+                .into_iter()
+                .map(|(did, est, _pos, _c)| (did, -est))
+                .collect());
         }
 
         // 6. Trim to `k × rerank_mult` by descending estimate.
@@ -716,9 +883,6 @@ impl VectorReader {
             });
             shortlist.truncate(want);
         }
-        if shortlist.is_empty() {
-            return Ok(Vec::new());
-        }
 
         // 7. Fat range over `full[]` covering all rerank
         //    candidates. `[min_pos..max_pos + 1]` over-fetches
@@ -728,7 +892,7 @@ impl VectorReader {
         //    ranges. Single get_range either way.
         let mut min_pos = shortlist[0].2;
         let mut max_pos = shortlist[0].2;
-        for &(_, _, pos) in &shortlist[1..] {
+        for &(_, _, pos, _) in &shortlist[1..] {
             if pos < min_pos {
                 min_pos = pos;
             }
@@ -736,16 +900,20 @@ impl VectorReader {
                 max_pos = pos;
             }
         }
-        let full_start = sub_start + col.full_off + (min_pos as usize) * dim_bytes;
-        let full_end = sub_start + col.full_off + ((max_pos as usize) + 1) * dim_bytes;
+        let full_start = sub_start + col.full_off + (min_pos as usize) * full_vec_bytes;
+        let full_end = sub_start + col.full_off + ((max_pos as usize) + 1) * full_vec_bytes;
         let full_run = self
             .source
             .get_range(full_start..full_end)
             .map_err(|e| VectorError::LazySource(e.to_string()))?;
 
-        // 8. CPU-only rerank using the true metric.
+        // 8. CPU-only rerank using the true metric. Sq8 columns
+        //    pre-build a per-query kernel that folds the per-dim
+        //    scale/offset into the query (one `dim/8` SIMD pass);
+        //    the per-doc inner step is then a plain u8→f32 widen
+        //    + SIMD dot. Fp32/Bf16 take the flat dispatch.
         Ok(rerank_candidates_in_run(
-            &full_run, min_pos, &shortlist, col.metric, col.dim, query, k,
+            &full_run, min_pos, &shortlist, col, query, k,
         ))
     }
 
@@ -788,10 +956,13 @@ impl VectorReader {
 /// helper through the same shape.
 #[inline]
 fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) -> Vec<(usize, f32)> {
-    let dim_bytes = col.dim * 4;
+    // Centroids are stored as fp32 regardless of the column's rerank
+    // codec — only the per-doc `full[]` region compresses. `distance_bytes`
+    // assumes fp32, which is correct here.
+    let centroid_stride = col.dim * 4;
     let mut scores: Vec<(usize, f32)> = (0..col.n_cent as usize)
         .map(|c| {
-            let bytes = &centroids_bytes[c * dim_bytes..(c + 1) * dim_bytes];
+            let bytes = &centroids_bytes[c * centroid_stride..(c + 1) * centroid_stride];
             (c, distance_bytes(col.metric, query, bytes))
         })
         .collect();
@@ -800,19 +971,26 @@ fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) ->
 }
 
 /// Score one cluster's 1-bit codes against the rotated query and
-/// append `(doc_id, estimate, pos_in_full)` tuples to `shortlist`.
-/// `pos = off + i` is the candidate's index in the column's
-/// `full[]` array — captured here at no extra cost so the rerank
-/// step doesn't need any lookup table.
+/// append `(doc_id, estimate, pos_in_full, cluster_id)` tuples to
+/// `shortlist`. `pos = off + i` is the candidate's index in the
+/// column's `full[]` array — captured here at no extra cost so the
+/// rerank step doesn't need any lookup table. `cluster_id` is
+/// captured for the per-cluster Sq8 rerank dispatch: each candidate
+/// knows which cluster's `(scale, offset)` quantizer to dequant
+/// against. For Fp32/Bf16/None the cluster_id is recorded but
+/// ignored by the rerank step (kept for layout simplicity — the
+/// extra 4 bytes per shortlist entry are noise next to the
+/// `k × rerank_mult` heap traffic).
 #[inline]
 fn score_cluster_codes(
     cluster_codes: &[u8],
     cluster_doc_ids: &[u8],
     cnt: u32,
     off: u32,
+    cluster_id: u32,
     quant: &BitQuantizer,
     q_rot: &[f32],
-    shortlist: &mut Vec<(u32, f32, u32)>,
+    shortlist: &mut Vec<(u32, f32, u32, u32)>,
 ) {
     let cb = quant.code_bytes();
     for i in 0..cnt as usize {
@@ -824,7 +1002,7 @@ fn score_cluster_codes(
             cluster_doc_ids[i * 4 + 2],
             cluster_doc_ids[i * 4 + 3],
         ]);
-        shortlist.push((did, est, off + i as u32));
+        shortlist.push((did, est, off + i as u32, cluster_id));
     }
 }
 
@@ -853,34 +1031,93 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 /// `(doc_id, distance)` pairs sorted by ascending distance.
 ///
 /// `full_run` is a contiguous run of `full[]` bytes covering at
-/// least the byte range `[base_pos × dim × 4 .. (max_pos + 1) ×
-/// dim × 4)` — every candidate's `pos` in `shortlist` must lie in
-/// `[base_pos, base_pos + full_run.len() / (dim × 4))`. For the
-/// sync path, `base_pos = 0` and `full_run` is the column's whole
-/// `full[]` slice; for the async path, `base_pos = min(pos)` and
-/// `full_run` is the per-query fat range. Zero-copy SIMD via
-/// `distance_bytes` over each candidate's slice.
+/// least the byte range `[base_pos × stride .. (max_pos + 1) ×
+/// stride)`, where `stride = col.rerank_codec.per_vector_bytes(
+/// col.dim)` — every candidate's `pos` in `shortlist` must lie
+/// in `[base_pos, base_pos + full_run.len() / stride)`. For the
+/// sync path, `base_pos = 0` and `full_run` is the column's
+/// whole `full[]` slice; for the async path, `base_pos =
+/// min(pos)` and `full_run` is the per-query fat range.
+///
+/// Dispatches on `col.rerank_codec`:
+/// - **Fp32 / Bf16**: flat dispatch via [`distance_bytes_codec`]
+///   (fp32 zero-copy SIMD or bf16-widen SIMD).
+/// - **Sq8**: builds a per-query [`Sq8Kernel`] from the column's
+///   `codec_meta` once (folds scale/offset into the query so the
+///   per-doc inner step is a plain u8→f32 widen + SIMD dot;
+///   per-doc decoded-norm cached at encode time short-circuits
+///   `Σx²` for L2Sq).
 #[inline]
 fn rerank_candidates_in_run(
     full_run: &[u8],
     base_pos: u32,
-    shortlist: &[(u32, f32, u32)],
-    metric: Metric,
-    dim: usize,
+    shortlist: &[(u32, f32, u32, u32)],
+    col: &ColumnReader,
     query: &[f32],
     k: usize,
 ) -> Vec<(u32, f32)> {
-    let dim_bytes = dim * 4;
-    let mut reranked: Vec<(u32, f32)> = shortlist
-        .iter()
-        .map(|&(did, _, pos)| {
-            let local = (pos - base_pos) as usize;
-            let start = local * dim_bytes;
-            let bytes = &full_run[start..start + dim_bytes];
-            let d = distance_bytes(metric, query, bytes);
-            (did, d)
-        })
-        .collect();
+    let stride = col.rerank_codec.per_vector_bytes(col.dim);
+    let mut reranked: Vec<(u32, f32)> = match col.rerank_codec {
+        RerankCodec::Fp32 | RerankCodec::Bf16 => shortlist
+            .iter()
+            .map(|&(did, _, pos, _)| {
+                let local = (pos - base_pos) as usize;
+                let start = local * stride;
+                let bytes = &full_run[start..start + stride];
+                let d = distance_bytes_codec(col.metric, col.rerank_codec, query, bytes);
+                (did, d)
+            })
+            .collect(),
+        RerankCodec::Sq8 => {
+            // Per-cluster Sq8: each candidate's cluster_id selects
+            // a `(scale[dim], offset[dim])` slice from the column
+            // meta. We build a fresh per-cluster `Sq8Kernel`
+            // lazily — at typical nprobe ≤ 64 we touch only a
+            // handful of clusters per query, and building a
+            // kernel is `O(dim)` SIMD work (one pass over the
+            // query × scale + one over query × offset). Caching
+            // by cluster_id avoids rebuilding the kernel for
+            // sibling candidates in the same cluster (most of
+            // the shortlist).
+            //
+            // Metadata is materialised at open time on every Sq8
+            // column; the unwrap can't fail unless someone
+            // constructs a `ColumnReader` outside `open_with`.
+            let meta = col
+                .sq8_meta
+                .as_ref()
+                .expect("Sq8 column must carry sq8_meta (built in open_with)");
+            let dim = col.dim;
+            let mut kernel_cache: HashMap<u32, Sq8Kernel> = HashMap::new();
+            shortlist
+                .iter()
+                .map(|&(did, _, pos, cluster_id)| {
+                    let local = (pos - base_pos) as usize;
+                    let start = local * stride;
+                    let bytes = &full_run[start..start + stride];
+                    let kernel = kernel_cache.entry(cluster_id).or_insert_with(|| {
+                        let c = cluster_id as usize;
+                        let scale_c = &meta.scale[c * dim..(c + 1) * dim];
+                        let offset_c = &meta.offset[c * dim..(c + 1) * dim];
+                        Sq8Kernel::new(
+                            col.metric,
+                            query,
+                            scale_c,
+                            offset_c,
+                            meta.per_doc_norms.as_deref(),
+                        )
+                    });
+                    let d = kernel.distance_at(pos, bytes);
+                    (did, d)
+                })
+                .collect()
+        }
+        RerankCodec::RabitqOnly => unreachable!(
+            "rerank_candidates_in_run reached with RabitqOnly codec — RabitqOnly \
+             columns have no full[] region and should short-circuit before \
+             the rerank step"
+        ),
+    };
     reranked.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     reranked.truncate(k);
     reranked
@@ -889,6 +1126,25 @@ fn rerank_candidates_in_run(
 #[inline]
 fn read_u32_le(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Decode an aligned-or-not `&[u8]` of length `4·N` as a
+/// `Vec<f32>` of length `N`. Used for Sq8's `codec_meta` arrays
+/// (scale, offset, per-doc norms) where the byte slice can land
+/// at any alignment relative to the `Bytes` backing — see the
+/// reader-side note where this is called for the alignment
+/// argument. Slow path (4 byte reads per f32) but only runs at
+/// open time over at-most-`8·n_cent·dim + 4·n_docs` bytes per Sq8
+/// column; the per-query inner loop never goes through here.
+#[inline]
+fn parse_f32_le_vec(bytes: &[u8]) -> Vec<f32> {
+    debug_assert!(bytes.len().is_multiple_of(4));
+    let n = bytes.len() / 4;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    out
 }
 
 #[inline]
@@ -1009,11 +1265,12 @@ mod tests {
     fn build_blob(n_docs: u32, dim: usize, n_cent: usize, metric: Metric) -> (Bytes, String) {
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "embedding".into(),
+            column: "embedding".into(),
             dim,
             n_cent,
             rot_seed: 7,
             metric,
+            rerank_codec: RerankCodec::Fp32,
         })
         .expect("register column");
         for i in 0..n_docs {
@@ -1030,7 +1287,7 @@ mod tests {
             Metric::NegDot => "negdot",
         };
         let json = format!(
-            r#"[{{"name":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_s}"}}]"#
+            r#"[{{"column":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_s}"}}]"#
         );
         (Bytes::from(bytes), json)
     }
@@ -1106,11 +1363,12 @@ mod tests {
         let dim = 16;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "embedding".into(),
+            column: "embedding".into(),
             dim,
             n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Fp32,
         })
         .expect("register column");
         let mut all_vecs = Vec::new();
@@ -1122,7 +1380,7 @@ mod tests {
             all_vecs.push(v);
         }
         let bytes = b.finish().expect("finish vector builder");
-        let json = r#"[{"name":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
+        let json = r#"[{"column":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
         let r = VectorReader::open(Bytes::from(bytes), json).expect("open VectorReader");
 
         // Pick a doc, query with its own vector → top-1 is self with distance 0.
@@ -1279,12 +1537,849 @@ mod tests {
     fn open_rejects_columns_json_mismatch() {
         let (blob, _) = build_blob(32, 16, 4, Metric::L2Sq);
         // header says 1 column; pass 2-column JSON.
-        let bad_json = r#"[{"name":"a","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"},{"name":"b","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
+        let bad_json = r#"[{"column":"a","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"},{"column":"b","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
         let err = VectorReader::open(blob, bad_json).expect_err("expected error");
         assert!(matches!(
             err,
             VectorError::Read(ReadError::MalformedVersion(_))
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Rerank-codec discriminator round-trip
+    // -----------------------------------------------------------------
+    //
+    // The codec discriminator rides as byte 52 of the per-column
+    // directory entry; the codec_meta region offset rides as bytes
+    // 12..16 of the sub-header. Both are zero on legacy fp32
+    // segments. Today `Fp32` and `Bf16` are implemented; every other
+    // codec must fail loudly against a reader that does not yet know
+    // how to decode it.
+
+    /// A fresh `Fp32` build round-trips through the reader with the
+    /// codec byte preserved as `RerankCodec::Fp32`.
+    #[test]
+    fn open_round_trips_fp32_codec_discriminator() {
+        let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        assert_eq!(r.columns.len(), 1);
+        assert_eq!(
+            r.columns[0].rerank_codec,
+            RerankCodec::Fp32,
+            "Fp32 build must surface as RerankCodec::Fp32 on the reader"
+        );
+        assert_eq!(
+            r.columns[0].codec_meta_off, 0,
+            "Fp32 segments must write codec_meta_off = 0 (zero-size region)"
+        );
+    }
+
+    /// Every exposed rerank codec is wired end-to-end.
+    #[test]
+    fn register_column_accepts_every_codec() {
+        for codec in [
+            RerankCodec::Fp32,
+            RerankCodec::Bf16,
+            RerankCodec::Sq8,
+            RerankCodec::RabitqOnly,
+        ] {
+            let mut b = VectorBuilder::new();
+            b.register_column(VectorConfig {
+                column: "v".into(),
+                dim: 16,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: codec,
+            })
+            .unwrap_or_else(|e| panic!("codec {codec:?} must register, got {e:?}"));
+        }
+    }
+
+    /// Building a column with `RerankCodec::Bf16` round-trips through
+    /// the reader. The codec discriminator surfaces on
+    /// `ColumnReader.rerank_codec`, the codec_meta region stays
+    /// zero-bytes, and the on-disk `full[]` region halves to
+    /// `n_docs * dim * 2` bytes.
+    #[test]
+    fn open_round_trips_bf16_codec_discriminator() {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Bf16,
+        })
+        .expect("register column");
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
+            b.add(0, &v).expect("add");
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        assert_eq!(r.columns.len(), 1);
+        assert_eq!(
+            r.columns[0].rerank_codec,
+            RerankCodec::Bf16,
+            "Bf16 build must surface as RerankCodec::Bf16 on the reader"
+        );
+        assert_eq!(
+            r.columns[0].codec_meta_off, 0,
+            "Bf16 segments must write codec_meta_off = 0 (zero-byte meta region)"
+        );
+        let col = &r.columns[0];
+        let expected_full_size = (col.n_docs as usize) * dim * 2;
+        assert_eq!(
+            col.doc_ids_off - col.full_off,
+            expected_full_size,
+            "Bf16 full[] region must be n_docs * dim * 2 bytes",
+        );
+    }
+
+    /// A Bf16 build + open + self-query recovers the planted
+    /// self-vector at top-1, end-to-end through the codec-aware rerank
+    /// dispatch.
+    #[test]
+    fn bf16_self_query_round_trips_top1() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 13,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Bf16,
+        })
+        .expect("register column");
+        let make = |i: u32| -> Vec<f32> {
+            (0..dim)
+                .map(|j| ((i.wrapping_mul(17) + j as u32 * 3) % 64) as f32 * 0.5)
+                .collect()
+        };
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let hits = r
+            .search("v", &all[17], 5, 4, 5)
+            .expect("search must succeed on Bf16 column");
+        assert_eq!(hits[0].0, 17, "Bf16 self-query must recover self at top-1");
+        assert!(
+            hits[0].1.abs() <= 1e-3,
+            "Bf16 self-query distance {} should be ~0",
+            hits[0].1
+        );
+    }
+
+    /// Building a column with `RerankCodec::Sq8` round-trips through
+    /// the reader. The codec discriminator surfaces on
+    /// `ColumnReader.rerank_codec`; the codec_meta region carries
+    /// `scale[dim] + offset[dim]` plus per-doc norms for L2Sq. The
+    /// on-disk `full[]` region shrinks to `n_docs * dim` u8 codes.
+    #[test]
+    fn open_round_trips_sq8_codec_discriminator_l2sq() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8,
+        })
+        .expect("register column");
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
+            b.add(0, &v).expect("add");
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        assert_eq!(r.columns.len(), 1);
+        let col = &r.columns[0];
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8);
+        assert_ne!(col.codec_meta_off, 0, "Sq8 must declare codec_meta_off > 0");
+        assert_eq!(col.doc_ids_off - col.full_off, (col.n_docs as usize) * dim);
+
+        let meta = col
+            .sq8_meta
+            .as_ref()
+            .expect("Sq8 column must materialise sq8_meta at open");
+        assert_eq!(meta.scale.len(), (col.n_cent as usize) * dim);
+        assert_eq!(meta.offset.len(), (col.n_cent as usize) * dim);
+        let norms = meta
+            .per_doc_norms
+            .as_ref()
+            .expect("L2Sq Sq8 column must carry per-doc norms");
+        assert_eq!(norms.len(), col.n_docs as usize);
+    }
+
+    /// Cosine Sq8 columns carry per-doc decoded norms so rerank can
+    /// normalize the decoded vector before computing cosine distance.
+    #[test]
+    fn open_sq8_cosine_carries_per_doc_norms() {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let n_docs = 32u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 11,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8,
+        })
+        .expect("register column");
+        for i in 0..n_docs {
+            let mut v: Vec<f32> = (0..dim)
+                .map(|j| (i + j as u32) as f32 * 0.1 + 0.5)
+                .collect();
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut v {
+                *x /= norm;
+            }
+            b.add(0, &v).expect("add");
+        }
+        let blob = b.finish().expect("finish");
+        let json =
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":11,"metric":"cosine"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let col = &r.columns[0];
+        let meta = col.sq8_meta.as_ref().expect("Sq8 must carry sq8_meta");
+        let norms = meta
+            .per_doc_norms
+            .as_ref()
+            .expect("Cosine Sq8 must carry per-doc norms");
+        assert_eq!(norms.len(), n_docs as usize);
+        assert_eq!(meta.scale.len(), n_cent * dim);
+        assert_eq!(meta.offset.len(), n_cent * dim);
+    }
+
+    /// Pins the per-doc-norms indexing contract: the on-disk norms
+    /// array is indexed by position in `full[]` (matching the rerank
+    /// shortlist's `pos`), not by `doc_id`.
+    #[test]
+    fn sq8_per_doc_norms_indexed_by_pos_not_doc_id() {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let n_docs = 32u32;
+        let make = |i: u32| -> Vec<f32> {
+            let s = 1.0 + (i as f32) * 0.5;
+            (0..dim).map(|j| s + (j as f32) * 0.1).collect()
+        };
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 23,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8,
+        })
+        .expect("register column");
+        let mut planted = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            planted.push(v);
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":23,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let col = &r.columns[0];
+        let meta = col.sq8_meta.as_ref().expect("Sq8 meta present");
+        let norms_by_pos = meta
+            .per_doc_norms
+            .as_ref()
+            .expect("L2Sq Sq8 carries per-doc norms");
+
+        let insertion_norms: Vec<f32> = planted
+            .iter()
+            .map(|v| v.iter().map(|x| x * x).sum::<f32>())
+            .collect();
+        let n_matching = insertion_norms
+            .iter()
+            .zip(norms_by_pos.iter())
+            .filter(|(ins, pos_n)| (**ins - **pos_n).abs() < 0.5)
+            .count();
+        assert!(
+            n_matching < (n_docs as usize) / 2,
+            "expected clustered build to reorder docs across positions, got {n_matching}/{n_docs} near insertion order"
+        );
+
+        for i in [0u32, 7, 15, 23, 31] {
+            let hits = r
+                .search("v", &planted[i as usize], 1, 4, 64)
+                .expect("self-query");
+            assert_eq!(hits[0].0, i, "self-query top-1 doc_id for doc {i}");
+            assert!(
+                hits[0].1 <= 0.5,
+                "doc {i}: self-query distance {} too large",
+                hits[0].1
+            );
+        }
+    }
+
+    /// Sq8 build + open + self-query recovers the planted self-vector
+    /// at top-1 through codec-aware rerank.
+    #[test]
+    fn sq8_self_query_round_trips_top1_l2sq() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 13,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8,
+        })
+        .expect("register column");
+        let make = |i: u32| -> Vec<f32> {
+            (0..dim)
+                .map(|j| ((i.wrapping_mul(17) + j as u32 * 3) % 64) as f32 * 0.5)
+                .collect()
+        };
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let hits = r
+            .search("v", &all[17], 5, 4, 20)
+            .expect("search must succeed on Sq8 column");
+        assert_eq!(hits[0].0, 17, "Sq8 self-query must recover self at top-1");
+        assert!(
+            hits[0].1 <= 1.0,
+            "Sq8 self-query distance {} should be small",
+            hits[0].1
+        );
+    }
+
+    /// Sq8 self-query top-1 round-trips under cosine too. The corpus
+    /// uses hashed unit vectors so the self-vector has a wide margin
+    /// over neighbors after quantization.
+    #[test]
+    fn sq8_self_query_round_trips_top1_cosine() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 19,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8,
+        })
+        .expect("register column");
+        let make = |i: u32| -> Vec<f32> {
+            let raw: Vec<f32> = (0..dim)
+                .map(|j| {
+                    let h = (i.wrapping_mul(0x9E37_79B9)) ^ ((j as u32).wrapping_mul(0x85EB_CA77));
+                    let h = h.wrapping_mul(0xC2B2_AE35);
+                    ((h & 0xFFFF) as f32) / 65535.0
+                })
+                .collect();
+            let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            raw.into_iter().map(|x| x / norm).collect()
+        };
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":19,"metric":"cosine"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let hits = r
+            .search("v", &all[42], 5, 4, 20)
+            .expect("search must succeed on Sq8 cosine column");
+        assert_eq!(hits[0].0, 42, "Sq8 cosine self-query must recover self");
+    }
+
+    /// Building with `RerankCodec::RabitqOnly` succeeds and the
+    /// on-disk segment carries a zero-length `full[]` region.
+    #[test]
+    fn open_round_trips_rabitq_only_codec_discriminator() {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::RabitqOnly,
+        })
+        .expect("register RabitqOnly column");
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
+            b.add(0, &v).expect("add");
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        assert_eq!(r.columns.len(), 1);
+        let col = &r.columns[0];
+        assert_eq!(col.rerank_codec, RerankCodec::RabitqOnly);
+        assert_eq!(col.codec_meta_off, 0);
+        assert_eq!(
+            col.doc_ids_off, col.full_off,
+            "RabitqOnly segments have zero-length full[]"
+        );
+        assert_eq!(col.n_docs, n_docs);
+    }
+
+    /// A `RabitqOnly` column returns top-K directly from the 1-bit
+    /// shortlist. Distances are sign-flipped estimates so smaller is
+    /// still closer.
+    ///
+    /// Self-query must rank the planted vector at index 0 — the
+    /// 1-bit shortlist's score for the exact-match query is the
+    /// dot product against itself, which dominates every neighbour
+    /// at this dim/cluster shape. A weaker `.any(== self)` check
+    /// would mask a regression that demoted self into positions
+    /// 1–4.
+    #[test]
+    fn rabitq_only_self_query_ranks_self_first() {
+        let dim = 128usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 11,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::RabitqOnly,
+        })
+        .expect("register RabitqOnly column");
+        let make = |i: u32| -> Vec<f32> {
+            let raw: Vec<f32> = (0..dim)
+                .map(|j| {
+                    let h = (i.wrapping_mul(0x9E37_79B9)) ^ ((j as u32).wrapping_mul(0x85EB_CA77));
+                    let h = h.wrapping_mul(0xC2B2_AE35);
+                    ((h & 0xFFFF) as f32) / 65535.0 - 0.5
+                })
+                .collect();
+            let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            raw.into_iter().map(|x| x / norm).collect()
+        };
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = b.finish().expect("finish");
+        let json =
+            r#"[{"column":"v","dim":128,"n_cent":4,"rot_seed":11,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+
+        let hits = r
+            .search("v", &all[17], 5, n_cent, 5)
+            .expect("RabitqOnly search must succeed");
+        assert!(!hits.is_empty(), "search must return some hits");
+        // Self-query must rank itself at index 0. `.any` masked
+        // demotion regressions — the planted vector's 1-bit
+        // shortlist score against itself is strictly greater than
+        // any neighbour's at this dim/cluster shape.
+        assert_eq!(
+            hits[0].0, 17,
+            "self-query must rank the planted vector at index 0, got {hits:?}"
+        );
+        assert!(hits.iter().all(|(_, d)| d.is_finite()));
+        for w in hits.windows(2) {
+            assert!(
+                w[0].1 <= w[1].1,
+                "RabitqOnly hits must be sorted ascending by distance, got {hits:?}"
+            );
+        }
+    }
+
+    /// `RabitqOnly` search must not fetch a `full[]` range because
+    /// the column does not store one.
+    #[test]
+    fn rabitq_only_search_issues_no_full_region_fetch() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 32u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 13,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::RabitqOnly,
+        })
+        .expect("register RabitqOnly column");
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
+            b.add(0, &v).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json =
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
+
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let async_calls = counting.async_counter();
+        let sync_calls = counting.sync_counter();
+        let r = VectorReader::open_with_source(
+            Source::Lazy(StdArc::clone(&counting) as StdArc<dyn LazyByteSource>),
+            &json,
+            OpenOptions::default(),
+        )
+        .expect("open lazy");
+
+        async_calls.store(0, AtomicOrdering::Relaxed);
+        sync_calls.store(0, AtomicOrdering::Relaxed);
+        let query: Vec<f32> = (0..dim).map(|j| j as f32 * 0.1).collect();
+        let _ = r.search("v", &query, 5, n_cent, 5).expect("search");
+
+        let sync_count = sync_calls.load(AtomicOrdering::Relaxed) as usize;
+        let async_count = async_calls.load(AtomicOrdering::Relaxed);
+        assert_eq!(
+            async_count, 0,
+            "RabitqOnly search on warm lazy must not bridge to async"
+        );
+        let max_expected = 2 + 2 * n_cent;
+        assert!(
+            sync_count <= max_expected,
+            "RabitqOnly search must issue at most {max_expected} sync fetches; got {sync_count}"
+        );
+        assert!(
+            sync_count >= 4,
+            "test corpus produced only empty clusters? got sync_count={sync_count}"
+        );
+    }
+
+    /// A directory entry carrying an unknown codec id errors as
+    /// `MalformedVersion` rather than guessing at a byte layout.
+    #[test]
+    fn open_rejects_segment_with_unknown_codec_id() {
+        let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
+        let mut bytes = blob.to_vec();
+
+        const OUTER_HDR: usize = 32;
+        const DIR_ENTRY: usize = 64;
+        let dir_off = OUTER_HDR;
+        let codec_byte_off = dir_off + 52;
+        bytes[codec_byte_off] = 200u8; // unassigned
+
+        let dir_bytes = &bytes[dir_off..dir_off + DIR_ENTRY];
+        let new_crc = crc32c(dir_bytes);
+        let crc_off = dir_off + DIR_ENTRY;
+        bytes[crc_off..crc_off + 4].copy_from_slice(&new_crc.to_le_bytes());
+
+        let err =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false })
+                .expect_err("unknown codec id must error at open");
+        assert!(
+            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
+            "expected MalformedVersion for unknown codec id, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown") || msg.contains("200"),
+            "error must call out the unknown id, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Diagnostic — Sq8 vs Fp32 recall on planted-cluster
+    // cosine corpus
+    // -----------------------------------------------------------------
+    //
+    // Planted-cluster cosine corpora can push Sq8 recall well outside
+    // the "< 0.005 drop on normalized embeddings" target envelope.
+    // The hypothesis is that the **per-column** Sq8 quantizer wastes
+    // most of its 256 buckets on cross-cluster spread: the per-dim
+    // global range across the full corpus is much wider than the
+    // intra-cluster spread, so within any one cluster only a handful
+    // of buckets are used. The intra-cluster cosine differences
+    // between top-K candidates then fall below the per-bucket
+    // quantization noise → reranks flip.
+    //
+    // This `#[ignore]`-gated diagnostic reproduces the recall drop at
+    // a small scale and prints corpus geometry stats. Run with
+    // `cargo test --lib -- sq8_recall_diagnostic --ignored --nocapture`
+    // to inspect. Per-column-quantizer fix (or fallback to Bf16
+    // default) is decided based on what this prints.
+    #[test]
+    #[ignore = "Sq8 vs Fp32 recall diagnostic; ~10s; --ignored --nocapture"]
+    fn sq8_recall_diagnostic_planted_cluster_cosine() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rand_distr::{Distribution, StandardNormal};
+
+        let n_docs = 16_000u32;
+        let dim = 384usize;
+        let n_cent_planted = 64usize;
+        let n_cent_ivf = 256usize;
+        let seed: u64 = 1;
+
+        // 1. Build the corpus — same shape as benches/utils/corpus.rs:
+        //    planted centers from 3·N(0,1) per dim, per-doc =
+        //    center + 0.3·N(0,1), L2-normalized.
+        let mut rng = StdRng::seed_from_u64(seed);
+        let dist = StandardNormal;
+        let centers: Vec<Vec<f32>> = (0..n_cent_planted)
+            .map(|_| {
+                (0..dim)
+                    .map(|_| {
+                        let s: f64 = dist.sample(&mut rng);
+                        (s as f32) * 3.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut all: Vec<Vec<f32>> = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs as usize {
+            let center = &centers[i % n_cent_planted];
+            let mut v: Vec<f32> = center
+                .iter()
+                .map(|&c| {
+                    let s: f64 = dist.sample(&mut rng);
+                    c + (s as f32) * 0.3
+                })
+                .collect();
+            let nrm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in v.iter_mut() {
+                *x /= nrm;
+            }
+            all.push(v);
+        }
+
+        // 2. Corpus geometry: per-dim global range vs intra-cluster spread.
+        let mut g_min = vec![f32::INFINITY; dim];
+        let mut g_max = vec![f32::NEG_INFINITY; dim];
+        for v in &all {
+            for d in 0..dim {
+                if v[d] < g_min[d] {
+                    g_min[d] = v[d];
+                }
+                if v[d] > g_max[d] {
+                    g_max[d] = v[d];
+                }
+            }
+        }
+        let g_ranges: Vec<f32> = (0..dim).map(|d| g_max[d] - g_min[d]).collect();
+        let mean_g_range: f32 = g_ranges.iter().sum::<f32>() / dim as f32;
+        let max_g_range: f32 = g_ranges.iter().cloned().fold(0.0f32, f32::max);
+
+        let mut c0_min = vec![f32::INFINITY; dim];
+        let mut c0_max = vec![f32::NEG_INFINITY; dim];
+        let mut c0_count = 0u32;
+        for (i, v) in all.iter().enumerate() {
+            if i % n_cent_planted == 0 {
+                c0_count += 1;
+                for d in 0..dim {
+                    if v[d] < c0_min[d] {
+                        c0_min[d] = v[d];
+                    }
+                    if v[d] > c0_max[d] {
+                        c0_max[d] = v[d];
+                    }
+                }
+            }
+        }
+        let intra_ranges: Vec<f32> = (0..dim).map(|d| c0_max[d] - c0_min[d]).collect();
+        let mean_intra: f32 = intra_ranges.iter().sum::<f32>() / dim as f32;
+
+        eprintln!("--- corpus geometry (16k × 384, 64 planted centers, cosine, L2-normalized) ---");
+        eprintln!(
+            "per-dim global range: mean={mean_g_range:.4}  max={max_g_range:.4}  \
+             bucket_width@255={:.6}",
+            mean_g_range / 255.0
+        );
+        eprintln!("per-dim intra-cluster-0 range ({c0_count} docs): mean={mean_intra:.4}");
+        eprintln!(
+            "bucket-waste factor (global / intra): {:.1}x — Sq8 uses ~{} of 256 buckets per cluster",
+            mean_g_range / mean_intra.max(1e-9),
+            (255.0 * mean_intra / mean_g_range).round() as i32
+        );
+
+        // 3. Build Fp32 + Sq8 segments from the same corpus.
+        let build = |codec: RerankCodec| -> Bytes {
+            let mut b = VectorBuilder::new();
+            b.register_column(VectorConfig {
+                column: "v".into(),
+                dim,
+                n_cent: n_cent_ivf,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: codec,
+            })
+            .expect("register");
+            for v in &all {
+                b.add(0, v).expect("add");
+            }
+            Bytes::from(b.finish().expect("finish"))
+        };
+        let fp32_blob = build(RerankCodec::Fp32);
+        let bf16_blob = build(RerankCodec::Bf16);
+        let sq8_blob = build(RerankCodec::Sq8);
+        eprintln!(
+            "--- segment sizes ---\n\
+             fp32: {:.2} MiB (1.00x)\n\
+             bf16: {:.2} MiB ({:.2}x)\n\
+             sq8:  {:.2} MiB ({:.2}x)",
+            fp32_blob.len() as f64 / 1024.0 / 1024.0,
+            bf16_blob.len() as f64 / 1024.0 / 1024.0,
+            bf16_blob.len() as f64 / fp32_blob.len() as f64,
+            sq8_blob.len() as f64 / 1024.0 / 1024.0,
+            sq8_blob.len() as f64 / fp32_blob.len() as f64
+        );
+
+        let json = format!(
+            r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent_ivf},"rot_seed":7,"metric":"cosine"}}]"#
+        );
+        let r_fp32 = VectorReader::open(fp32_blob, &json).expect("open fp32");
+        let r_bf16 = VectorReader::open(bf16_blob, &json).expect("open bf16");
+        let r_sq8 = VectorReader::open(sq8_blob, &json).expect("open sq8");
+
+        // 4. Brute-force ground truth (cosine sim descending = neg-dot
+        //    ascending — both engines return smaller-is-closer).
+        let n_queries = 100usize;
+        let k = 10usize;
+        let nprobe = n_cent_ivf / 4;
+        let rerank_mult = 50usize; // Sq8 calibration floor at dim ≤ 384
+        let ground_truth: Vec<std::collections::HashSet<u32>> = (0..n_queries)
+            .map(|qi| {
+                let q = &all[qi];
+                let mut sims: Vec<(u32, f32)> = (0..all.len())
+                    .map(|j| {
+                        let d: f32 = (0..dim).map(|i| q[i] * all[j][i]).sum();
+                        (j as u32, d)
+                    })
+                    .collect();
+                sims.sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                sims.into_iter().take(k).map(|(id, _)| id).collect()
+            })
+            .collect();
+
+        let recall_of = |reader: &VectorReader, label: &str| -> f32 {
+            let mut total_match = 0usize;
+            for qi in 0..n_queries {
+                let hits = reader
+                    .search("v", &all[qi], k, nprobe, rerank_mult)
+                    .expect("search");
+                let hit_ids: std::collections::HashSet<u32> =
+                    hits.into_iter().map(|(id, _)| id).collect();
+                let gt = &ground_truth[qi];
+                total_match += gt.iter().filter(|id| hit_ids.contains(id)).count();
+            }
+            let recall = total_match as f32 / (n_queries * k) as f32;
+            eprintln!("recall@{k} ({label}): {recall:.4}");
+            recall
+        };
+
+        eprintln!(
+            "--- recall@{k} on {n_queries} self-queries (nprobe={nprobe}, rerank_mult={rerank_mult}) ---"
+        );
+        let r_fp = recall_of(&r_fp32, "fp32");
+        let r_bf = recall_of(&r_bf16, "bf16");
+        let r_sq = recall_of(&r_sq8, "sq8 ");
+        eprintln!(
+            "drop (fp32 - bf16): {:.4}\ndrop (fp32 - sq8 ): {:.4}",
+            r_fp - r_bf,
+            r_fp - r_sq
+        );
+        eprintln!("(target acceptance: drop must be \u{2264} 0.01)");
+
+        // -- Probe: vary rerank_mult to isolate shortlist depth vs rerank noise --
+        eprintln!("\n--- rerank_mult sweep (Sq8, same corpus/queries) ---");
+        for &rm in &[20usize, 50, 100, 200, 400] {
+            let mut tm = 0usize;
+            for qi in 0..n_queries {
+                let hits = r_sq8.search("v", &all[qi], k, nprobe, rm).expect("search");
+                let hit_ids: std::collections::HashSet<u32> =
+                    hits.into_iter().map(|(id, _)| id).collect();
+                tm += ground_truth[qi]
+                    .iter()
+                    .filter(|id| hit_ids.contains(id))
+                    .count();
+            }
+            eprintln!(
+                "  rerank_mult={rm:>4}: sq8 recall@{k} = {:.4}",
+                tm as f32 / (n_queries * k) as f32
+            );
+        }
+
+        // -- Probe: typical top-10 cosine spread (signal that
+        //    Sq8 noise must beat).
+        let mut spreads = Vec::with_capacity(n_queries);
+        for qi in 0..n_queries.min(20) {
+            let q = &all[qi];
+            let mut sims: Vec<f32> = (0..all.len())
+                .map(|j| (0..dim).map(|i| q[i] * all[j][i]).sum::<f32>())
+                .collect();
+            sims.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let top11: Vec<f32> = sims.iter().take(11).cloned().collect();
+            // Spread between top-1 (self, sim=1) and top-10
+            let span = top11[0] - top11[10];
+            // Median consecutive gap among top-10
+            let mut gaps: Vec<f32> = (1..11).map(|i| top11[i - 1] - top11[i]).collect();
+            gaps.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med_gap = gaps[gaps.len() / 2];
+            spreads.push((span, med_gap));
+        }
+        let mean_span: f32 = spreads.iter().map(|(s, _)| s).sum::<f32>() / spreads.len() as f32;
+        let mean_gap: f32 = spreads.iter().map(|(_, g)| g).sum::<f32>() / spreads.len() as f32;
+        eprintln!("\n--- top-10 cosine geometry (the signal Sq8 noise must beat) ---");
+        eprintln!(
+            "  mean top1-to-top10 span:      {mean_span:.4}\n  \
+             mean consecutive median gap:  {mean_gap:.5}\n  \
+             Sq8 noise est. (3e-5) vs gap: ratio = {:.2}%",
+            3e-5_f32 / mean_gap.max(1e-9) * 100.0
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1306,11 +2401,12 @@ mod tests {
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "embedding".into(),
+            column: "embedding".into(),
             dim,
             n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Fp32,
         })
         .expect("register column");
         let mut all = Vec::with_capacity(n_docs as usize);
@@ -1322,7 +2418,7 @@ mod tests {
             all.push(v);
         }
         let bytes = b.finish().expect("finish vector builder");
-        let json = r#"[{"name":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#
+        let json = r#"[{"column":"embedding","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#
             .to_string();
         (Bytes::from(bytes), json, all)
     }
@@ -1693,11 +2789,12 @@ mod tests {
 
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
-            name: "embedding".into(),
+            column: "embedding".into(),
             dim,
             n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Fp32,
         })
         .expect("register column");
         let mut v = vec![0f32; dim];
@@ -1714,7 +2811,7 @@ mod tests {
         b.finish_to(writer).expect("finish_to BufWriter<File>");
 
         format!(
-            r#"[{{"name":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"l2sq"}}]"#
+            r#"[{{"column":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"l2sq"}}]"#
         )
     }
 

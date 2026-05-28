@@ -27,6 +27,7 @@ use bytes::Bytes;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
 use infino::superfile::vector::distance::{Metric, distance, normalize};
 use infino::superfile::vector::reader::VectorReader;
+use infino::superfile::vector::rerank_codec::RerankCodec;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
@@ -84,11 +85,12 @@ fn build_reader(
 ) -> VectorReader {
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
-        name: "v".into(),
+        column: "v".into(),
         dim,
         n_cent,
         rot_seed,
         metric,
+        rerank_codec: RerankCodec::Fp32,
     })
     .expect("register column");
     for v in corpus {
@@ -101,7 +103,7 @@ fn build_reader(
         Metric::NegDot => "negdot",
     };
     let json = format!(
-        r#"[{{"name":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":{rot_seed},"metric":"{metric_str}"}}]"#
+        r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":{rot_seed},"metric":"{metric_str}"}}]"#
     );
     VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader")
 }
