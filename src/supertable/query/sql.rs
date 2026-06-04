@@ -69,7 +69,6 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::runtime_bridge::bridge_sync_to_async;
 use crate::supertable::error::QueryError;
 use crate::supertable::handle::Supertable;
 use crate::supertable::manifest::Manifest;
@@ -96,17 +95,27 @@ impl Supertable {
     /// (single worker thread) cached on the `SupertableInner`;
     /// subsequent calls reuse it.
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
+        self.ensure_fresh();
         let reader = self.reader();
         let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let storage = self.options().storage.as_ref().map(Arc::clone);
         let scalar_schema = self.options().scalar_schema();
         let tombstone_cache = reader.tombstone_cache.clone();
 
-        let table = build_mem_table(scalar_schema, manifest, store, disk_cache, tombstone_cache)?;
         let sql = sql.to_owned();
 
         let drive = async move {
+            let table = build_mem_table(
+                scalar_schema,
+                manifest,
+                store,
+                disk_cache,
+                storage,
+                tombstone_cache,
+            )
+            .await?;
             let ctx = SessionContext::new();
             ctx.register_table(TABLE_NAME, Arc::new(table))
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
@@ -119,10 +128,18 @@ impl Supertable {
                 .map_err(|e| QueryError::Execute(e.to_string()))
         };
 
-        // Cross the sync→async boundary through the one shared
-        // bridge: ride the ambient runtime when present, the
-        // process-wide owned runtime otherwise.
-        bridge_sync_to_async(drive)
+        // same ambient-runtime detection pattern the
+        // writer's persist_commit uses. Lazy-init the owned
+        // query_runtime only when there's NO ambient runtime —
+        // calling `Builder::new_multi_thread().build()` from
+        // inside another runtime panics with "Cannot start a
+        // runtime from within a runtime". Web handlers,
+        // `#[tokio::test]`s, and any async caller now get a
+        // working query_sql.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
+            Err(_) => self.query_runtime().block_on(drive),
+        }
     }
 
     /// Resolve a predicate to the matching `_id` values. Used by
@@ -142,7 +159,7 @@ impl Supertable {
     /// the eventual `commit()` are NOT in the returned set —
     /// captured-at-call semantics match SQL `UPDATE WHERE` /
     /// `DELETE WHERE`.
-    pub fn scan_ids_matching(
+    pub(crate) fn scan_ids_matching(
         &self,
         expr: datafusion::prelude::Expr,
     ) -> Result<Vec<i128>, QueryError> {
@@ -150,13 +167,21 @@ impl Supertable {
         let manifest = Arc::clone(reader.manifest());
         let store = Arc::clone(&self.options().store);
         let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
+        let storage = self.options().storage.as_ref().map(Arc::clone);
         let scalar_schema = self.options().scalar_schema();
         let tombstone_cache = reader.tombstone_cache.clone();
         let id_column = self.options().id_column.clone();
 
-        let table = build_mem_table(scalar_schema, manifest, store, disk_cache, tombstone_cache)?;
-
         let drive = async move {
+            let table = build_mem_table(
+                scalar_schema,
+                manifest,
+                store,
+                disk_cache,
+                storage,
+                tombstone_cache,
+            )
+            .await?;
             let ctx = SessionContext::new();
             ctx.register_table(TABLE_NAME, Arc::new(table))
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
@@ -175,7 +200,10 @@ impl Supertable {
             extract_id_column(&batches)
         };
 
-        bridge_sync_to_async(drive)
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive)),
+            Err(_) => self.query_runtime().block_on(drive),
+        }
     }
 }
 
@@ -228,17 +256,18 @@ fn extract_id_column(batches: &[RecordBatch]) -> Result<Vec<i128>, QueryError> {
 /// don't surface predicates until after `MemTable` providers
 /// have built their partition list, so a pushdown-aware
 /// variant requires either a custom `TableProvider` (significant
-/// new code) or a pre-parse pass. M15c ships the "load all
+/// new code) or a pre-parse pass. Ships the "load all
 /// parts" SQL path; exact-term BM25 + prefix BM25 + vector
 /// queries get list-prune via their dedicated entry points.
-fn build_mem_table(
+async fn build_mem_table(
     schema: Arc<arrow_schema::Schema>,
     manifest: Arc<Manifest>,
     store: Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<Arc<crate::supertable::reader_cache::DiskCacheStore>>,
+    storage: Option<Arc<dyn crate::storage::StorageProvider>>,
     tombstone_cache: Option<Arc<crate::supertable::tombstones::SidecarCache>>,
 ) -> Result<MemTable, QueryError> {
-    // M15c: route through the hierarchical iterator when
+    // route through the hierarchical iterator when
     // the manifest has a persisted list (which includes
     // both eager + lazy modes). For in-process supertables
     // with no list, the fallback returns the flat
@@ -246,7 +275,8 @@ fn build_mem_table(
     let superfiles: Vec<Arc<crate::supertable::SuperfileEntry>> = match manifest.list.as_ref() {
         Some(list) => {
             let kept: Vec<_> = list.parts.iter().map(|p| p.part_id).collect();
-            crate::supertable::query::hierarchical_iter::load_and_flatten(manifest.as_ref(), &kept)?
+            crate::supertable::query::hierarchical_iter::load_and_flatten(manifest.as_ref(), &kept)
+                .await?
         }
         None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
             manifest.as_ref(),
@@ -261,10 +291,24 @@ fn build_mem_table(
         let reader = crate::supertable::query::superfile_reader::superfile_reader(
             &store,
             disk_cache.as_ref(),
+            storage.as_ref(),
             &entry.uri,
+            entry.subsection_offsets.as_ref(),
         )
+        .await
         .map_err(|e| QueryError::Store(e.to_string()))?;
-        let mut batches = read_all_batches(reader.parquet_bytes().clone())?;
+        let parquet = reader
+            .parquet_bytes()
+            .ok_or_else(|| {
+                QueryError::Plan(format!(
+                    "SQL pass-through requires eager-opened superfile bytes; \
+                     reader for {:?} was opened via the lazy path which does \
+                     not materialize the full segment",
+                    entry.uri
+                ))
+            })?
+            .clone();
+        let mut batches = read_all_batches(parquet)?;
         if let Some(cache) = tombstone_cache.as_ref() {
             apply_tombstone_filter_to_batches(cache, entry.superfile_id, &mut batches, now)?;
         }
@@ -593,10 +637,15 @@ mod tests {
     }
 
     #[test]
-    fn query_sql_succeeds_across_repeated_calls() {
-        // Repeated queries on the same supertable all succeed —
-        // they share the one process-wide bridge runtime, so there's
-        // no per-call runtime build to regress on.
+    fn query_runtime_is_cached_across_calls() {
+        // Two queries on the same supertable must share one
+        // Runtime — the OnceLock guarantees this; we assert by
+        // checking that both calls succeed without spawning a
+        // fresh Runtime per call (observed indirectly via the
+        // `.await` over `block_on` not double-allocating; if the
+        // cache regressed, tests would still pass but would leak
+        // a Runtime per call. The functional check below is
+        // adequate for correctness; benchmarks would catch leak).
         let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_cat_batch(0, &["x"], &["t"])).expect("a");

@@ -4,7 +4,7 @@
 //! `SupertableOptions::with_storage(...)` is attached:
 //!
 //! - A commit on a storage-backed supertable writes:
-//!   - each new segment's bytes to `data/seg-<uuid>.sf`
+//!   - each new segment's bytes to `data/seg-<uuid>.sf.parquet`
 //!   - one manifest part to `manifests/part-<hash>.avro.zst`
 //!   - the manifest list to `manifest-lists/list-NNNNNN.json`
 //!   - the pointer to `_supertable/current`
@@ -143,8 +143,8 @@ fn two_successive_commits_both_publish() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn multipart_threshold_forces_segment_through_put_multipart() {
+#[test]
+fn multipart_threshold_forces_segment_through_put_multipart() {
     // D1: setting `put_multipart_threshold_bytes = 1` routes
     // every segment through `put_multipart` instead of
     // `put_atomic`. Verifies the end-to-end shape:
@@ -191,7 +191,6 @@ async fn multipart_threshold_forces_segment_through_put_multipart() {
     // the writer produced.
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open after multipart commit");
     let r = consumer.reader();
     assert_eq!(r.manifest_id(), 1);
@@ -247,8 +246,7 @@ fn committed_supertable_remains_in_memory_queryable_for_now() {
     w.commit().expect("commit");
     drop(w);
 
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search(
             "title",
             "nimblefox",

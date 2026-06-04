@@ -413,6 +413,11 @@ async fn do_apply(
         // which is correct for the Hash{n_buckets=1} default.
         partition_key: Vec::new(),
         partition_hint: None,
+        // WAL-committed segments don't yet embed M7 open hints;
+        // the reader falls back to fetching vec/fts open ranges
+        // over the wire. Correct, just not 1-RTT-optimized — a
+        // follow-up can mirror the writer's `build_subsection_offsets`.
+        subsection_offsets: None,
     });
 
     // ---- Step 6: PUT bytes + CAS-commit the manifest ----
@@ -545,7 +550,9 @@ fn build_fts_summary(
         return out;
     };
     for fc in &options.fts_columns {
-        let terms = fts_reader.iter_column_terms(&fc.column);
+        let terms = fts_reader
+            .iter_column_terms(&fc.column)
+            .expect("FST bytes valid: segment just built");
         let n_terms_distinct = terms.len() as u32;
         let (min_term, max_term) = match (terms.first(), terms.last()) {
             (Some(min), Some(max)) => (min.clone(), max.clone()),
@@ -1038,10 +1045,14 @@ fn resolve_target_id_in_manifest(
         // recovery sweep on `Supertable::open` lands here when
         // the freshly-opened handle's in-memory tier is empty
         // and no disk cache is attached.
-        let reader = match crate::supertable::query::superfile_reader::superfile_reader(
-            &inner.options.store,
-            inner.options.disk_cache.as_ref(),
-            &entry.uri,
+        let reader = match bridge_sync_to_async(
+            crate::supertable::query::superfile_reader::superfile_reader(
+                &inner.options.store,
+                inner.options.disk_cache.as_ref(),
+                inner.options.storage.as_ref(),
+                &entry.uri,
+                entry.subsection_offsets.as_ref(),
+            ),
         ) {
             Ok(r) => r,
             Err(_) => {
@@ -1067,14 +1078,47 @@ fn resolve_target_id_in_manifest(
             }
         };
 
-        if let Some(doc_id) =
-            reader
-                .id_lookup(target)
-                .map_err(|e| TombstonePhaseError::IdLookupFailed {
+        // id_lookup requires the full segment bytes (eager open).
+        // A lazy-opened reader from the cache path will return an Io
+        // error here; fall back to a direct storage fetch in that case.
+        let lookup_result = match reader.id_lookup(target) {
+            Ok(result) => result,
+            Err(crate::superfile::ReadError::Io(_)) => {
+                // Lazy reader — re-open eagerly from storage.
+                let bytes =
+                    fetch_superfile_bytes_for_id_scan(inner, entry.uri.0).map_err(|message| {
+                        TombstonePhaseError::IdLookupFailed {
+                            target_id: target_id.to_hex(),
+                            message: format!(
+                                "open superfile {} (eager fallback for id_lookup): {message}",
+                                entry.uri.0
+                            ),
+                        }
+                    })?;
+                let eager_reader = SuperfileReader::open(bytes).map_err(|e| {
+                    TombstonePhaseError::IdLookupFailed {
+                        target_id: target_id.to_hex(),
+                        message: format!(
+                            "SuperfileReader::open {} (eager fallback for id_lookup): {e}",
+                            entry.uri.0
+                        ),
+                    }
+                })?;
+                eager_reader
+                    .id_lookup(target)
+                    .map_err(|e| TombstonePhaseError::IdLookupFailed {
+                        target_id: target_id.to_hex(),
+                        message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
+                    })?
+            }
+            Err(e) => {
+                return Err(TombstonePhaseError::IdLookupFailed {
                     target_id: target_id.to_hex(),
                     message: format!("id_lookup in superfile {}: {e}", entry.uri.0),
-                })?
-        {
+                });
+            }
+        };
+        if let Some(doc_id) = lookup_result {
             return Ok(Some((entry.superfile_id, doc_id)));
         }
     }
@@ -1100,7 +1144,7 @@ fn fetch_superfile_bytes_for_id_scan(
         .as_ref()
         .ok_or_else(|| "no storage attached".to_string())?
         .clone();
-    let path = format!("data/seg-{}.sf", superfile_id);
+    let path = SuperfileUri(superfile_id).storage_path();
     let (bytes, _) = bridge_sync_to_async(async move { storage.get(&path).await })
         .map_err(|e| format!("storage get: {e}"))?;
     Ok(bytes)
@@ -1412,7 +1456,7 @@ mod tests {
             .find(|e| e.uri.0 == pre_uuid)
             .expect("entry");
         let storage1 = st1.inner().options.storage.as_ref().expect("storage");
-        let path = format!("data/seg-{}.sf", pre_uuid);
+        let path = entry1.uri.storage_path();
         let (bytes1, _) = storage1.get(&path).await.expect("get bytes");
 
         // Second independent run on a fresh fixture with the

@@ -98,8 +98,7 @@ async fn fts_query_excludes_tombstoned_row() {
     // Before tombstones the FTS query would return 3 hits;
     // post-tombstone we expect 2, and the dropped one is the
     // middle row.
-    let reader = st.reader();
-    let hits = reader
+    let hits = st
         .bm25_search("title", "alpha", 10, BoolMode::Or)
         .expect("fts");
     assert_eq!(hits.len(), 2, "tombstoned row must be excluded");
@@ -302,8 +301,7 @@ async fn vector_query_excludes_tombstoned_row() {
     // Query close to the origin. The tombstoned row (local doc_id
     // 0) must not appear in the result list.
     let q = [0.0f32; DIM];
-    let reader = st.reader();
-    let hits = reader
+    let hits = st
         .vector_search("embedding", &q, 5, VectorSearchOptions::new())
         .expect("vector");
     assert!(!hits.is_empty(), "expected at least one un-tombstoned hit");

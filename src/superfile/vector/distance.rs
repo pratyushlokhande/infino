@@ -15,6 +15,13 @@ use crate::superfile::vector::rerank_codec::RerankCodec;
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
+/// Residual quantization step divisor for [`RerankCodec::Sq8Residual`].
+/// The signed 8-bit residual code at dim `d` carries
+/// `scale_c[d] / SQ8_RESIDUAL_DIVISOR`-sized steps around the Sq8
+/// dequant base. `16` hit the recall target with the best
+/// byte/CPU trade-off on the 1M × 384 cosine calibration sweep.
+pub(crate) const SQ8_RESIDUAL_DIVISOR: f32 = 16.0;
+
 /// Distance metric for a vector column. Stored per-column in
 /// `inf.vec.columns` JSON, applied at query time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,10 +325,11 @@ pub(crate) fn distance_bytes_codec(
 ) -> f32 {
     match codec {
         RerankCodec::Fp32 => distance_bytes(metric, query, bytes),
-        RerankCodec::Sq8 => {
+        RerankCodec::Sq8Residual => {
             unreachable!(
-                "distance_bytes_codec called with Sq8 — Sq8 rerank goes through \
-                 Sq8Kernel (needs per-column scale/offset + per-doc norm context)"
+                "distance_bytes_codec called with Sq8Residual — Sq8Residual rerank goes \
+                 through dedicated kernels (need per-column scale/offset + per-doc \
+                 norm context)"
             )
         }
         RerankCodec::RabitqOnly => {
@@ -360,14 +368,15 @@ pub(crate) struct Sq8Kernel<'a> {
     q_norm_sq: f32,
     /// Optional per-doc `Σ_d x_decoded²` table, indexed by the
     /// rerank shortlist's `pos` field. `Some` for L2Sq columns,
-    /// `None` for Cosine / NegDot (the `x²` term cancels out).
+    /// `None` for NegDot. `Some` for L2Sq (stores `‖x‖²`) and
+    /// Cosine (stores `‖x‖²`; rerank divides by `√norm`).
     per_doc_norms: Option<&'a [f32]>,
 }
 
 impl<'a> Sq8Kernel<'a> {
     /// Build the per-query kernel. `scale` + `offset` are the
     /// per-dim quantizer arrays from the column's `codec_meta`.
-    /// `per_doc_norms` is `Some` iff the column metric is L2Sq.
+    /// `per_doc_norms` is `Some` for L2Sq and Cosine columns.
     pub fn new(
         metric: Metric,
         query: &[f32],
@@ -422,6 +431,12 @@ impl<'a> Sq8Kernel<'a> {
     /// metric (matches the [`distance`] dispatch convention).
     #[inline]
     pub fn distance_at(&self, pos: u32, code_bytes: &[u8]) -> f32 {
+        let norm = self.per_doc_norms.map(|norms| norms[pos as usize]);
+        self.distance_with_norm(code_bytes, norm)
+    }
+
+    #[inline]
+    pub fn distance_with_norm(&self, code_bytes: &[u8], norm: Option<f32>) -> f32 {
         debug_assert_eq!(code_bytes.len(), self.dim);
         // Per-doc inner reduction: Σ_d q_prime[d] * code[d] as f32.
         // Dispatches to AVX-512 (16-lane FMA with VPMOVZXBD widen)
@@ -434,17 +449,169 @@ impl<'a> Sq8Kernel<'a> {
         //                         + Σ_d q[d] * offset[d].
         let dot = qp_code_dot + self.q_dot_offset;
         match self.metric {
-            Metric::Cosine => 1.0 - dot,
+            Metric::Cosine => {
+                let x_norm = norm
+                    .expect("Sq8Kernel + Cosine requires per_doc_norms")
+                    .sqrt();
+                if x_norm > 0.0 {
+                    1.0 - dot / x_norm
+                } else {
+                    1.0 - dot
+                }
+            }
             Metric::NegDot => -dot,
             Metric::L2Sq => {
-                // |q - x|² = |q|² − 2·q·x + |x|². The |x|²
-                // term is precomputed per-doc at encode time
-                // (using the *decoded* values, so this matches
-                // exactly what the kernel reconstructs).
-                let norms = self
-                    .per_doc_norms
-                    .expect("Sq8Kernel + L2Sq requires per_doc_norms");
-                let x_norm_sq = norms[pos as usize];
+                let x_norm_sq = norm.expect("Sq8Kernel + L2Sq requires per_doc_norms");
+                self.q_norm_sq - 2.0 * dot + x_norm_sq
+            }
+        }
+    }
+}
+
+/// `Sq8Residual` rerank context — the residual-corrected sibling of
+/// [`Sq8Kernel`]. Captures the per-cluster quantizer (`scale[dim]`,
+/// `offset[dim]`) plus the query-side precomputes for both the Sq8
+/// code leg and the i8 residual leg, so the per-candidate inner loop
+/// is two u8/i8 → f32 widens + SIMD dot.
+///
+/// Applied only to the small final-refine set the Sq8 score selects,
+/// so it never runs over the full shortlist. One kernel per query +
+/// cluster, reused across that cluster's refine candidates.
+pub(crate) struct Sq8ResidualKernel<'a> {
+    metric: Metric,
+    dim: usize,
+    /// `q_code[d] = query[d] * scale[d]`. Per-doc step is
+    /// `Σ_d q_code[d] * code[d] as f32`.
+    q_code: Vec<f32>,
+    /// `q_residual[d] = query[d] * scale[d] / residual_divisor`.
+    /// Per-doc step is `Σ_d q_residual[d] * residual[d] as f32`.
+    q_residual: Vec<f32>,
+    /// `Σ_d query[d] * offset[d]`. Folded in once per candidate.
+    q_dot_offset: f32,
+    /// `Σ_d query[d]²`. L2Sq only.
+    q_norm_sq: f32,
+    /// Per-doc `Σ_d x_corrected²` table (residual-corrected norms),
+    /// indexed by the shortlist's `pos`. `Some` for L2Sq + Cosine.
+    per_doc_norms: Option<&'a [f32]>,
+}
+
+impl<'a> Sq8ResidualKernel<'a> {
+    /// Build the per-query residual kernel. `scale` + `offset` are
+    /// the per-cluster quantizer arrays; `residual_divisor` is
+    /// [`SQ8_RESIDUAL_DIVISOR`]. `per_doc_norms` is `Some` for L2Sq
+    /// and Cosine columns.
+    pub fn new(
+        metric: Metric,
+        query: &[f32],
+        scale: &[f32],
+        offset: &[f32],
+        residual_divisor: f32,
+        per_doc_norms: Option<&'a [f32]>,
+    ) -> Self {
+        let dim = query.len();
+        debug_assert_eq!(scale.len(), dim);
+        debug_assert_eq!(offset.len(), dim);
+        debug_assert!(residual_divisor > 0.0);
+        let mut q_code = vec![0.0f32; dim];
+        let mut q_residual = vec![0.0f32; dim];
+        let inv_residual_divisor = 1.0 / residual_divisor;
+        let mut q_dot_offset_acc = f32x8::ZERO;
+        let mut i = 0;
+        while i + 8 <= dim {
+            let qc = f32x8::from(<[f32; 8]>::try_from(&query[i..i + 8]).expect("len-8 slice"));
+            let sc = f32x8::from(<[f32; 8]>::try_from(&scale[i..i + 8]).expect("len-8 slice"));
+            let oc = f32x8::from(<[f32; 8]>::try_from(&offset[i..i + 8]).expect("len-8 slice"));
+            let q_code_v = qc * sc;
+            let q_residual_v = q_code_v * f32x8::splat(inv_residual_divisor);
+            q_code[i..i + 8].copy_from_slice(&q_code_v.to_array());
+            q_residual[i..i + 8].copy_from_slice(&q_residual_v.to_array());
+            q_dot_offset_acc += qc * oc;
+            i += 8;
+        }
+        let mut q_dot_offset = q_dot_offset_acc.reduce_add();
+        while i < dim {
+            let q_scale = query[i] * scale[i];
+            q_code[i] = q_scale;
+            q_residual[i] = q_scale * inv_residual_divisor;
+            q_dot_offset += query[i] * offset[i];
+            i += 1;
+        }
+        let q_norm_sq = match metric {
+            Metric::L2Sq => dot(query, query),
+            Metric::Cosine | Metric::NegDot => 0.0,
+        };
+        Self {
+            metric,
+            dim,
+            q_code,
+            q_residual,
+            q_dot_offset,
+            q_norm_sq,
+            per_doc_norms,
+        }
+    }
+
+    /// Distance for one refine candidate at position `pos`, with
+    /// `dim` u8 Sq8 codes at `code_bytes` and `dim` i8 residual
+    /// codes at `residual_bytes`. Smaller = closer for every metric.
+    #[inline]
+    pub fn distance_at(&self, pos: u32, code_bytes: &[u8], residual_bytes: &[u8]) -> f32 {
+        let norm = self.per_doc_norms.map(|norms| norms[pos as usize]);
+        self.distance_with_norm(code_bytes, residual_bytes, norm)
+    }
+
+    /// Like [`Self::distance_at`] but takes the per-doc decoded-norm
+    /// explicitly — for lazy object-store paths that fetch norms into
+    /// a sparse `pos → norm` map rather than a contiguous slice.
+    #[inline]
+    pub fn distance_with_norm(
+        &self,
+        code_bytes: &[u8],
+        residual_bytes: &[u8],
+        norm: Option<f32>,
+    ) -> f32 {
+        debug_assert_eq!(code_bytes.len(), self.dim);
+        debug_assert_eq!(residual_bytes.len(), self.dim);
+        let mut acc = f32x8::ZERO;
+        let mut i = 0;
+        while i + 8 <= self.dim {
+            let qc: [f32; 8] = self.q_code[i..i + 8]
+                .try_into()
+                .expect("q_code[i..i+8] len 8");
+            let qr: [f32; 8] = self.q_residual[i..i + 8]
+                .try_into()
+                .expect("q_residual[i..i+8] len 8");
+            let mut code = [0f32; 8];
+            let mut residual = [0f32; 8];
+            for j in 0..8 {
+                code[j] = code_bytes[i + j] as f32;
+                residual[j] = i8::from_le_bytes([residual_bytes[i + j]]) as f32;
+            }
+            acc += f32x8::from(qc) * f32x8::from(code);
+            acc += f32x8::from(qr) * f32x8::from(residual);
+            i += 8;
+        }
+        let mut cross = acc.reduce_add();
+        while i < self.dim {
+            cross += self.q_code[i] * (code_bytes[i] as f32);
+            cross += self.q_residual[i] * (i8::from_le_bytes([residual_bytes[i]]) as f32);
+            i += 1;
+        }
+        let dot = cross + self.q_dot_offset;
+        match self.metric {
+            Metric::Cosine => {
+                let x_norm = norm
+                    .expect("Sq8ResidualKernel + Cosine requires per_doc_norms")
+                    .sqrt();
+                if x_norm > 0.0 {
+                    1.0 - dot / x_norm
+                } else {
+                    1.0 - dot
+                }
+            }
+            Metric::NegDot => -dot,
+            Metric::L2Sq => {
+                let x_norm_sq = norm.expect("Sq8ResidualKernel + L2Sq requires per_doc_norms");
                 self.q_norm_sq - 2.0 * dot + x_norm_sq
             }
         }
@@ -839,6 +1006,99 @@ mod tests {
             .collect()
     }
 
+    /// Decode `Sq8Residual` codes (`code * scale + offset + residual
+    /// * scale / divisor`) — the reference the residual kernel must
+    /// agree with.
+    fn decode_sq8_residual(
+        codes: &[u8],
+        residuals: &[u8],
+        dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        residual_divisor: f32,
+    ) -> Vec<f32> {
+        codes
+            .iter()
+            .zip(residuals.iter())
+            .enumerate()
+            .map(|(i, (&c, &r))| {
+                let d = i % dim;
+                (c as f32) * scale[d]
+                    + offset[d]
+                    + (i8::from_le_bytes([r]) as f32) * scale[d] / residual_divisor
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sq8_residual_kernel_matches_corrected_reference() {
+        let dim = 24usize;
+        let residual_divisor = SQ8_RESIDUAL_DIVISOR;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.04 - 0.2).collect();
+        let scale: Vec<f32> = (0..dim).map(|i| 0.01 + (i as f32) * 0.001).collect();
+        let offset: Vec<f32> = (0..dim).map(|i| -0.4 + (i as f32) * 0.03).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| ((i * 29 + 7) % 256) as u8).collect();
+        let residuals: Vec<u8> = (0..dim)
+            .map(|i| (((i * 17 + 3) % 63) as i8 - 31).to_le_bytes()[0])
+            .collect();
+        let corrected =
+            decode_sq8_residual(&codes, &residuals, dim, &scale, &offset, residual_divisor);
+        let corrected_norm: f32 = corrected.iter().map(|x| x * x).sum();
+        let norms = [corrected_norm];
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let norms_arg = match metric {
+                Metric::Cosine | Metric::L2Sq => Some(&norms[..]),
+                Metric::NegDot => None,
+            };
+            let kernel = Sq8ResidualKernel::new(
+                metric,
+                &query,
+                &scale,
+                &offset,
+                residual_divisor,
+                norms_arg,
+            );
+            let got = kernel.distance_at(0, &codes, &residuals);
+            let want = match metric {
+                Metric::Cosine => 1.0 - dot(&query, &corrected) / corrected_norm.sqrt(),
+                _ => distance(metric, &query, &corrected),
+            };
+            assert!(
+                (want - got).abs() <= 1e-4,
+                "metric {metric:?}: residual kernel {got} vs corrected ref {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn sq8_residual_kernel_handles_tail_dim_not_multiple_of_8() {
+        let dim = 13usize;
+        let residual_divisor = SQ8_RESIDUAL_DIVISOR;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.03 + 0.1).collect();
+        let scale: Vec<f32> = (0..dim).map(|i| 0.02 + (i as f32) * 0.001).collect();
+        let offset: Vec<f32> = (0..dim).map(|i| -0.2 + (i as f32) * 0.02).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| ((i * 11 + 5) % 256) as u8).collect();
+        let residuals: Vec<u8> = (0..dim)
+            .map(|i| (((i * 23 + 9) % 47) as i8 - 23).to_le_bytes()[0])
+            .collect();
+        let corrected =
+            decode_sq8_residual(&codes, &residuals, dim, &scale, &offset, residual_divisor);
+        let kernel = Sq8ResidualKernel::new(
+            Metric::NegDot,
+            &query,
+            &scale,
+            &offset,
+            residual_divisor,
+            None,
+        );
+        let got = kernel.distance_at(0, &codes, &residuals);
+        let want = distance(Metric::NegDot, &query, &corrected);
+        assert!(
+            (want - got).abs() <= 1e-4,
+            "tail-dim residual kernel: got {got} vs corrected ref {want}"
+        );
+    }
+
     #[test]
     fn sq8_kernel_dot_matches_decoded_reference() {
         let dim = 16usize;
@@ -849,8 +1109,24 @@ mod tests {
         let decoded = decode_sq8(&codes, dim, &scale, &offset);
 
         for m in [Metric::Cosine, Metric::NegDot] {
-            let want = distance(m, &query, &decoded);
-            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, None);
+            let norms = if m == Metric::Cosine {
+                Some(vec![decoded.iter().map(|x| x * x).sum::<f32>()])
+            } else {
+                None
+            };
+            let want = match m {
+                Metric::Cosine => {
+                    let x_norm = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if x_norm > 0.0 {
+                        1.0 - dot(&query, &decoded) / x_norm
+                    } else {
+                        1.0 - dot(&query, &decoded)
+                    }
+                }
+                Metric::NegDot => distance(m, &query, &decoded),
+                Metric::L2Sq => unreachable!(),
+            };
+            let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms.as_deref());
             let got = kernel.distance_at(0, &codes);
             let err = (want - got).abs();
             assert!(
@@ -971,8 +1247,8 @@ mod tests {
 
         for m in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
             let norms_arg: Option<&[f32]> = match m {
-                Metric::L2Sq => Some(&per_doc_norms),
-                _ => None,
+                Metric::L2Sq | Metric::Cosine => Some(&per_doc_norms),
+                Metric::NegDot => None,
             };
             let kernel = Sq8Kernel::new(m, &query, &scale, &offset, norms_arg);
             // Probe a handful of doc positions — exercises both
@@ -987,7 +1263,17 @@ mod tests {
                     &query,
                     &corpus[(pos as usize) * dim..(pos as usize + 1) * dim],
                 );
-                let want_decoded = distance(m, &query, decoded_doc);
+                let want_decoded = match m {
+                    Metric::Cosine => {
+                        let x_norm = per_doc_norms[pos as usize].sqrt();
+                        if x_norm > 0.0 {
+                            1.0 - dot(&query, decoded_doc) / x_norm
+                        } else {
+                            1.0 - dot(&query, decoded_doc)
+                        }
+                    }
+                    _ => distance(m, &query, decoded_doc),
+                };
                 // Kernel must match the decoded reference very
                 // tightly — it's doing the same math, just fused
                 // through the per-query precompute. Difference
@@ -996,11 +1282,16 @@ mod tests {
                     (got - want_decoded).abs() <= 1e-3,
                     "metric {m:?} pos {pos}: kernel {got} vs decoded ref {want_decoded}"
                 );
-                let rel = (got - want_fp32).abs() / want_fp32.abs().max(1e-2);
-                assert!(
-                    rel <= 0.1 || (got - want_fp32).abs() <= 1.0,
-                    "metric {m:?} pos {pos}: Sq8 {got} vs fp32 {want_fp32} (rel {rel})"
-                );
+                // Cosine Sq8 normalizes the decoded vector at rerank;
+                // [`distance`] assumes unit-norm fp32 inputs, so the
+                // fp32 reference is only meaningful for L2Sq / NegDot.
+                if m != Metric::Cosine {
+                    let rel = (got - want_fp32).abs() / want_fp32.abs().max(1e-2);
+                    assert!(
+                        rel <= 0.1 || (got - want_fp32).abs() <= 1.0,
+                        "metric {m:?} pos {pos}: Sq8 {got} vs fp32 {want_fp32} (rel {rel})"
+                    );
+                }
             }
         }
     }

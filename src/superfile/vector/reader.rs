@@ -8,11 +8,14 @@
 //! Self-contained: owns its `Bytes`. Per-column metadata is parsed
 //! eagerly at `open()`; per-query work happens on demand.
 
-use crate::runtime_bridge::bridge_sync_to_async;
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
-use crate::superfile::lazy_source::{LazyByteSource, LazyByteSourceError};
-use crate::superfile::vector::distance::{Metric, Sq8Kernel, distance_bytes, distance_bytes_codec};
+pub use crate::superfile::lazy_source::Source;
+use crate::superfile::lazy_source::{LazyByteSource, PrefetchedSource};
+use crate::superfile::vector::distance::{
+    Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualKernel, distance_bytes,
+    distance_bytes_codec,
+};
 use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rerank_codec::RerankCodec;
 use crate::superfile::vector::rotation::RandomRotation;
@@ -21,18 +24,16 @@ use bytes::Bytes;
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const OUTER_HEADER_SIZE: usize = 32;
 const DIR_ENTRY_SIZE: usize = 64;
 const SUB_HEADER_SIZE: usize = 56;
 
 /// JSON-deserialized form of one entry in `inf.vec.columns`. The KV
-/// value is a JSON array of these in declaration order. Mirrors
-/// the build-time [`VectorConfig`] but with `metric` as a string
-/// so serde can read it straight from the KV blob.
+/// value is a JSON array of these in declaration order.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VectorColumnConfig {
     pub column: String,
@@ -43,32 +44,25 @@ pub struct VectorColumnConfig {
     pub metric: String,
 }
 
-/// Sq8 quantizer state materialised from the on-disk `codec_meta`
-/// region at open time. The reader picks the candidate's cluster
-/// slice of `scale` / `offset` and passes it into [`Sq8Kernel::new`]
-/// once per (query, cluster) pair to build the per-query precomputes.
-///
-/// Per-cluster (not per-column) quantizer: each IVF cluster
-/// owns its own `(scale[dim], offset[dim])` pair, packed
-/// contiguously cluster-by-cluster. Per-cluster quantization avoids
-/// stretching 256 buckets over the whole column when the rerank signal
-/// lives inside much narrower IVF clusters.
 #[derive(Debug, Clone)]
-pub(super) struct Sq8ColumnMeta {
-    /// Per-cluster, per-dim quantizer scale. Length =
-    /// `n_cent × dim`, laid out cluster-major: cluster `c`'s
-    /// scale array is `scale[c·dim .. (c+1)·dim]`.
-    /// `x_decoded[d] = code[d] * scale[c·dim + d] + offset[c·dim + d]`
-    /// for a doc in cluster `c`.
-    pub scale: Vec<f32>,
-    /// Per-cluster, per-dim quantizer offset. Same layout as `scale`.
-    pub offset: Vec<f32>,
-    /// Per-doc `Σ_d x_decoded²`, length == n_docs, indexed by
-    /// position-in-full (matches the rerank shortlist's `pos`
-    /// field). `Some` for L2Sq columns; `None` for Cosine /
-    /// NegDot (the `Σx²` term cancels out of those distance
-    /// formulas).
-    pub per_doc_norms: Option<Vec<f32>>,
+pub(super) enum Sq8ColumnMeta {
+    Eager {
+        scale: Vec<f32>,
+        offset: Vec<f32>,
+        per_doc_norms: Option<Vec<f32>>,
+    },
+    Lazy {
+        scale_abs_off: usize,
+        offset_abs_off: usize,
+        norms_abs_off: Option<usize>,
+    },
+}
+
+#[derive(Debug)]
+struct Sq8ParsedMeta {
+    scale: Vec<f32>,
+    offset: Vec<f32>,
+    per_doc_norms: Option<Vec<f32>>,
 }
 
 /// Per-column reader state; cached at open time.
@@ -80,11 +74,20 @@ pub struct ColumnReader {
     pub n_docs: u32,
     pub metric: Metric,
     pub rot_seed: u64,
-    /// On-disk rerank codec for this column.
+    /// — on-disk rerank codec for this column. Today
+    /// admits Fp32, Sq8, and RabitqOnly; the parser rejects
+    /// every other codec at open time with a `MalformedVersion`
+    /// until the corresponding milestone lands (None: M4).
     pub rerank_codec: RerankCodec,
-    /// `Sq8`-only quantizer metadata, materialised at open time from
-    /// the `codec_meta` region. `None` for every other codec.
+    /// `Sq8`-only quantizer metadata, materialised
+    /// at open time from the `codec_meta` region. `None` for
+    /// every other codec (Fp32 / RabitqOnly). At dim=384 the
+    /// scale + offset arrays are 3 KB total; for L2Sq columns
+    /// the per-doc norms add `n_docs × 4` bytes (4 MB at 1M
+    /// docs / column). Materialising here amortizes the parse
+    /// across every search call.
     pub(super) sq8_meta: Option<Sq8ColumnMeta>,
+    lazy_sq8_parsed: OnceLock<Arc<Sq8ParsedMeta>>,
     /// Byte range of this column's subsection within the outer blob.
     subsection_range: Range<usize>,
     /// Offsets relative to the subsection start.
@@ -92,13 +95,26 @@ pub struct ColumnReader {
     summary_radius: f32,
     centroids_off: usize,
     cluster_idx_off: usize,
-    codes_off: usize,
-    /// Relative offset of the per-column `codec_meta` region inside
-    /// the subsection. `0` means "no codec_meta in this subsection".
+    /// relative offset of the per-column
+    /// `codec_meta` region inside the subsection. `0` means
+    /// "no codec_meta" (Fp32 / RabitqOnly); non-zero is only
+    /// produced by codecs whose `codec_meta_bytes(...) > 0`
+    /// (`Sq8` is the only one today). In the 013 layout
+    /// `codec_meta` sits between `cluster_idx` and the
+    /// per-cluster blocks (inside the open-time region).
     #[allow(dead_code)]
     codec_meta_off: usize,
-    full_off: usize,
-    doc_ids_off: usize,
+    /// Relative offset of the per-cluster blocks region. Each
+    /// cluster `c` lives at
+    /// `per_cluster_blocks_off + doc_off[c] * stride` for
+    /// `count[c] * stride` bytes, where `stride = code_bytes + 4
+    /// + per_vec_bytes`, formatted as `[codes_chunk:
+    /// count*code_bytes][doc_ids_chunk: count*4][full_chunk:
+    /// count*per_vec_bytes]`. The full-precision rerank vectors
+    /// are interleaved into each block (no separate `full[]`
+    /// region) so one range GET per probed cluster covers the
+    /// estimate codes, doc-ids, and rerank vectors together.
+    per_cluster_blocks_off: usize,
     quant: BitQuantizer,
     /// Cached random rotation built once at open from `(dim, rot_seed)`.
     /// Construction is `O(dim³)` for Gram-Schmidt — at dim=384 that's
@@ -107,13 +123,86 @@ pub struct ColumnReader {
     rot: RandomRotation,
 }
 
-/// Per-open knobs for [`VectorReader::open_with`]. `Default` is the
-/// safe choice (CRC verification on). The argumentless
-/// [`VectorReader::open`] takes the default.
+impl ColumnReader {
+    /// byte range covering one cluster's
+    /// `[codes_chunk + doc_ids_chunk]` block as a single
+    /// contiguous span. Pulled in **one** range fetch per
+    /// probed cluster; the cold-first-search budget collapses
+    /// to `nprobe + 1` range GETs (nprobe cluster blocks + 1
+    /// rerank run) on a freshly-opened lazy reader, down from
+    /// `2 × nprobe + 1` on the 011-era split-range path.
+    ///
+    /// 013 layout: each cluster's block is
+    /// `count * (code_bytes + 4)` bytes formatted as
+    /// `[codes: count*code_bytes][doc_ids: count*4]`. The
+    /// per-cluster `(doc_off, count)` entry recorded in
+    /// `cluster_idx` addresses both halves with no extra
+    /// lookup: byte offset = `per_cluster_blocks_off +
+    /// doc_off * (code_bytes + 4)`.
+    /// Full per-cluster block range `[codes][doc_ids][full]`. The
+    /// production search now fetches only the codes+doc_ids prefix
+    /// (`cluster_codes_doc_ids_range`) plus survivor `full[]` rows
+    /// (`cluster_rerank_row_range`), so this whole-block range is
+    /// retained for the layout-invariant test that pins the on-disk
+    /// shape.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn cluster_block_range(
+        &self,
+        cluster_doc_off: u32,
+        cluster_count: u32,
+    ) -> Range<usize> {
+        let sub_start = self.subsection_range.start;
+        let stride = self.per_cluster_doc_stride();
+        let start = sub_start + self.per_cluster_blocks_off + (cluster_doc_off as usize) * stride;
+        let len = (cluster_count as usize) * stride;
+        start..start + len
+    }
+
+    pub(super) fn cluster_codes_doc_ids_range(
+        &self,
+        cluster_doc_off: u32,
+        cluster_count: u32,
+    ) -> Range<usize> {
+        let sub_start = self.subsection_range.start;
+        let start = sub_start
+            + self.per_cluster_blocks_off
+            + (cluster_doc_off as usize) * self.per_cluster_doc_stride();
+        let len = (cluster_count as usize) * (self.quant.code_bytes() + 4);
+        start..start + len
+    }
+
+    pub(super) fn cluster_rerank_row_range(
+        &self,
+        cluster_doc_off: u32,
+        cluster_count: u32,
+        local_idx: usize,
+    ) -> Range<usize> {
+        let sub_start = self.subsection_range.start;
+        let block_start = sub_start
+            + self.per_cluster_blocks_off
+            + (cluster_doc_off as usize) * self.per_cluster_doc_stride();
+        let prefix_len = (cluster_count as usize) * (self.quant.code_bytes() + 4);
+        let start =
+            block_start + prefix_len + local_idx * self.rerank_codec.per_vector_bytes(self.dim);
+        start..start + self.rerank_codec.per_vector_bytes(self.dim)
+    }
+
+    /// Per-doc byte stride inside a cluster block:
+    /// `code_bytes + 4 (doc_id) + per_vec_bytes (full rerank)`.
+    /// A cluster's block packs `cnt` docs at this stride as
+    /// `[codes_chunk][doc_ids_chunk][full_chunk]`.
+    pub(super) fn per_cluster_doc_stride(&self) -> usize {
+        self.quant.code_bytes() + 4 + self.rerank_codec.per_vector_bytes(self.dim)
+    }
+}
+
+/// Per-open knobs for [`VectorReader::open_with`] and
+/// [`VectorReader::open_lazy`]. `Default` is the safe choice
+/// (CRC verification on). The argumentless [`VectorReader::open`]
+/// takes the default; the lazy path uses
+/// [`Self::for_object_store`] which turns CRC off (a full-blob
+/// scan would defeat every byte-budget number in plan 013).
 ///
-/// Today: `verify_crc` only. Object-storage-native knobs (e.g.
-/// `range_fetch_concurrency`) may land here later under the same
-/// struct.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
     /// Verify the per-subsection CRC during open. Each subsection is
@@ -132,133 +221,14 @@ impl Default for OpenOptions {
     }
 }
 
-/// Backing for a [`VectorReader`].
-///
-/// Two variants, plumbed through every byte-fetch point:
-///
-/// - `InMemory(Bytes)`: caller materialised the full
-///   subsection before opening. Every byte fetch is a
-///   zero-copy `Bytes::slice` against the buffer.
-/// - `Lazy(Arc<dyn LazyByteSource>)`: a range-fetching source
-///   (mmap, object-store range GET, broadcast subscription).
-///   Every byte access in the open + search paths routes
-///   through the same call sites so swapping the backing in
-///   doesn't require a second rewrite.
-///
-/// Both variants expose **sync-only** byte access — every
-/// public surface in `src/` is sync. The
-/// `LazyByteSource::range` trait method is async because
-/// production impls (object store, network sources) are;
-/// [`Source::get_range`] hides that under the same
-/// `block_in_place + Handle::block_on` / one-shot
-/// `current_thread` `Runtime` bridge the supertable's
-/// per-segment reader uses for the disk-cache fetch path.
-/// Hot-path callers (`Source::InMemory`, mmap-backed
-/// `BytesLazyByteSource`) never hit the bridge — both override
-/// `try_get_range_sync` to return zero-copy slices, so
-/// `get_range` resolves on the sync fast path.
-///
-/// `Source: Clone` so `Arc`-shared instances can be handed to
-/// multiple readers / supertable segments without forking the
-/// underlying state. Lazy variant clones the `Arc`; in-memory
-/// clones the `Bytes` (refcount bump).
-#[derive(Clone)]
-pub enum Source {
-    InMemory(Bytes),
-    Lazy(Arc<dyn LazyByteSource>),
-}
-
-impl std::fmt::Debug for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InMemory(b) => f.debug_tuple("InMemory").field(&b.len()).finish(),
-            Self::Lazy(_) => f.debug_struct("Lazy").finish_non_exhaustive(),
-        }
-    }
-}
-
-impl Source {
-    /// Total backing size in bytes — matches what a single
-    /// `get_range(0..len())` would cover.
-    pub fn len(&self) -> usize {
-        match self {
-            Self::InMemory(b) => b.len(),
-            Self::Lazy(s) => s.size() as usize,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Sync best-effort fetch. Always succeeds on
-    /// `Source::InMemory` (zero-copy `Bytes::slice`); on
-    /// `Source::Lazy` returns `Some` only if the range is
-    /// already resident in the source's in-process cache.
-    ///
-    /// Returns `None` for out-of-bounds ranges so callers can
-    /// distinguish "not available sync" from a hard error;
-    /// callers that need a typed error should fall through to
-    /// [`Self::get_range`].
-    pub fn try_get_range_sync(&self, range: Range<usize>) -> Option<Bytes> {
-        let start = range.start as u64;
-        let len = range.len() as u64;
-        match self {
-            Self::InMemory(b) => {
-                if range.end > b.len() {
-                    return None;
-                }
-                Some(b.slice(range))
-            }
-            Self::Lazy(s) => s.try_get_range_sync(start, len),
-        }
-    }
-
-    /// Sync range fetch with internal async bridging on cold
-    /// `Source::Lazy` misses.
-    ///
-    /// Fast path: `try_get_range_sync` (zero-copy `Bytes::slice`
-    /// on `InMemory`; same on `BytesLazyByteSource` / mmap-
-    /// backed sources). This covers every production caller
-    /// today and every hot-path read at default open
-    /// (`Source::Lazy(BytesLazyByteSource over
-    /// Bytes::from_owner(mmap))`).
-    ///
-    /// Cold path (`Source::Lazy` and `try_get_range_sync`
-    /// returned `None`): bridge to the source's `async fn
-    /// range(...)` via `block_in_place + Handle::block_on`
-    /// when there's an ambient tokio runtime, or build a
-    /// throwaway `current_thread` `Runtime` when there isn't.
-    /// This is the same pattern `supertable::query::
-    /// segment_reader` uses for its sync disk-cache fetch path
-    /// (see `segment_reader::segment_reader` for the canonical
-    /// reference). The runtime-build cost on the no-ambient
-    /// fallback is ≈ 1 ms — negligible vs the network
-    /// round-trip the source is about to issue. In production
-    /// the supertable always has an ambient runtime, so the
-    /// no-ambient branch fires only in standalone tests /
-    /// scripts.
-    ///
-    /// Convention: every public surface in `src/` stays sync,
-    /// async is hidden behind well-defined bridge points.
-    /// `Source::get_range` is one of those bridge points.
-    pub fn get_range(&self, range: Range<usize>) -> Result<Bytes, LazyByteSourceError> {
-        if let Some(bytes) = self.try_get_range_sync(range.clone()) {
-            return Ok(bytes);
-        }
-        let Self::Lazy(s) = self else {
-            // `Source::InMemory` always satisfies `try_get_range_sync`
-            // for in-bounds ranges. Reaching this arm means the
-            // request was out of bounds.
-            return Err(LazyByteSourceError::OutOfBounds {
-                start: range.start as u64,
-                len: range.len() as u64,
-                size: self.len() as u64,
-            });
-        };
-        let start = range.start as u64;
-        let len = range.len() as u64;
-        bridge_sync_to_async(s.range(start, len))
+impl OpenOptions {
+    /// defaults tuned for an object-store-backed
+    /// `Source::Lazy` open: `verify_crc = false` (a full-blob
+    /// scan would defeat every cold-open byte-budget number in
+    /// the plan; deployments that need CRC verification opt
+    /// back in and accept the cost).
+    pub fn for_object_store() -> Self {
+        Self { verify_crc: false }
     }
 }
 
@@ -294,14 +264,228 @@ impl VectorReader {
         columns_json: &str,
         opts: OpenOptions,
     ) -> Result<Self, VectorError> {
-        // Every byte fetch routes through `Source::try_get_range_sync`
-        // so the lazy variant can intercept the same call sites
+        // every byte fetch routes through `Source::try_get_range_sync`
+        // so a future lazy variant can intercept the same call sites
         // without a second rewrite. `InMemory` returns zero-copy
         // `Bytes::slice` views; refcount bumps only.
         Self::open_with_source(Source::InMemory(blob), columns_json, opts)
     }
 
-    /// Open over an arbitrary [`Source`].
+    /// Async open against a [`LazyByteSource`].
+    ///
+    /// The lazy open path fetches exactly the bytes the structural
+    /// decode reads:
+    ///   - outer header (`32 B`);
+    ///   - directory + directory CRC;
+    ///   - each subsection header (`56 B`);
+    ///   - Sq8 `codec_meta` only (scale/offset/norm tables).
+    ///
+    /// Centroids, cluster indexes, and per-cluster blocks are search-time
+    /// data, not open-time data. They stay lazy so cold open is governed
+    /// by metadata bytes and serial dependency depth instead of a large
+    /// speculative slab.
+    ///
+    /// `opts.verify_crc = true` is honored, but it forces every
+    /// subsection to be fetched in full and defeats the cold-open
+    /// byte-budget goal of plan 013 — only set it when the
+    /// underlying storage is untrusted and CRC verification is
+    /// load-bearing. The convenience constructor
+    /// [`OpenOptions::for_object_store`] sets it to `false`
+    /// (the load-bearing default discussed in the plan's
+    /// "verify_crc trade-off" section).
+    pub async fn open_lazy(
+        source: Arc<dyn LazyByteSource>,
+        columns_json: &str,
+        opts: OpenOptions,
+    ) -> Result<Self, VectorError> {
+        let blob_size = source.size() as usize;
+        if blob_size < OUTER_HEADER_SIZE + 4 {
+            return Err(VectorError::Read(ReadError::MissingKv(
+                "vector blob header",
+            )));
+        }
+
+        let header_bytes = source
+            .range(0, OUTER_HEADER_SIZE as u64)
+            .await
+            .map_err(|e| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "lazy open: outer header fetch: {e}"
+                )))
+            })?;
+        if &header_bytes[0..8] != format::vec::OUTER_MAGIC {
+            return Err(VectorError::Read(ReadError::BadMagic {
+                section: "vector",
+                expected: format::vec::OUTER_MAGIC,
+                actual: header_bytes[0..8].to_vec(),
+            }));
+        }
+        let version = read_u32_le(&header_bytes[8..12]);
+        if version != format::vec::VERSION {
+            return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
+                "vector blob version {version}"
+            ))));
+        }
+        let n_columns = read_u32_le(&header_bytes[12..16]) as usize;
+        let dir_offset = read_u64_le(&header_bytes[24..32]) as usize;
+        let dir_size = n_columns * DIR_ENTRY_SIZE;
+        let dir_end = dir_offset + dir_size + 4 /* dir CRC */;
+        if dir_end > blob_size {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "lazy open: directory end {dir_end} exceeds blob size {blob_size}",
+            ))));
+        }
+
+        let dir_prefetch = source
+            .range(dir_offset as u64, (dir_end - dir_offset) as u64)
+            .await
+            .map_err(|e| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "lazy open: directory fetch: {e}"
+                )))
+            })?;
+
+        // Validate directory CRC against the prefetched bytes
+        // before walking subsection metadata. A directory-CRC
+        // mismatch on the lazy path is the closest thing we
+        // have to an end-to-end integrity check when
+        // `verify_crc = false`.
+        let dir_bytes_slice = &dir_prefetch[0..dir_size];
+        let dir_crc_expected = read_u32_le(&dir_prefetch[dir_size..dir_size + 4]);
+        let dir_crc_actual = crc32c(dir_bytes_slice);
+        if dir_crc_expected != dir_crc_actual {
+            return Err(VectorError::Read(ReadError::ChecksumMismatch {
+                section: "vector/directory",
+                column: String::new(),
+            }));
+        }
+
+        // Stage the overlay with the exact header and directory bytes.
+        let mut overlay = PrefetchedSource::new(Arc::clone(&source));
+        overlay.install(0, header_bytes.clone());
+        overlay.install(dir_offset as u64, dir_prefetch.clone());
+
+        let mut subsection_meta = Vec::with_capacity(n_columns);
+        let mut subheader_ranges = Vec::with_capacity(n_columns);
+        for i in 0..n_columns {
+            let entry_off = i * DIR_ENTRY_SIZE;
+            let subsection_off =
+                read_u64_le(&dir_bytes_slice[entry_off + 24..entry_off + 32]) as usize;
+            let subsection_len =
+                read_u64_le(&dir_bytes_slice[entry_off + 32..entry_off + 40]) as usize;
+            let dir_codec_meta_off =
+                read_u32_le(&dir_bytes_slice[entry_off + 56..entry_off + 60]) as usize;
+            let dir_codec_meta_size =
+                read_u32_le(&dir_bytes_slice[entry_off + 60..entry_off + 64]) as usize;
+            if subsection_len < SUB_HEADER_SIZE + 4 {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "subsection {i} too short ({subsection_len} bytes)"
+                ))));
+            }
+            let sub_end = subsection_off + subsection_len;
+            if sub_end > blob_size {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "subsection {i} runs past blob",
+                ))));
+            }
+            if dir_codec_meta_size > 0 {
+                let meta_end = dir_codec_meta_off + dir_codec_meta_size;
+                if dir_codec_meta_off < SUB_HEADER_SIZE || meta_end > subsection_len - 4 {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "subsection {i} directory codec_meta range [{dir_codec_meta_off}..\
+                         {meta_end}) outside subsection body length {}",
+                        subsection_len - 4
+                    ))));
+                }
+            }
+            subsection_meta.push((
+                i,
+                entry_off,
+                subsection_off,
+                subsection_len,
+                sub_end,
+                dir_codec_meta_off,
+                dir_codec_meta_size,
+            ));
+            subheader_ranges.push((i, subsection_off));
+        }
+
+        let subheaders_fut =
+            futures::future::try_join_all(subheader_ranges.iter().map(|&(i, subsection_off)| {
+                let source = Arc::clone(&source);
+                async move {
+                    let bytes = source
+                        .range(subsection_off as u64, SUB_HEADER_SIZE as u64)
+                        .await
+                        .map_err(|e| {
+                            VectorError::Read(ReadError::MalformedVersion(format!(
+                                "lazy open: subsection {i} sub-header fetch: {e}"
+                            )))
+                        })?;
+                    Ok::<_, VectorError>((i, subsection_off, bytes))
+                }
+            }));
+        let subheaders = subheaders_fut.await?;
+
+        for (i, subsection_off, sub_header) in subheaders {
+            if &sub_header[0..8] != format::vec::SUB_MAGIC {
+                return Err(VectorError::Read(ReadError::BadMagic {
+                    section: "vector/subsection",
+                    expected: format::vec::SUB_MAGIC,
+                    actual: sub_header[0..8].to_vec(),
+                }));
+            }
+            overlay.install(subsection_off as u64, sub_header.clone());
+            let (_, entry_off, _, subsection_len, sub_end, dir_codec_meta_off, dir_codec_meta_size) =
+                subsection_meta[i];
+            let per_cluster_blocks_off = read_u64_le(&sub_header[48..56]) as usize;
+            let open_time_abs_end = subsection_off + per_cluster_blocks_off;
+            if open_time_abs_end > sub_end {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "subsection {i} per_cluster_blocks_off {per_cluster_blocks_off} \
+                     exceeds subsection length {subsection_len}",
+                ))));
+            }
+            let codec_meta_size = read_u32_le(&sub_header[12..16]) as usize;
+
+            // Codec_meta lives at `[cluster_idx_off + n_cent*8 ..
+            // per_cluster_blocks_off]`. We only need it for Sq8
+            // columns (non-Sq8 declares codec_meta_size = 0).
+            //
+            // Exact-open path: fetch only the codec_meta bytes,
+            // not the centroids / cluster_idx prefix that precedes
+            // them in the subsection.
+            if codec_meta_size > 0 {
+                let cluster_idx_off = read_u64_le(&sub_header[40..48]) as usize;
+                let n_cent = read_u32_le(&dir_bytes_slice[entry_off + 8..entry_off + 12]) as usize;
+                let codec_meta_off = cluster_idx_off + n_cent * 8;
+                let codec_meta_abs_off = subsection_off + codec_meta_off;
+                if codec_meta_abs_off + codec_meta_size != open_time_abs_end {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "subsection {i} codec_meta_size {codec_meta_size} does not end at \
+                         per_cluster_blocks_off {per_cluster_blocks_off}"
+                    ))));
+                }
+                if dir_codec_meta_off != codec_meta_off || dir_codec_meta_size != codec_meta_size {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "subsection {i} directory codec_meta range \
+                         off={dir_codec_meta_off} len={dir_codec_meta_size} does not match \
+                         subheader-derived off={codec_meta_off} len={codec_meta_size}"
+                    ))));
+                }
+                let _ = subsection_len;
+            } else if dir_codec_meta_size != 0 || dir_codec_meta_off != 0 {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "subsection {i} has zero codec_meta_size but directory declares \
+                     off={dir_codec_meta_off} len={dir_codec_meta_size}"
+                ))));
+            }
+        }
+
+        Self::open_with_source(Source::Lazy(Arc::new(overlay)), columns_json, opts)
+    }
+
+    /// open over an arbitrary [`Source`].
     ///
     /// The structural decode path is the same as
     /// [`Self::open_with`]; this entry just accepts a pre-built
@@ -309,19 +493,17 @@ impl VectorReader {
     /// - Test helpers that need to wire a counting / mock
     ///   [`LazyByteSource`] under a `Source::Lazy` (e.g. the
     ///   range-counting integration test).
-    /// - A future `SuperfileReader::open_lazy` rewrite that
-    ///   hands the underlying source through to the
-    ///   `VectorReader` instead of materialising the full
-    ///   subsection up-front.
+    /// - [`Self::open_lazy`] (013 M2), which pre-fetches the
+    ///   open-time region into a [`PrefetchedSource`] overlay
+    ///   and hands the overlay through as `Source::Lazy`.
     ///
-    /// Today's contract on `Source::Lazy`: every byte access in
-    /// the open path goes through
-    /// [`Source::try_get_range_sync`], so the lazy source must
-    /// already have the structural-decode regions (header,
-    /// directory, per-subsection headers) resident — typically
-    /// via a one-range pre-fetch issued by the caller. A future
-    /// async open entrypoint can pre-fetch those regions on the
-    /// source's behalf.
+    /// Contract on `Source::Lazy`: the lazy source's
+    /// `try_get_range_sync` must resolve every range request
+    /// the structural decode path issues — sub-header (56 B per
+    /// column) and codec_meta tail (Sq8 columns only). M2's
+    /// `open_lazy` guarantees this via the overlay; callers
+    /// constructing a `Source::Lazy` directly (tests, mmap-
+    /// backed sources) must arrange equivalent residency.
     pub fn open_with_source(
         source: Source,
         columns_json: &str,
@@ -356,7 +538,8 @@ impl VectorReader {
         let n_docs = read_u64_le(&header[16..24]);
         let dir_offset = read_u64_le(&header[24..32]) as usize;
 
-        // Verify directory CRC.
+        // Verify directory CRC (cheap, needed before we can parallelize
+        // subsection CRCs since we walk dir entries to find them).
         let dir_size = n_columns * DIR_ENTRY_SIZE;
         if dir_offset + dir_size + 4 > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(
@@ -378,8 +561,95 @@ impl VectorReader {
             }));
         }
 
+        // CRC verification: the outer-blob scan and per-subsection scans
+        // each touch ~1.5 GiB at 1M × 384; together they're the bulk of
+        // cold-open cost when `verify_crc=true`. Two stacked optimizations:
+        //
+        // 1. CLMUL-vectorized CRC32C via `crc-fast` in the checksum
+        //    module — folds 8 lanes in vector regs instead of one
+        //    serial dependency chain on `_mm_crc32_u64`, ~10× single-
+        //    thread throughput on the boxes we measure.
+        // 2. Run outer + per-subsection scans in parallel via rayon —
+        //    each subsection's CRC is independent. The outer scan
+        //    overlaps with the largest subsection on its own thread.
+        //
+        // Skip the whole pass via `OpenOptions { verify_crc: false }`
+        // if upstream storage is trusted (content-addressed object
+        // store, etc.); that path is ~12 ms regardless.
         if opts.verify_crc {
-            verify_vector_crcs(&source, &dir_bytes, n_columns)?;
+            // `Bytes` instead of `&'a [u8]` so the par_iter doesn't need
+            // a lifetime parameter — each job owns a refcount-shared view
+            // into the source, which is itself shared via the outer
+            // `Source` for the duration of `open_with`.
+            struct CrcJob {
+                idx: i32,
+                bytes: Bytes,
+                expected: u32,
+            }
+
+            let mut jobs: Vec<CrcJob> = Vec::with_capacity(n_columns + 1);
+
+            let outer_total = source.len();
+            let outer_crc_pos = outer_total - 4;
+            let outer_body = fetch_sync(&source, 0..outer_crc_pos, "outer body")?;
+            let outer_crc_bytes = fetch_sync(&source, outer_crc_pos..outer_total, "outer crc")?;
+            jobs.push(CrcJob {
+                idx: -1,
+                bytes: outer_body,
+                expected: read_u32_le(&outer_crc_bytes),
+            });
+
+            for i in 0..n_columns {
+                let entry_off = i * DIR_ENTRY_SIZE;
+                let subsection_off =
+                    read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
+                let subsection_len =
+                    read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
+                let sub_end = subsection_off + subsection_len;
+                if sub_end > source.len() {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "subsection {i} runs past blob"
+                    ))));
+                }
+                let sub = fetch_sync(&source, subsection_off..sub_end, "subsection")?;
+                if sub.len() < SUB_HEADER_SIZE + 4 {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "subsection {i} too short"
+                    ))));
+                }
+                let sub_crc_pos = sub.len() - 4;
+                // `Bytes::slice` is zero-copy — no second `try_get_range_sync`
+                // round-trip needed since we already hold the subsection.
+                let sub_body = sub.slice(0..sub_crc_pos);
+                let sub_crc_bytes = sub.slice(sub_crc_pos..sub.len());
+                jobs.push(CrcJob {
+                    idx: i as i32,
+                    bytes: sub_body,
+                    expected: read_u32_le(&sub_crc_bytes),
+                });
+            }
+
+            let mismatch = jobs.par_iter().find_map_any(|job| {
+                if crc32c(&job.bytes) != job.expected {
+                    Some(job.idx)
+                } else {
+                    None
+                }
+            });
+            if let Some(idx) = mismatch {
+                if idx < 0 {
+                    return Err(VectorError::Read(ReadError::ChecksumMismatch {
+                        section: "vector",
+                        column: String::new(),
+                    }));
+                } else {
+                    let i = idx as usize;
+                    return Err(VectorError::Read(ReadError::ChecksumMismatch {
+                        section: "vector/subsection",
+                        column: format!(" (column index {i})"),
+                    }));
+                }
+            }
         }
 
         // Parse JSON.
@@ -434,7 +704,7 @@ impl VectorReader {
             let subsection_off = read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
             let subsection_len = read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
             // bytes [40..48] = summary_offset (absolute), [48..52] = summary_length,
-            // [52..56] = codec_id (1) + reserved (3)
+            // [52..56] = codec_id (1) + reserved (3) — plan 012 M1
             let _summary_off_abs = read_u64_le(&dir_bytes[entry_off + 40..entry_off + 48]);
             let codec_id = dir_bytes[entry_off + 52];
             let rerank_codec = RerankCodec::from_codec_id(codec_id).ok_or_else(|| {
@@ -446,7 +716,8 @@ impl VectorReader {
             })?;
             if !rerank_codec.is_implemented() {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' uses rerank codec {} which is not implemented by this version",
+                    "column '{}' uses rerank codec {} which is not implemented yet \
+                     (`fp32`, `sq8`, `rabitq_only` are the supported codecs)",
                     cfg.column,
                     rerank_codec.name()
                 ))));
@@ -477,58 +748,161 @@ impl VectorReader {
                 }
             };
 
-            // Validate subsection bounds + magic. Subsection CRCs are
-            // verified above in the parallel CRC pre-pass when requested.
+            // Validate subsection bounds + magic.
+            //
+            // Open-time region fetch — M2. The reader's
+            // open path only reads the sub-header + (when present)
+            // codec_meta from the subsection. Per-cluster blocks,
+            // full[], and the trailing CRC are search-time concerns.
+            //
+            // To minimize cold-open byte volume against an object-
+            // store-backed `Source::Lazy`, fetch in two phases:
+            //   Phase A — sub-header (56 B) at `[subsection_off..
+            //     subsection_off + SUB_HEADER_SIZE]`. Carries
+            //     codec_meta_size and per_cluster_blocks_off, which
+            //     together fix the open-time region's end offset.
+            //   Phase B — codec_meta tail at `[subsection_off +
+            //     cluster_idx_off + n_cent*8 .. subsection_off +
+            //     per_cluster_blocks_off]` (Sq8 columns only;
+            //     skipped when codec_meta_size == 0).
+            //
+            // On `Source::InMemory` both fetches are zero-copy
+            // `Bytes::slice` views — identical cost to the previous
+            // single full-subsection slice. On `Source::Lazy` they
+            // resolve through the `PrefetchedSource` overlay
+            // installed by `open_lazy` (zero underlying GETs) when
+            // the caller pre-fetched the open-time region; on a
+            // bare `Source::Lazy` they fall through to the
+            // underlying async `range` and round-trip per fetch.
             let sub_end = subsection_off + subsection_len;
             if sub_end > source.len() {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} runs past blob"
                 ))));
             }
-            let sub = fetch_sync(&source, subsection_off..sub_end, "subsection")?;
-            if sub.len() < SUB_HEADER_SIZE + 4 {
+            if subsection_len < SUB_HEADER_SIZE + 4 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "subsection {i} too short"
                 ))));
             }
-            if &sub[0..8] != format::vec::SUB_MAGIC {
+            let sub_header = fetch_sync(
+                &source,
+                subsection_off..subsection_off + SUB_HEADER_SIZE,
+                "sub_header",
+            )?;
+            if &sub_header[0..8] != format::vec::SUB_MAGIC {
                 return Err(VectorError::Read(ReadError::BadMagic {
                     section: "vector/subsection",
                     expected: format::vec::SUB_MAGIC,
-                    actual: sub[0..8].to_vec(),
+                    actual: sub_header[0..8].to_vec(),
                 }));
             }
-            let sub_crc_pos = sub.len() - 4;
+            // CRC was either already verified above in the parallel
+            // pre-pass (when `opts.verify_crc` is true) or skipped on
+            // the lazy fast path. Either way `sub_crc_pos` is derived
+            // from `subsection_len` (directory entry), not from a
+            // resident buffer.
+            let sub_crc_pos = subsection_len - 4;
 
-            // Sub-header parse (SUB_HEADER_SIZE = 56 bytes):
-            //   [8..12]  version  (cross-checked against outer header)
-            //   [12..16] codec_meta_off (former reserved slot; zero
-            //            for Fp32 and legacy fp32 segments).
-            //   [16..24] summary_centroid_offset (relative to sub start)
-            //   [24..28] summary_radius_x100
-            //   [28..32] reserved
-            //   [32..40] centroids_offset
-            //   [40..48] cluster_idx_offset
-            //   [48..52] codes_offset
-            //   [52..56] full_offset
-            let codec_meta_off = read_u32_le(&sub[12..16]) as usize;
-            let summary_off = read_u64_le(&sub[16..24]) as usize;
-            let summary_radius_x100 = read_u32_le(&sub[24..28]);
-            let centroids_off = read_u64_le(&sub[32..40]) as usize;
-            let cluster_idx_off = read_u64_le(&sub[40..48]) as usize;
-            let codes_off = read_u32_le(&sub[48..52]) as usize;
-            let full_off = read_u32_le(&sub[52..56]) as usize;
-            // Fp32 + RabitqOnly all keep zero-byte codec_meta; Sq8
-            // emits per-cluster scale/offset (+ per-doc
-            // norms for L2Sq/Cosine). The per-codec layout check below
-            // validates the declared `codec_meta_off` against the
-            // codec's expected size once `col_n_docs` is known.
+            // Sub-header parse. Only one layout supported
+            // (new-service-only; no pre-013 segments to keep
+            // readable). See `format::vec::SUBSECTION_VERSION`
+            // for the byte-level spec.
+            //   [ 8..12] SUBSECTION_VERSION
+            //   [12..16] codec_meta_size (u32 LE)
+            //   [16..24] summary_centroid_offset (u64 LE)
+            //   [24..28] summary_radius_x100 (u32 LE)
+            //   [28..32] reserved (u32)
+            //   [32..40] centroids_off (u64 LE)
+            //   [40..48] cluster_idx_off (u64 LE)
+            //   [48..56] per_cluster_blocks_off (u64 LE)
+            let subsection_version = read_u32_le(&sub_header[8..12]);
+            if subsection_version != format::vec::SUBSECTION_VERSION {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' has unsupported subsection layout version \
+                     {subsection_version}; this build supports only {}",
+                    cfg.column,
+                    format::vec::SUBSECTION_VERSION
+                ))));
+            }
+
+            let quant = BitQuantizer::new(dim);
+            let code_bytes = quant.code_bytes();
+            if code_bytes == 0 {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' dim={dim} yields code_bytes=0",
+                    cfg.column
+                ))));
+            }
+            let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
             let codec_meta_required_zero =
                 matches!(rerank_codec, RerankCodec::Fp32 | RerankCodec::RabitqOnly);
-            if codec_meta_required_zero && codec_meta_off != 0 {
+
+            let codec_meta_size = read_u32_le(&sub_header[12..16]) as usize;
+            let summary_off = read_u64_le(&sub_header[16..24]) as usize;
+            let summary_radius_x100 = read_u32_le(&sub_header[24..28]);
+            let centroids_off = read_u64_le(&sub_header[32..40]) as usize;
+            let cluster_idx_off = read_u64_le(&sub_header[40..48]) as usize;
+            let per_cluster_blocks_off = read_u64_le(&sub_header[48..56]) as usize;
+
+            if codec_meta_required_zero && codec_meta_size != 0 {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' has codec_meta_off={codec_meta_off} for codec {}; \
-                     fp32/rabitq_only must write codec_meta_off=0 (zero-byte meta region)",
+                    "column '{}' has codec_meta_size={codec_meta_size} for codec {}; \
+                     fp32/rabitq_only must write codec_meta_size=0",
+                    cfg.column,
+                    rerank_codec.name()
+                ))));
+            }
+
+            // codec_meta sits immediately after cluster_idx (when
+            // non-empty); 0 means "no codec_meta" and skips the
+            // sq8_meta parse below.
+            let cluster_idx_size = (n_cent as usize) * 8;
+            let codec_meta_off = if codec_meta_size == 0 {
+                0
+            } else {
+                let off = cluster_idx_off + cluster_idx_size;
+                // codec_meta must immediately precede the
+                // per-cluster blocks region by exactly its
+                // declared size. Any gap is a malformed segment.
+                if off + codec_meta_size != per_cluster_blocks_off {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "column '{}' codec_meta region [{off}..{}) does not abut \
+                         per_cluster_blocks_off={per_cluster_blocks_off}",
+                        cfg.column,
+                        off + codec_meta_size
+                    ))));
+                }
+                off
+            };
+
+            // Per-cluster blocks fill [per_cluster_blocks_off..
+            // sub_crc_pos). Each doc contributes
+            // `code_bytes + 4 (doc_id) + per_vec_bytes (full)` —
+            // codes, doc-id, and rerank vector interleaved per
+            // cluster. Solve for n_docs from the region size.
+            let blocks_region_size = sub_crc_pos - per_cluster_blocks_off;
+            let per_doc_stride = code_bytes + 4 + per_vec_bytes;
+            if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' per_cluster_blocks region {blocks_region_size} bytes \
+                     not divisible by per-doc stride {per_doc_stride}",
+                    cfg.column
+                ))));
+            }
+            let col_n_docs = (blocks_region_size / per_doc_stride) as u32;
+            let actual_codec_meta_size = codec_meta_size;
+
+            // Sq8 + L2Sq adds the per-doc norms tail to codec_meta
+            // (`n_docs * 4` bytes); now that `col_n_docs` is known
+            // we can validate the declared size against the codec's
+            // exact expectation.
+            let expected_codec_meta_size =
+                rerank_codec.codec_meta_bytes(dim, col_n_docs as usize, n_cent as usize, metric);
+            if actual_codec_meta_size != expected_codec_meta_size {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' codec_meta_size={actual_codec_meta_size} on disk but \
+                     codec {} / metric {metric:?} expects {expected_codec_meta_size} bytes",
                     cfg.column,
                     rerank_codec.name()
                 ))));
@@ -536,106 +910,49 @@ impl VectorReader {
 
             let summary_radius = (summary_radius_x100 as f32) / 100.0;
 
-            // Compute n_docs for this column and doc_ids_off.
-            // doc_ids start at end of full vectors. Total subsection
-            // bytes (excluding CRC) = SUB_HEADER + summary + centroids +
-            // cluster_idx + codes + full + doc_ids.
-            let quant = BitQuantizer::new(dim);
-            let code_bytes = quant.code_bytes();
-            // Derive `n_docs` from the codes region size. The codes
-            // region is [codes_off, end_of_codes), where end_of_codes
-            // is either `codec_meta_off` (Sq8) or `full_off` (Fp32 —
-            // no codec_meta region between codes and full).
-            let end_of_codes = if codec_meta_off != 0 {
-                if codec_meta_off <= codes_off || codec_meta_off > full_off {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                        "column '{}' has codec_meta_off={codec_meta_off} outside \
-                         (codes_off={codes_off}, full_off={full_off}]",
-                        cfg.column
-                    ))));
-                }
-                codec_meta_off
-            } else {
-                full_off
-            };
-            let codes_size = end_of_codes - codes_off;
-            if code_bytes == 0 || !codes_size.is_multiple_of(code_bytes) {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' codes size {codes_size} not divisible by {code_bytes}",
-                    cfg.column
-                ))));
-            }
-            let col_n_docs = (codes_size / code_bytes) as u32;
-
-            // `full[]` byte stride depends on the column's rerank codec.
-            // Centroids stay fp32 regardless (only the per-doc rerank
-            // region compresses).
-            let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
-            let full_size = (col_n_docs as usize) * per_vec_bytes;
-            let doc_ids_off = full_off + full_size;
-
-            let expected_codec_meta_size =
-                rerank_codec.codec_meta_bytes(dim, col_n_docs as usize, n_cent as usize, metric);
-            let actual_codec_meta_size = if codec_meta_off != 0 {
-                full_off - codec_meta_off
-            } else {
-                0
-            };
-            if actual_codec_meta_size != expected_codec_meta_size {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' codec_meta region is {actual_codec_meta_size} bytes \
-                     on disk, but codec {} / metric {metric:?} expects \
-                     {expected_codec_meta_size} bytes",
-                    cfg.column,
-                    rerank_codec.name()
-                ))));
-            }
-
-            // Materialise Sq8 codec_meta (per-cluster scale + offset
-            // plus optional per-doc norms) at open time. Parse through
-            // `f32::from_le_bytes` because the codec_meta region is not
-            // guaranteed to be 4-byte aligned for all dimensions.
-            let sq8_meta = if rerank_codec == RerankCodec::Sq8 {
-                let meta_start = codec_meta_off;
-                let meta_end = meta_start + actual_codec_meta_size;
-                let meta_bytes = &sub[meta_start..meta_end];
+            let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8Residual) {
+                let meta_abs_start = subsection_off + codec_meta_off;
+                let meta_abs_end = meta_abs_start + actual_codec_meta_size;
                 let so_block_bytes = (n_cent as usize) * dim * 4;
                 let scale_end = so_block_bytes;
                 let offset_end = scale_end + so_block_bytes;
-                let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
-                let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
-                let per_doc_norms = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
-                    let norms_end = offset_end + (col_n_docs as usize) * 4;
-                    debug_assert_eq!(norms_end, actual_codec_meta_size);
-                    Some(parse_f32_le_vec(&meta_bytes[offset_end..norms_end]))
+                if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
+                    let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
+                    let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
+                    let per_doc_norms = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
+                        let norms_end = offset_end + (col_n_docs as usize) * 4;
+                        debug_assert_eq!(norms_end, actual_codec_meta_size);
+                        Some(parse_f32_le_vec(&meta_bytes[offset_end..norms_end]))
+                    } else {
+                        None
+                    };
+                    Some(Sq8ColumnMeta::Eager {
+                        scale,
+                        offset,
+                        per_doc_norms,
+                    })
                 } else {
-                    None
-                };
-                Some(Sq8ColumnMeta {
-                    scale,
-                    offset,
-                    per_doc_norms,
-                })
+                    Some(Sq8ColumnMeta::Lazy {
+                        scale_abs_off: meta_abs_start,
+                        offset_abs_off: meta_abs_start + scale_end,
+                        norms_abs_off: matches!(metric, Metric::L2Sq | Metric::Cosine)
+                            .then_some(meta_abs_start + offset_end),
+                    })
+                }
             } else {
                 None
             };
 
-            // Bounds-check the cluster_idx + doc_ids regions without
-            // reading them. Search carries `pos = off + i` inline
-            // in the shortlist, so it never needs a `doc_to_pos`
-            // lookup table; open only needs the offset math.
-            let cluster_idx_size = (n_cent as usize) * 8;
+            // Structural bounds. cluster_idx fits before the
+            // per-cluster blocks region. The
+            // `blocks_region_size.is_multiple_of(...)` check
+            // above already pinned n_docs and that the per-cluster
+            // blocks region tiles exactly to the CRC; this check
+            // guards an off-by-one in the cluster_idx slot.
             let cluster_idx_end = cluster_idx_off + cluster_idx_size;
             if cluster_idx_end > sub_crc_pos {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' cluster index runs past subsection",
-                    cfg.column
-                ))));
-            }
-            let doc_ids_size = (col_n_docs as usize) * 4;
-            if doc_ids_off + doc_ids_size > sub_crc_pos {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' doc_ids region runs past subsection",
                     cfg.column
                 ))));
             }
@@ -665,15 +982,14 @@ impl VectorReader {
                 rot_seed,
                 rerank_codec,
                 sq8_meta,
+                lazy_sq8_parsed: OnceLock::new(),
                 subsection_range: subsection_off..sub_end,
                 summary_off,
                 summary_radius,
                 centroids_off,
                 cluster_idx_off,
-                codes_off,
                 codec_meta_off,
-                full_off,
-                doc_ids_off,
+                per_cluster_blocks_off,
                 quant,
                 rot: RandomRotation::new(dim, rot_seed),
             });
@@ -696,14 +1012,25 @@ impl VectorReader {
         self.columns.iter().map(|c| c.name.as_str())
     }
 
+    pub(crate) fn public_rerank_mult(&self, column: &str, base: usize) -> usize {
+        let Some(&cid) = self.column_id_by_name.get(column) else {
+            return base;
+        };
+        let col = &self.columns[cid as usize];
+        if col.rerank_codec.writes_full() {
+            base.max(20)
+        } else {
+            base
+        }
+    }
+
     /// Per-column summary centroid + radius, used by the storage plan
     /// for cross-segment skip pruning.
     pub fn summary(&self, column: &str) -> Option<(Vec<f32>, f32)> {
         let cid = *self.column_id_by_name.get(column)?;
         let col = &self.columns[cid as usize];
-        // Byte access routed through `Source::try_get_range_sync`
-        // — zero-copy on `InMemory`, same call site serves the
-        // lazy path.
+        // byte access routed through `Source::try_get_range_sync`
+        // — zero-copy on `InMemory`, M2/M3 wires the lazy path.
         let sub = self
             .source
             .try_get_range_sync(col.subsection_range.clone())?;
@@ -722,18 +1049,19 @@ impl VectorReader {
     /// distance)` sorted ascending by distance (smaller = closer
     /// for every metric).
     ///
-    /// Sync — every public surface in `src/` is sync. Routes
-    /// per-region byte access through [`Source::get_range`],
-    /// which is itself sync and bridges to the underlying
-    /// async `LazyByteSource::range` only on a cold
-    /// `Source::Lazy` miss (via `block_in_place +
-    /// Handle::block_on`, same pattern as the supertable's
-    /// per-segment reader). On `Source::InMemory` and on
-    /// `Source::Lazy` warm caches (`BytesLazyByteSource`,
-    /// mmap-backed) every fetch resolves zero-copy on the
-    /// sync fast path.
+    /// Sync — matches plan 002 Q9's convention (every public
+    /// surface in `src/` is sync). Routes per-region byte
+    /// access through [`Source::get_range`], which is itself
+    /// sync and bridges to the underlying async
+    /// `LazyByteSource::range` only on a cold `Source::Lazy`
+    /// miss (via `block_in_place + Handle::block_on`, same
+    /// pattern as `supertable::query::segment_reader`). On
+    /// `Source::InMemory` and on `Source::Lazy` warm caches
+    /// (`BytesLazyByteSource`, mmap-backed) every fetch resolves
+    /// zero-copy on the sync fast path.
     ///
-    /// Range count per cold first search at `nprobe = 8`:
+    /// Range count per cold first search at `nprobe = 8` on the
+    /// v0 layout:
     ///
     /// - 1 range for centroids (`n_cent × dim × 4` bytes)
     /// - 1 range for the cluster_idx header (`n_cent × 8` bytes)
@@ -747,7 +1075,10 @@ impl VectorReader {
     /// time (each candidate's position is `off + i` where
     /// `(off, cnt)` is the cluster's entry and `i` is the
     /// in-cluster index), so there is no `doc_to_pos` lookup
-    /// table at all.
+    /// table at all — that 4 MB / 1M-doc allocation was deleted
+    /// in plan 011 M4 once the audit confirmed zero external
+    /// readers. See `claude_plans/011_lazy_reader_loads.md`
+    /// § Search path for the contract.
     pub fn search(
         &self,
         column: &str,
@@ -761,96 +1092,211 @@ impl VectorReader {
             return Ok(Vec::new());
         }
         // Centroids are always fp32 (4 bytes/dim) regardless of codec.
-        // `full[]` (rerank candidates) is codec-dependent.
         let centroid_stride = col.dim * 4;
-        let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
         let sub_start = col.subsection_range.start;
 
-        // 1. Centroids region. `n_cent × dim × 4` bytes,
-        //    ~1.5 MB at default shape. Source::InMemory
-        //    returns a zero-copy Bytes::slice; warm-cache
-        //    Source::Lazy returns the same; cold-miss
-        //    Source::Lazy bridges to async range() via the
-        //    sync→async pattern in Source::get_range.
+        // 1. Centroids + cluster_idx region. These are contiguous
+        //    in the subsection, and search needs both before it can
+        //    issue per-cluster range requests. Fetching them as one
+        //    span saves one request and one foreground RTT batch on
+        //    cold object-store search.
         let centroids_start = sub_start + col.centroids_off;
         let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
-        let centroids = self
-            .source
-            .get_range(centroids_start..centroids_end)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
-
-        // 2. Cluster_idx header. `n_cent × 8` bytes, 8 KB at
-        //    default shape. Cheap.
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * 8;
-        let cluster_idx = self
+        let centroid_idx_region = self
             .source
-            .get_range(idx_start..idx_end)
+            .get_range(centroids_start..idx_end)
             .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
+        let cluster_idx =
+            centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
 
-        // 3. Score centroids → top `nprobe` clusters.
-        let mut centroid_scores = score_centroids(&centroids, col, query);
         let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
-        centroid_scores.truncate(nprobe_eff);
+        // 2. Score centroids → top `nprobe` clusters. Only the
+        // retained probe set is fully sorted; the tail centroids are
+        // partitioned away with `select_nth_unstable_by`.
+        let centroid_scores = score_centroids(&centroids, col, query, nprobe_eff);
 
-        // 4. Rotate query once for the 1-bit code estimator.
+        // 3. Rotate query once for the 1-bit code estimator.
         let mut q_rot = vec![0f32; col.dim];
         col.rot.apply(query, &mut q_rot);
 
-        // 5. Per-cluster fetches (codes + doc_ids) and shortlist
-        //    build. Shortlist tuple is (doc_id, estimate, pos,
-        //    cluster_id); pos = off + i and cluster_id are
-        //    captured inline at no extra fetch cost. cluster_id
-        //    is consumed by the per-cluster Sq8 rerank dispatch to
-        //    pick each candidate's quantizer; Fp32/None
-        //    rerank paths ignore it.
+        // 4. Per-cluster fetches and shortlist build. Shortlist
+        //    tuple is (doc_id, estimate, pos, cluster_id);
+        //    pos = off + i and cluster_id are captured inline at
+        //    no extra fetch cost. cluster_id is consumed by the
+        //    Sq8PerCluster rerank dispatch to pick each
+        //    candidate's quantizer; Fp32/RabitqOnly rerank paths
+        //    ignore it.
+        //
+        //    codes and doc_ids per cluster live in
+        //    one contiguous block on disk (`per-cluster blocks`
+        //    region under the v1 layout), so each cluster pulls
+        //    in **one** `get_range` call. those
+        //    `nprobe` per-cluster GETs fire **concurrently**
+        //    via [`Source::get_ranges_parallel`] instead of
+        //    serially via per-call [`Source::get_range`]. On a
+        //    `Source::Lazy` backed by object storage the cold
+        //    first-search wall-clock collapses from
+        //    `sum_c RTT(c)` to `max_c RTT(c)` (one HTTP/2
+        //    multiplexed batch). On warm/in-memory paths the
+        //    requests resolve through the sync zero-copy
+        //    fast path with no extra cost.
+        let _ = sub_start; // retained for downstream offset math below
         let cb = col.quant.code_bytes();
-        let mut shortlist: Vec<(u32, f32, u32, u32)> = Vec::new();
+        let mut cluster_meta: Vec<(usize, u32, u32)> = Vec::with_capacity(nprobe_eff);
+        let mut cluster_prefix_ranges: Vec<Range<usize>> = Vec::with_capacity(nprobe_eff);
         for &(c, _) in &centroid_scores {
             let (off, cnt) = read_cluster_entry(&cluster_idx, c);
             if cnt == 0 {
                 continue;
             }
-            let codes_start = sub_start + col.codes_off + (off as usize) * cb;
-            let codes_end = codes_start + (cnt as usize) * cb;
-            let codes = self
-                .source
-                .get_range(codes_start..codes_end)
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
-            let did_start = sub_start + col.doc_ids_off + (off as usize) * 4;
-            let did_end = did_start + (cnt as usize) * 4;
-            let doc_ids = self
-                .source
-                .get_range(did_start..did_end)
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
-            score_cluster_codes(
-                &codes,
-                &doc_ids,
-                cnt,
-                off,
-                c as u32,
-                &col.quant,
-                &q_rot,
-                &mut shortlist,
-            );
+            cluster_prefix_ranges.push(col.cluster_codes_doc_ids_range(off, cnt));
+            cluster_meta.push((c, off, cnt));
         }
+        let lazy_sq8_meta_range = lazy_sq8_meta_range(col);
+        let prefix_blocks_sync: Option<Vec<Bytes>> = cluster_prefix_ranges
+            .iter()
+            .map(|range| self.source.try_get_range_sync(range.clone()))
+            .collect();
+        // Survivor-only rerank fetch on BOTH the warm and cold paths.
+        // Coarse-score off the cheap `[codes][doc_ids]` prefix, then
+        // pull the full rerank vectors ONLY for the survivors:
+        //   * warm — the prefix is already resident (the sync probe
+        //     above hits), and survivor rows are sliced from the
+        //     resident segment; zero GETs either wave.
+        //   * cold — fetch the prefixes over the wire in one coalesced
+        //     RTT batch, score, then fetch the survivor rows in a
+        //     second small batch. The dominant per-candidate `full[]`
+        //     bytes (~3.4 MiB/segment — the volume that saturates S3
+        //     read throughput on a 256-way cold fan-out) are never
+        //     moved for non-survivors.
+        // The scoring math is identical to the old full-block path —
+        // same codes, same coarse shortlist, same fp32/Sq8 rerank — so
+        // recall is unchanged; only *which* bytes are fetched differs.
+        let survivor_only_rerank_fetch = true;
+        let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync
+        {
+            let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
+                let mut fetched = self
+                    .source
+                    .get_ranges_parallel(&[range])
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                fetched.pop()
+            } else {
+                None
+            };
+            (prefix_blocks, meta_bytes)
+        } else {
+            // Cold: fetch only the codes+doc_ids prefixes (coalesced)
+            // plus the Sq8 meta in one batch. Full vectors are fetched
+            // later, for survivors only.
+            get_cluster_ranges_coalesced_with_extra(
+                &self.source,
+                &cluster_prefix_ranges,
+                lazy_sq8_meta_range,
+            )
+            .map_err(|e| VectorError::LazySource(e.to_string()))?
+        };
+        debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
+
+        // Each cluster block is `[codes_chunk][doc_ids_chunk]
+        // [full_chunk]` (interleaved layout). Score off the codes
+        // + doc_ids prefix now; the full_chunk suffix is read back
+        // for the survivors at rerank time — from the *same*
+        // already-fetched block, so rerank issues zero extra GETs.
+        let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
+        // Score each probed cluster's 1-bit codes into the shortlist.
+        // The per-cluster slices are zero-copy `Bytes` views; the
+        // actual estimate scan is the hot CPU work. It runs in
+        // parallel across clusters once the candidate pool is large
+        // enough to amortize the rayon hand-off — the 10M supertable's
+        // `nprobe × segments` fan-out clears the bar, while the 1M
+        // single-superfile nprobe=1 hot path (one cluster) stays
+        // serial. Cluster scoring is order-independent: every survivor
+        // is re-sorted by estimate immediately below, so the parallel
+        // and serial shortlists rank identically.
+        let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
+        let coarse_limit = if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
+            k
+        } else {
+            k.saturating_mul(rerank_mult)
+        };
+        if coarse_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let score_block =
+            |heap: &mut BoundedCoarseHeap,
+             (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
+                let codes_len = (cnt as usize) * cb;
+                let doc_ids_len = (cnt as usize) * 4;
+                debug_assert_eq!(
+                    block.len(),
+                    if survivor_only_rerank_fetch {
+                        codes_len + doc_ids_len
+                    } else {
+                        codes_len + doc_ids_len + (cnt as usize) * full_vec_bytes
+                    }
+                );
+                let codes = block.slice(0..codes_len);
+                let doc_ids = block.slice(codes_len..codes_len + doc_ids_len);
+                score_cluster_codes_into_heap(
+                    &codes, &doc_ids, cnt, off, c as u32, &col.quant, &q_rot, heap,
+                );
+            };
+        let shortlist_heap = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
+            cluster_meta
+                .par_iter()
+                .zip(cluster_blocks.par_iter())
+                .fold(
+                    || BoundedCoarseHeap::new(coarse_limit),
+                    |mut heap, item| {
+                        score_block(&mut heap, item);
+                        heap
+                    },
+                )
+                .reduce(
+                    || BoundedCoarseHeap::new(coarse_limit),
+                    |mut left, right| {
+                        left.merge(right);
+                        left
+                    },
+                )
+        } else {
+            let mut heap = BoundedCoarseHeap::new(coarse_limit);
+            for item in cluster_meta.iter().zip(cluster_blocks.iter()) {
+                score_block(&mut heap, item);
+            }
+            heap
+        };
+        let mut shortlist = shortlist_heap.into_vec();
 
         if shortlist.is_empty() {
             return Ok(Vec::new());
         }
 
-        // `None` columns have no `full[]` region to refine against:
-        // the 1-bit shortlist is the final ranking. Return sign-flipped
-        // estimates so the public `(doc_id, distance)` convention still
-        // means smaller is closer.
-        if !col.rerank_codec.writes_full() {
+        // `None` codec short-circuit. The 1-bit
+        // shortlist *is* the final ranking — there's no `full[]`
+        // region on disk and no rerank step. We:
+        //   * partial-sort the shortlist to land the top-K by
+        //     descending estimate (higher dot estimate = better
+        //     candidate),
+        //   * fully sort the retained k for a stable output
+        //     ordering, and
+        //   * flip the sign of the estimate so the returned
+        //     `(doc_id, distance)` pairs follow the standard
+        //     "smaller = closer" convention for the caller. The
+        //     value is a 1-bit-derived score, not a true metric
+        //     distance; for `None` columns recall is the
+        //     contract, not numerical agreement with fp32.
+        //
+        // `rerank_mult` is intentionally ignored here — there's
+        // nothing to refine. Storage shrinks by ~30×; recall
+        // drops 0.05-0.15 vs rerank-equipped codecs (corpus-
+        // dependent). M5 will surface the bench numbers.
+        if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
             let _ = rerank_mult;
-            if shortlist.len() > k {
-                shortlist.select_nth_unstable_by(k - 1, |a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
-                });
-                shortlist.truncate(k);
-            }
             shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
             return Ok(shortlist
                 .into_iter()
@@ -858,46 +1304,81 @@ impl VectorReader {
                 .collect());
         }
 
-        // 6. Trim to `k × rerank_mult` by descending estimate.
-        let want = (k.saturating_mul(rerank_mult)).min(shortlist.len());
-        if want < shortlist.len() {
-            shortlist.select_nth_unstable_by(want.saturating_sub(1), |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+        // 6. Build lightweight rerank references into the cluster
+        //    blocks already in hand — no second fetch and no survivor
+        //    byte packing. Each block's `full_chunk` follows its
+        //    `[codes][doc_ids]` prefix; candidate at cluster-order
+        //    position `pos = cluster_doc_off + i` lives at in-block
+        //    offset `cnt*cb + cnt*4 + i*stride`.
+        //
+        //    Because `full[]` rides inside the per-cluster block,
+        //    the whole cold first search is just the `nprobe`
+        //    cluster-block GETs (issued in parallel above) — the
+        //    rerank step adds zero round-trips and zero extra
+        //    bytes over the wire.
+        let mut block_by_cid: HashMap<u32, usize> = HashMap::with_capacity(cluster_meta.len());
+        for (bi, &(c, _, _)) in cluster_meta.iter().enumerate() {
+            block_by_cid.insert(c as u32, bi);
+        }
+        let stride = full_vec_bytes;
+        let mut candidates = Vec::with_capacity(shortlist.len());
+        let mut survivor_full_ranges = if survivor_only_rerank_fetch {
+            Some(Vec::with_capacity(shortlist.len()))
+        } else {
+            None
+        };
+        for &(did, _, pos, cluster_id) in &shortlist {
+            let bi = block_by_cid[&cluster_id];
+            let (_, off, cnt) = cluster_meta[bi];
+            let full_start = (cnt as usize) * cb + (cnt as usize) * 4;
+            let local = (pos - off) as usize;
+            let full_idx = if let Some(ranges) = survivor_full_ranges.as_mut() {
+                let idx = ranges.len();
+                ranges.push(col.cluster_rerank_row_range(off, cnt, local));
+                Some(idx)
+            } else {
+                None
+            };
+            candidates.push(RerankCandidate {
+                did,
+                pos,
+                cluster_id,
+                block_idx: bi,
+                full_off: full_start + local * stride,
+                full_idx,
             });
-            shortlist.truncate(want);
         }
-
-        // 7. Fat range over `full[]` covering all rerank
-        //    candidates. `[min_pos..max_pos + 1]` over-fetches
-        //    today (positions span probed clusters); a future
-        //    layout that interleaves codes + doc_ids + full per
-        //    cluster would drop this to `nprobe` cluster-sized
-        //    ranges. Single get_range either way.
-        let mut min_pos = shortlist[0].2;
-        let mut max_pos = shortlist[0].2;
-        for &(_, _, pos, _) in &shortlist[1..] {
-            if pos < min_pos {
-                min_pos = pos;
-            }
-            if pos > max_pos {
-                max_pos = pos;
-            }
-        }
-        let full_start = sub_start + col.full_off + (min_pos as usize) * full_vec_bytes;
-        let full_end = sub_start + col.full_off + ((max_pos as usize) + 1) * full_vec_bytes;
-        let full_run = self
-            .source
-            .get_range(full_start..full_end)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let survivor_full_rows = if let Some(ranges) = survivor_full_ranges {
+            // Coalesce the survivor rows: on the cold path these are
+            // scattered single-vector ranges inside each cluster's
+            // `full[]` region, so merging adjacent ones (bounded gap /
+            // overfetch) keeps the second-wave GET count down. On the
+            // warm path the underlying fetch resolves sync/zero-copy,
+            // so the coalescing is just a cheap sort.
+            Some(
+                get_cluster_ranges_coalesced(&self.source, &ranges)
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?,
+            )
+        } else {
+            None
+        };
 
         // 8. CPU-only rerank using the true metric. Sq8 columns
         //    pre-build a per-query kernel that folds the per-dim
         //    scale/offset into the query (one `dim/8` SIMD pass);
         //    the per-doc inner step is then a plain u8→f32 widen
         //    + SIMD dot. Fp32 takes the flat dispatch.
-        Ok(rerank_candidates_in_run(
-            &full_run, min_pos, &shortlist, col, query, k,
-        ))
+        rerank_candidates_from_blocks(
+            &self.source,
+            lazy_sq8_meta_bytes.as_ref(),
+            &cluster_blocks,
+            survivor_full_rows.as_deref(),
+            &candidates,
+            col,
+            query,
+            k,
+        )
+        .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
     /// Look up the column by name and validate `query.len() == col.dim`
@@ -930,15 +1411,20 @@ impl VectorReader {
 }
 
 /// Score `query` against every centroid in `centroids_bytes` and
-/// return the per-cluster `(cluster_id, distance)` pairs sorted by
-/// ascending distance (closest first). Caller truncates to `nprobe`.
+/// return the top `nprobe` `(cluster_id, distance)` pairs sorted by
+/// ascending distance (closest first).
 ///
 /// Takes a `&[u8]` view so the caller can hand in either an
 /// in-memory subsection slice or the just-fetched centroids
 /// region bytes from [`Source::get_range`] — both reach this
 /// helper through the same shape.
 #[inline]
-fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) -> Vec<(usize, f32)> {
+fn score_centroids(
+    centroids_bytes: &[u8],
+    col: &ColumnReader,
+    query: &[f32],
+    nprobe: usize,
+) -> Vec<(usize, f32)> {
     // Centroids are stored as fp32 regardless of the column's rerank
     // codec — only the per-doc `full[]` region compresses. `distance_bytes`
     // assumes fp32, which is correct here.
@@ -949,23 +1435,26 @@ fn score_centroids(centroids_bytes: &[u8], col: &ColumnReader, query: &[f32]) ->
             (c, distance_bytes(col.metric, query, bytes))
         })
         .collect();
+    if nprobe < scores.len() {
+        scores.select_nth_unstable_by(nprobe, |a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
+        });
+        scores.truncate(nprobe);
+    }
     scores.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     scores
 }
 
-/// Score one cluster's 1-bit codes against the rotated query and
-/// append `(doc_id, estimate, pos_in_full, cluster_id)` tuples to
-/// `shortlist`. `pos = off + i` is the candidate's index in the
-/// column's `full[]` array — captured here at no extra cost so the
-/// rerank step doesn't need any lookup table. `cluster_id` is
-/// captured for the per-cluster Sq8 rerank dispatch: each candidate
-/// knows which cluster's `(scale, offset)` quantizer to dequant
-/// against. For Fp32/None the cluster_id is recorded but
-/// ignored by the rerank step (kept for layout simplicity — the
-/// extra 4 bytes per shortlist entry are noise next to the
-/// `k × rerank_mult` heap traffic).
+/// Minimum candidate-pool size before per-query scans (coarse 1-bit
+/// scoring and rerank) switch from a serial loop to a rayon parallel
+/// scan. Below this the fixed rayon dispatch cost outweighs the
+/// multicore speedup, so small queries — notably the 1M single-
+/// superfile nprobe=1 hot path — stay serial, while the 10M
+/// supertable's `nprobe × segments` fan-out goes parallel.
+const PARALLEL_SCAN_MIN: usize = 2048;
+
 #[inline]
-fn score_cluster_codes(
+fn score_cluster_codes_into_heap(
     cluster_codes: &[u8],
     cluster_doc_ids: &[u8],
     cnt: u32,
@@ -973,17 +1462,9 @@ fn score_cluster_codes(
     cluster_id: u32,
     quant: &BitQuantizer,
     q_rot: &[f32],
-    shortlist: &mut Vec<(u32, f32, u32, u32)>,
+    out: &mut BoundedCoarseHeap,
 ) {
     let cb = quant.code_bytes();
-    // Per-query precompute for the AVX-512 RaBitQ estimator: the
-    // estimate is `2 * Σ_{bit=1} q_rot[d] − q_total`; the second
-    // term is constant across every candidate scored against
-    // this query, so we hoist it out of the per-doc loop. Cost
-    // ≪ 1 % across the typical IVF probe (thousands of candidates).
-    // Non-AVX-512 hosts ignore the precomputed value and fall
-    // back to the original sign-table kernel, so the numeric
-    // result is identical regardless.
     let q_total: f32 = q_rot.iter().sum();
     for i in 0..cnt as usize {
         let code = &cluster_codes[i * cb..(i + 1) * cb];
@@ -994,8 +1475,131 @@ fn score_cluster_codes(
             cluster_doc_ids[i * 4 + 2],
             cluster_doc_ids[i * 4 + 3],
         ]);
-        shortlist.push((did, est, off + i as u32, cluster_id));
+        out.push(CoarseCandidate {
+            did,
+            estimate: est,
+            pos: off + i as u32,
+            cluster_id,
+        });
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CoarseCandidate {
+    did: u32,
+    estimate: f32,
+    pos: u32,
+    cluster_id: u32,
+}
+
+impl PartialEq for CoarseCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.estimate == other.estimate
+            && self.did == other.did
+            && self.pos == other.pos
+            && self.cluster_id == other.cluster_id
+    }
+}
+
+impl Eq for CoarseCandidate {}
+
+impl PartialOrd for CoarseCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CoarseCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap. Reverse estimate ordering so `peek()`
+        // is the worst retained candidate; higher estimates are better.
+        other
+            .estimate
+            .partial_cmp(&self.estimate)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| other.did.cmp(&self.did))
+            .then_with(|| other.pos.cmp(&self.pos))
+            .then_with(|| other.cluster_id.cmp(&self.cluster_id))
+    }
+}
+
+struct BoundedCoarseHeap {
+    limit: usize,
+    heap: BinaryHeap<CoarseCandidate>,
+}
+
+impl BoundedCoarseHeap {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(limit.max(1)),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, candidate: CoarseCandidate) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.heap.len() < self.limit {
+            self.heap.push(candidate);
+            return;
+        }
+        if self
+            .heap
+            .peek()
+            .is_some_and(|worst| candidate.estimate > worst.estimate)
+        {
+            let mut worst = self
+                .heap
+                .peek_mut()
+                .expect("heap is non-empty because len == limit");
+            *worst = candidate;
+        }
+    }
+
+    fn merge(&mut self, other: BoundedCoarseHeap) {
+        for candidate in other.heap {
+            self.push(candidate);
+        }
+    }
+
+    fn into_vec(self) -> Vec<(u32, f32, u32, u32)> {
+        self.heap
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.did,
+                    candidate.estimate,
+                    candidate.pos,
+                    candidate.cluster_id,
+                )
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RerankCandidate {
+    did: u32,
+    pos: u32,
+    cluster_id: u32,
+    block_idx: usize,
+    full_off: usize,
+    full_idx: Option<usize>,
+}
+
+#[inline]
+fn candidate_full_bytes<'a>(
+    blocks: &'a [Bytes],
+    survivor_full_rows: Option<&'a [Bytes]>,
+    cand: &RerankCandidate,
+    stride: usize,
+) -> &'a [u8] {
+    if let (Some(rows), Some(idx)) = (survivor_full_rows, cand.full_idx) {
+        return &rows[idx];
+    }
+    &blocks[cand.block_idx][cand.full_off..cand.full_off + stride]
 }
 
 /// Decode one cluster's `(off, cnt)` entry from
@@ -1022,14 +1626,10 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 /// Full-precision rerank over `shortlist`, returning the top-`k`
 /// `(doc_id, distance)` pairs sorted by ascending distance.
 ///
-/// `full_run` is a contiguous run of `full[]` bytes covering at
-/// least the byte range `[base_pos × stride .. (max_pos + 1) ×
-/// stride)`, where `stride = col.rerank_codec.per_vector_bytes(
-/// col.dim)` — every candidate's `pos` in `shortlist` must lie
-/// in `[base_pos, base_pos + full_run.len() / stride)`. For the
-/// sync path, `base_pos = 0` and `full_run` is the column's
-/// whole `full[]` slice; for the async path, `base_pos =
-/// min(pos)` and `full_run` is the per-query fat range.
+/// `candidates` points into the already-fetched per-cluster blocks:
+/// each entry carries `(block_idx, full_off)` for its `full[]` row.
+/// That avoids allocating and copying a packed survivor buffer on
+/// every query while still keeping rerank byte lookup O(1).
 ///
 /// Dispatches on `col.rerank_codec`:
 /// - **Fp32**: flat dispatch via [`distance_bytes_codec`]
@@ -1040,92 +1640,366 @@ fn read_cluster_entry(cluster_idx_slice: &[u8], c: usize) -> (u32, u32) {
 ///   per-doc decoded-norm cached at encode time short-circuits
 ///   `Σx²` for L2Sq).
 #[inline]
-fn rerank_candidates_in_run(
-    full_run: &[u8],
-    base_pos: u32,
-    shortlist: &[(u32, f32, u32, u32)],
+fn rerank_candidates_from_blocks(
+    source: &Source,
+    lazy_sq8_meta_bytes: Option<&Bytes>,
+    cluster_blocks: &[Bytes],
+    survivor_full_rows: Option<&[Bytes]>,
+    candidates: &[RerankCandidate],
     col: &ColumnReader,
     query: &[f32],
     k: usize,
-) -> Vec<(u32, f32)> {
+) -> Result<Vec<(u32, f32)>, crate::superfile::lazy_source::LazyByteSourceError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
     let mut reranked: Vec<(u32, f32)> = match col.rerank_codec {
-        RerankCodec::Fp32 => shortlist
-            .iter()
-            .map(|&(did, _, pos, _)| {
-                let local = (pos - base_pos) as usize;
-                let start = local * stride;
-                let bytes = &full_run[start..start + stride];
-                let d = distance_bytes_codec(col.metric, col.rerank_codec, query, bytes);
-                (did, d)
-            })
-            .collect(),
-        RerankCodec::Sq8 => {
-            // Per-cluster Sq8: each candidate's cluster_id selects
-            // a `(scale[dim], offset[dim])` slice from the column
-            // meta. We build a fresh per-cluster `Sq8Kernel`
-            // lazily — at typical nprobe ≤ 64 we touch only a
-            // handful of clusters per query, and building a
-            // kernel is `O(dim)` SIMD work (one pass over the
-            // query × scale + one over query × offset). Caching
-            // by cluster_id avoids rebuilding the kernel for
-            // sibling candidates in the same cluster (most of
-            // the shortlist).
-            //
-            // Metadata is materialised at open time on every Sq8
-            // column; the unwrap can't fail unless someone
-            // constructs a `ColumnReader` outside `open_with`.
+        RerankCodec::Fp32 => {
+            // Exact fp32 rerank — every survivor is independent, so the
+            // gather + SIMD distance runs in parallel once the shortlist
+            // is large enough to amortize the rayon hand-off (high
+            // rerank_mult on the supertable fan-out). The output is
+            // sorted by distance below, so parallel and serial rank
+            // identically.
+            let rerank_one = |cand: &RerankCandidate| {
+                let bytes = candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
+                (
+                    cand.did,
+                    distance_bytes_codec(col.metric, col.rerank_codec, query, bytes),
+                )
+            };
+            if candidates.len() >= PARALLEL_SCAN_MIN {
+                candidates.par_iter().map(rerank_one).collect()
+            } else {
+                candidates.iter().map(rerank_one).collect()
+            }
+        }
+        RerankCodec::Sq8Residual => {
             let meta = col
                 .sq8_meta
                 .as_ref()
-                .expect("Sq8 column must carry sq8_meta (built in open_with)");
+                .expect("Sq8Residual column must carry sq8_meta (built in open_with)");
             let dim = col.dim;
-            // Cache the per-cluster `Sq8Kernel` indexed by
-            // `cluster_id` so sibling candidates in the same
-            // cluster (most of the shortlist at typical nprobe
-            // values) reuse the kernel rather than rebuilding the
-            // O(dim) per-query precompute. `cluster_id` is bounded
-            // by `col.n_cent` (which is what built the column's
-            // IVF index), so a flat `Vec<Option<Sq8Kernel>>` of
-            // that length indexes in O(1) — no hash, no
-            // hashbrown bucket walk — and at typical
-            // `n_cent = 1024` costs ~16 KiB of `Option<Box<…>>`
-            // slots which is negligible against the per-query
-            // working set.
-            let n_cent = col.n_cent as usize;
-            let mut kernel_cache: Vec<Option<Sq8Kernel>> = (0..n_cent).map(|_| None).collect();
-            shortlist
-                .iter()
-                .map(|&(did, _, pos, cluster_id)| {
-                    let local = (pos - base_pos) as usize;
-                    let start = local * stride;
-                    let bytes = &full_run[start..start + stride];
-                    let c = cluster_id as usize;
-                    let kernel = kernel_cache[c].get_or_insert_with(|| {
-                        let scale_c = &meta.scale[c * dim..(c + 1) * dim];
-                        let offset_c = &meta.offset[c * dim..(c + 1) * dim];
-                        Sq8Kernel::new(
-                            col.metric,
+            // `Sq8Residual` stores `[code dim u8 ‖ residual dim i8]`
+            // per vector (`stride == 2·dim`); the first `dim` bytes
+            // are the Sq8 code leg the shortlist scoring reads.
+            match meta {
+                Sq8ColumnMeta::Eager {
+                    scale,
+                    offset,
+                    per_doc_norms,
+                } => sq8_score_and_refine(
+                    candidates,
+                    cluster_blocks,
+                    survivor_full_rows,
+                    col,
+                    query,
+                    scale,
+                    offset,
+                    per_doc_norms.as_deref(),
+                    k,
+                    stride,
+                ),
+                Sq8ColumnMeta::Lazy {
+                    scale_abs_off,
+                    offset_abs_off,
+                    norms_abs_off,
+                } => {
+                    if let Some(meta_bytes) = lazy_sq8_meta_bytes {
+                        let parsed = Arc::clone(col.lazy_sq8_parsed.get_or_init(|| {
+                            Arc::new(parse_sq8_meta_bytes(
+                                meta_bytes,
+                                col.n_cent as usize,
+                                dim,
+                                col.n_docs as usize,
+                                norms_abs_off.is_some(),
+                            ))
+                        }));
+                        return Ok(sq8_score_and_refine(
+                            candidates,
+                            cluster_blocks,
+                            survivor_full_rows,
+                            col,
                             query,
-                            scale_c,
-                            offset_c,
-                            meta.per_doc_norms.as_deref(),
-                        )
-                    });
-                    let d = kernel.distance_at(pos, bytes);
-                    (did, d)
-                })
-                .collect()
+                            parsed.scale.as_slice(),
+                            parsed.offset.as_slice(),
+                            parsed.per_doc_norms.as_deref(),
+                            k,
+                            stride,
+                        ));
+                    }
+                    let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
+                    clusters.sort_unstable();
+                    clusters.dedup();
+
+                    let cluster_meta_len = dim * 4;
+                    let mut ranges = Vec::with_capacity(clusters.len() * 2);
+                    for &cluster_id in &clusters {
+                        let c = cluster_id as usize;
+                        let scale_start = *scale_abs_off + c * cluster_meta_len;
+                        let offset_start = *offset_abs_off + c * cluster_meta_len;
+                        ranges.push(scale_start..scale_start + cluster_meta_len);
+                        ranges.push(offset_start..offset_start + cluster_meta_len);
+                    }
+                    let bytes = source.get_ranges_parallel(&ranges)?;
+                    let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
+                        HashMap::with_capacity(clusters.len());
+                    for (idx, &cluster_id) in clusters.iter().enumerate() {
+                        let scale = parse_f32_le_vec(&bytes[idx * 2]);
+                        let offset = parse_f32_le_vec(&bytes[idx * 2 + 1]);
+                        scale_offset_by_cluster.insert(cluster_id, (scale, offset));
+                    }
+
+                    let norm_by_pos = if let Some(norms_abs_off) = norms_abs_off {
+                        let mut spans: HashMap<u32, (u32, u32)> = HashMap::new();
+                        for cand in candidates {
+                            spans
+                                .entry(cand.cluster_id)
+                                .and_modify(|(lo, hi)| {
+                                    *lo = (*lo).min(cand.pos);
+                                    *hi = (*hi).max(cand.pos);
+                                })
+                                .or_insert((cand.pos, cand.pos));
+                        }
+                        let mut span_items: Vec<(u32, u32, u32)> = spans
+                            .into_iter()
+                            .map(|(cluster_id, (lo, hi))| (cluster_id, lo, hi))
+                            .collect();
+                        span_items.sort_unstable_by_key(|&(cluster_id, _, _)| cluster_id);
+                        let norm_ranges: Vec<Range<usize>> = span_items
+                            .iter()
+                            .map(|&(_, lo, hi)| {
+                                let start = *norms_abs_off + lo as usize * 4;
+                                start..start + (hi - lo + 1) as usize * 4
+                            })
+                            .collect();
+                        let norm_bytes = source.get_ranges_parallel(&norm_ranges)?;
+                        let mut out = HashMap::new();
+                        for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
+                            let vals = parse_f32_le_vec(&bytes);
+                            for (i, pos) in (lo..=hi).enumerate() {
+                                out.insert(pos, vals[i]);
+                            }
+                        }
+                        Some(out)
+                    } else {
+                        None
+                    };
+
+                    let scored: Vec<(u32, f32, usize, u32, u32)> = candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, cand)| {
+                            let row = candidate_full_bytes(
+                                cluster_blocks,
+                                survivor_full_rows,
+                                cand,
+                                stride,
+                            );
+                            let code = &row[..dim];
+                            let (scale, offset) = scale_offset_by_cluster
+                                .get(&cand.cluster_id)
+                                .expect("cluster metadata fetched");
+                            let kernel = Sq8Kernel::new(
+                                col.metric,
+                                query,
+                                scale.as_slice(),
+                                offset.as_slice(),
+                                None,
+                            );
+                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&cand.pos).copied());
+                            (
+                                cand.did,
+                                kernel.distance_with_norm(code, norm),
+                                i,
+                                cand.pos,
+                                cand.cluster_id,
+                            )
+                        })
+                        .collect();
+                    // Refine the top final-set with the residual leg.
+                    // The residual kernel takes its per-doc norm
+                    // explicitly because the lazy norms live in a
+                    // sparse `pos → norm` map, not a contiguous slice.
+                    let mut scored = scored;
+                    scored
+                        .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                    let final_refine = k.saturating_mul(2).max(k).min(scored.len());
+                    scored.truncate(final_refine);
+                    let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
+                    scored
+                        .into_iter()
+                        .map(|(did, _, i, pos, cluster_id)| {
+                            let row = candidate_full_bytes(
+                                cluster_blocks,
+                                survivor_full_rows,
+                                &candidates[i],
+                                stride,
+                            );
+                            let code = &row[..dim];
+                            let residual = &row[dim..dim * 2];
+                            let kernel = rk.entry(cluster_id).or_insert_with(|| {
+                                let (scale, offset) = scale_offset_by_cluster
+                                    .get(&cluster_id)
+                                    .expect("cluster metadata fetched");
+                                Sq8ResidualKernel::new(
+                                    col.metric,
+                                    query,
+                                    scale.as_slice(),
+                                    offset.as_slice(),
+                                    SQ8_RESIDUAL_DIVISOR,
+                                    None,
+                                )
+                            });
+                            let norm = norm_by_pos.as_ref().and_then(|m| m.get(&pos).copied());
+                            (did, kernel.distance_with_norm(code, residual, norm))
+                        })
+                        .collect()
+                }
+            }
         }
         RerankCodec::RabitqOnly => unreachable!(
-            "rerank_candidates_in_run reached with RabitqOnly codec — RabitqOnly \
-             columns have no full[] region and should short-circuit before \
-             the rerank step"
+            "rerank_candidates_in_run reached with None codec — None columns \
+             have no full[] region and should short-circuit before the rerank step"
         ),
     };
     reranked.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     reranked.truncate(k);
-    reranked
+    Ok(reranked)
+}
+
+/// Shared Sq8 first-pass scorer used by both the eager and
+/// lazy-with-parsed-cache arms of `rerank_candidates_from_blocks`.
+/// Builds one [`Sq8Kernel`] per distinct probed cluster from the
+/// provided `scale`/`offset` slices, scores every candidate (parallel
+/// when the shortlist exceeds [`PARALLEL_SCAN_MIN`]), then applies the
+/// residual refinement via [`residual_refine_from_blocks`].
+///
+/// Both code paths keep their own data-access strategy (eager mmap vs
+/// lazy range GETs); only the scoring math is shared here.
+fn sq8_score_and_refine(
+    candidates: &[RerankCandidate],
+    cluster_blocks: &[Bytes],
+    survivor_full_rows: Option<&[Bytes]>,
+    col: &ColumnReader,
+    query: &[f32],
+    scale: &[f32],
+    offset: &[f32],
+    per_doc_norms: Option<&[f32]>,
+    k: usize,
+    stride: usize,
+) -> Vec<(u32, f32)> {
+    let dim = col.dim;
+    let mut cids: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
+    cids.sort_unstable();
+    cids.dedup();
+    let kernels: HashMap<u32, Sq8Kernel> = cids
+        .into_iter()
+        .map(|cid| {
+            let c = cid as usize;
+            let scale_c = &scale[c * dim..(c + 1) * dim];
+            let offset_c = &offset[c * dim..(c + 1) * dim];
+            (
+                cid,
+                Sq8Kernel::new(col.metric, query, scale_c, offset_c, per_doc_norms),
+            )
+        })
+        .collect();
+    let score_one = |(i, cand): (usize, &RerankCandidate)| {
+        let row = candidate_full_bytes(cluster_blocks, survivor_full_rows, cand, stride);
+        let code = &row[..dim];
+        let kernel = kernels
+            .get(&cand.cluster_id)
+            .expect("kernel prebuilt for every probed cluster");
+        (
+            cand.did,
+            kernel.distance_at(cand.pos, code),
+            i,
+            cand.pos,
+            cand.cluster_id,
+        )
+    };
+    let scored: Vec<(u32, f32, usize, u32, u32)> = if candidates.len() >= PARALLEL_SCAN_MIN {
+        candidates.par_iter().enumerate().map(score_one).collect()
+    } else {
+        candidates.iter().enumerate().map(score_one).collect()
+    };
+    residual_refine_from_blocks(
+        scored,
+        cluster_blocks,
+        survivor_full_rows,
+        candidates,
+        stride,
+        dim,
+        k,
+        |cluster_id| {
+            let c = cluster_id as usize;
+            Sq8ResidualKernel::new(
+                col.metric,
+                query,
+                &scale[c * dim..(c + 1) * dim],
+                &offset[c * dim..(c + 1) * dim],
+                SQ8_RESIDUAL_DIVISOR,
+                per_doc_norms,
+            )
+        },
+    )
+}
+
+/// `Sq8Residual` final-refine pass. Takes the Sq8-scored shortlist
+/// (`(did, sq8_dist, candidate_idx, pos, cluster_id)`), keeps the lowest
+/// `2·k` by Sq8 distance, then re-scores just that set with the
+/// residual-corrected [`Sq8ResidualKernel`] (built per cluster via
+/// `make_kernel`). The candidate index points into `candidates`,
+/// whose row bytes are read directly from `cluster_blocks`.
+fn residual_refine_from_blocks<'a>(
+    mut scored: Vec<(u32, f32, usize, u32, u32)>,
+    cluster_blocks: &[Bytes],
+    survivor_full_rows: Option<&[Bytes]>,
+    candidates: &[RerankCandidate],
+    stride: usize,
+    dim: usize,
+    k: usize,
+    make_kernel: impl Fn(u32) -> Sq8ResidualKernel<'a>,
+) -> Vec<(u32, f32)> {
+    scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    let final_refine = k.saturating_mul(2).max(k).min(scored.len());
+    scored.truncate(final_refine);
+    let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
+    scored
+        .into_iter()
+        .map(|(did, _, i, pos, cluster_id)| {
+            let row =
+                candidate_full_bytes(cluster_blocks, survivor_full_rows, &candidates[i], stride);
+            let code = &row[..dim];
+            let residual = &row[dim..dim * 2];
+            let kernel = rk
+                .entry(cluster_id)
+                .or_insert_with(|| make_kernel(cluster_id));
+            (did, kernel.distance_at(pos, code, residual))
+        })
+        .collect()
+}
+
+fn parse_sq8_meta_bytes(
+    bytes: &[u8],
+    n_cent: usize,
+    dim: usize,
+    n_docs: usize,
+    has_norms: bool,
+) -> Sq8ParsedMeta {
+    let so_block_bytes = n_cent * dim * 4;
+    let scale_end = so_block_bytes;
+    let offset_end = scale_end + so_block_bytes;
+    let scale = parse_f32_le_vec(&bytes[0..scale_end]);
+    let offset = parse_f32_le_vec(&bytes[scale_end..offset_end]);
+    let per_doc_norms = has_norms.then(|| {
+        let norms_end = offset_end + n_docs * 4;
+        parse_f32_le_vec(&bytes[offset_end..norms_end])
+    });
+    Sq8ParsedMeta {
+        scale,
+        offset,
+        per_doc_norms,
+    }
 }
 
 #[inline]
@@ -1139,7 +2013,7 @@ fn read_u32_le(b: &[u8]) -> u32 {
 /// at any alignment relative to the `Bytes` backing — see the
 /// reader-side note where this is called for the alignment
 /// argument. Slow path (4 byte reads per f32) but only runs at
-/// open time over at-most-`8·n_cent·dim + 4·n_docs` bytes per Sq8
+/// open time over at-most-`8·dim + 4·n_docs` bytes per Sq8
 /// column; the per-query inner loop never goes through here.
 #[inline]
 fn parse_f32_le_vec(bytes: &[u8]) -> Vec<f32> {
@@ -1159,98 +2033,140 @@ fn read_u64_le(b: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-#[inline]
-fn verify_vector_crcs(
+const CLUSTER_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
+const CLUSTER_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
+
+fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
+    let Sq8ColumnMeta::Lazy { scale_abs_off, .. } = col.sq8_meta.as_ref()? else {
+        return None;
+    };
+    let scale_offset_bytes = 2 * (col.n_cent as usize) * col.dim * 4;
+    let norm_bytes = if matches!(col.metric, Metric::L2Sq | Metric::Cosine) {
+        (col.n_docs as usize) * 4
+    } else {
+        0
+    };
+    Some(*scale_abs_off..*scale_abs_off + scale_offset_bytes + norm_bytes)
+}
+
+fn get_cluster_ranges_coalesced_with_extra(
     source: &Source,
-    dir_bytes: &[u8],
-    n_columns: usize,
-) -> Result<(), VectorError> {
-    // `Bytes` instead of `&'a [u8]` so the par_iter doesn't need a
-    // lifetime parameter — each job owns a refcount-shared view into
-    // the source, which is itself shared via the outer `Source` for
-    // the duration of `open_with`.
-    struct CrcJob {
-        idx: i32,
-        bytes: Bytes,
-        expected: u32,
+    ranges: &[Range<usize>],
+    extra: Option<Range<usize>>,
+) -> Result<(Vec<Bytes>, Option<Bytes>), crate::superfile::lazy_source::LazyByteSourceError> {
+    let Some(extra) = extra else {
+        return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
+    };
+    if ranges.is_empty() {
+        let mut fetched = source.get_ranges_parallel(&[extra])?;
+        return Ok((Vec::new(), fetched.pop()));
     }
 
-    let mut jobs: Vec<CrcJob> = Vec::with_capacity(n_columns + 1);
+    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
+    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
 
-    let outer_total = source.len();
-    let outer_crc_pos = outer_total - 4;
-    let outer_body = fetch_sync(source, 0..outer_crc_pos, "outer body")?;
-    let outer_crc_bytes = fetch_sync(source, outer_crc_pos..outer_total, "outer crc")?;
-    jobs.push(CrcJob {
-        idx: -1,
-        bytes: outer_body,
-        expected: read_u32_le(&outer_crc_bytes),
-    });
-
-    for i in 0..n_columns {
-        let entry_off = i * DIR_ENTRY_SIZE;
-        let subsection_off = read_u64_le(&dir_bytes[entry_off + 24..entry_off + 32]) as usize;
-        let subsection_len = read_u64_le(&dir_bytes[entry_off + 32..entry_off + 40]) as usize;
-        let sub_end = subsection_off + subsection_len;
-        if sub_end > source.len() {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                "subsection {i} runs past blob"
-            ))));
+    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
+    for (idx, range) in sorted {
+        if let Some((merged, payload_len, members)) = groups.last_mut() {
+            let gap = range.start.saturating_sub(merged.end);
+            let merged_end = merged.end.max(range.end);
+            let new_payload_len = *payload_len + range.len();
+            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
+            if range.start <= merged.end
+                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
+                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
+            {
+                merged.end = merged_end;
+                *payload_len = new_payload_len;
+                members.push((idx, range));
+                continue;
+            }
         }
-        let sub = fetch_sync(source, subsection_off..sub_end, "subsection")?;
-        if sub.len() < SUB_HEADER_SIZE + 4 {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                "subsection {i} too short"
-            ))));
-        }
-        let sub_crc_pos = sub.len() - 4;
-        // `Bytes::slice` is zero-copy — no second `try_get_range_sync`
-        // round-trip needed since we already hold the subsection.
-        let sub_body = sub.slice(0..sub_crc_pos);
-        let sub_crc_bytes = sub.slice(sub_crc_pos..sub.len());
-        jobs.push(CrcJob {
-            idx: i as i32,
-            bytes: sub_body,
-            expected: read_u32_le(&sub_crc_bytes),
-        });
+        groups.push((range.clone(), range.len(), vec![(idx, range)]));
     }
 
-    // The outer-blob scan and per-subsection scans each touch ~1.5 GiB
-    // at 1M x 384. They are independent, so run them as parallel jobs
-    // and let the checksum module's CLMUL implementation handle each
-    // byte stream quickly.
-    let mismatch = jobs.par_iter().find_map_any(|job| {
-        if crc32c(&job.bytes) != job.expected {
-            Some(job.idx)
-        } else {
-            None
+    let mut fetch_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
+    fetch_ranges.push(extra);
+    let mut fetched = source.get_ranges_parallel(&fetch_ranges)?;
+    let extra_bytes = fetched.pop();
+
+    let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
+    for ((merged_range, _, members), bytes) in groups.into_iter().zip(fetched) {
+        for (idx, range) in members {
+            let start = range.start - merged_range.start;
+            let end = start + range.len();
+            out[idx] = Some(bytes.slice(start..end));
         }
-    });
-    if let Some(idx) = mismatch {
-        if idx < 0 {
-            return Err(VectorError::Read(ReadError::ChecksumMismatch {
-                section: "vector",
-                column: String::new(),
-            }));
-        }
-        let i = idx as usize;
-        return Err(VectorError::Read(ReadError::ChecksumMismatch {
-            section: "vector/subsection",
-            column: format!(" (column index {i})"),
-        }));
     }
 
-    Ok(())
+    Ok((
+        out.into_iter()
+            .map(|b| b.expect("cluster range filled by coalesced fetch"))
+            .collect(),
+        extra_bytes,
+    ))
+}
+
+fn get_cluster_ranges_coalesced(
+    source: &Source,
+    ranges: &[Range<usize>],
+) -> Result<Vec<Bytes>, crate::superfile::lazy_source::LazyByteSourceError> {
+    if ranges.len() <= 1 {
+        return source.get_ranges_parallel(ranges);
+    }
+
+    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
+    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
+
+    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
+    for (idx, range) in sorted {
+        if let Some((merged, payload_len, members)) = groups.last_mut() {
+            let gap = range.start.saturating_sub(merged.end);
+            let merged_end = merged.end.max(range.end);
+            let new_payload_len = *payload_len + range.len();
+            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
+            if range.start <= merged.end
+                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
+                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
+            {
+                merged.end = merged_end;
+                *payload_len = new_payload_len;
+                members.push((idx, range));
+                continue;
+            }
+        }
+        groups.push((range.clone(), range.len(), vec![(idx, range)]));
+    }
+
+    if groups.len() == ranges.len() {
+        return source.get_ranges_parallel(ranges);
+    }
+
+    let merged_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
+    let merged_bytes = source.get_ranges_parallel(&merged_ranges)?;
+    let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
+    for ((merged_range, _, members), bytes) in groups.into_iter().zip(merged_bytes) {
+        for (idx, range) in members {
+            let start = range.start - merged_range.start;
+            out[idx] = Some(bytes.slice(start..start + range.len()));
+        }
+    }
+
+    Ok(out
+        .into_iter()
+        .map(|b| b.expect("every cluster range filled"))
+        .collect())
 }
 
 /// Best-effort sync byte fetch with a typed error. Used throughout
 /// `open_with` so every byte access goes through the `Source`
-/// abstraction — the lazy variant plumbs the eager-prefetch
+/// abstraction — the lazy variant (M2) will plumb the eager-prefetch
 /// path through the same call sites without a second rewrite.
 ///
 /// Failure mode here means the range is out-of-bounds or not
-/// present in the sync cache. On `Source::InMemory` any in-bounds
-/// range succeeds zero-copy; this only fires on a malformed blob.
+/// present in the sync cache. M1 only opens `Source::InMemory`, where
+/// any in-bounds range succeeds zero-copy; this only fires on a
+/// malformed blob today.
 #[inline]
 fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes, VectorError> {
     let start = range.start;
@@ -1363,8 +2279,8 @@ mod tests {
         assert_eq!(r1.n_docs(), r2.n_docs());
     }
 
-    #[test]
-    fn search_self_query_returns_self_as_top1() {
+    #[tokio::test]
+    async fn search_self_query_returns_self_as_top1() {
         let dim = 16;
         let mut b = VectorBuilder::new();
         b.register_column(VectorConfig {
@@ -1402,8 +2318,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn search_unknown_column_errors() {
+    #[tokio::test]
+    async fn search_unknown_column_errors() {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let err = r
@@ -1412,8 +2328,8 @@ mod tests {
         assert!(matches!(err, VectorError::UnknownColumn(_)));
     }
 
-    #[test]
-    fn search_dim_mismatch_errors() {
+    #[tokio::test]
+    async fn search_dim_mismatch_errors() {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let err = r
@@ -1422,8 +2338,8 @@ mod tests {
         assert!(matches!(err, VectorError::DimensionMismatch { .. }));
     }
 
-    #[test]
-    fn search_zero_k_returns_empty() {
+    #[tokio::test]
+    async fn search_zero_k_returns_empty() {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let hits = r
@@ -1432,8 +2348,8 @@ mod tests {
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn search_results_sorted_ascending_by_distance() {
+    #[tokio::test]
+    async fn search_results_sorted_ascending_by_distance() {
         let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
         let q = vec![0.5; 16];
@@ -1457,10 +2373,12 @@ mod tests {
     // Source enum sanity tests
     // -----------------------------------------------------------------
     //
-    // These tests directly exercise the `Source` contract so any
-    // future refactor that breaks the InMemory zero-copy invariant
-    // or mis-implements the Lazy wrapper fails here rather than at
-    // the wider Lance oracle gate.
+    // M1 only adds the enum + reroutes runtime byte access through
+    // it; the public open path still takes a `Bytes` (M2 introduces
+    // `open_lazy`). These tests directly exercise the `Source`
+    // contract so any future refactor that breaks the InMemory
+    // zero-copy invariant or mis-implements the Lazy wrapper fails
+    // here rather than at the wider recall oracle gate.
 
     #[test]
     fn source_in_memory_try_get_range_sync_zero_copy() {
@@ -1551,18 +2469,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Rerank-codec discriminator round-trip
+    // rerank-codec discriminator round-trip
     // -----------------------------------------------------------------
     //
     // The codec discriminator rides as byte 52 of the per-column
     // directory entry; the codec_meta region offset rides as bytes
-    // 12..16 of the sub-header. Both are zero on legacy fp32
-    // segments. Today `Fp32`, `Sq8`, and `RabitqOnly` are implemented; every other
-    // codec must fail loudly against a reader that does not yet know
-    // how to decode it.
+    // 12..16 of the sub-header. Both are zero on pre-012 fp32
+    // segments. `Fp32` / `Sq8` / `RabitqOnly` are wired end-to-end;
+    // must still round-trip as a typed `MalformedVersion` at open
+    // time so a future segment built by an M3+ binary fails loud
+    // against an M2 binary rather than mis-decoding.
 
-    /// A fresh `Fp32` build round-trips through the reader with the
-    /// codec byte preserved as `RerankCodec::Fp32`.
+    use crate::superfile::format::checksum::crc32c;
+
+    /// a fresh `Fp32` build round-trips through the
+    /// reader with `ColumnReader.rerank_codec == Fp32` — the
+    /// directory-entry codec byte makes it back out of the on-disk
+    /// representation unchanged. The structural assertion pins the
+    /// on-disk discriminator contract.
     #[test]
     fn open_round_trips_fp32_codec_discriminator() {
         let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
@@ -1579,10 +2503,19 @@ mod tests {
         );
     }
 
-    /// Every exposed rerank codec is wired end-to-end.
+    /// every codec the enum exposes is now wired end-
+    /// to-end (`Fp32`, `Sq8`, `RabitqOnly`), so
+    /// `register_column` must accept all of them. The check exists
+    /// so adding a *new* unimplemented variant in the future
+    /// surfaces here loud and fast.
     #[test]
     fn register_column_accepts_every_codec() {
-        for codec in [RerankCodec::Fp32, RerankCodec::Sq8, RerankCodec::RabitqOnly] {
+        for codec in [
+            RerankCodec::Fp32,
+            RerankCodec::Sq8Residual,
+            RerankCodec::Sq8Residual,
+            RerankCodec::RabitqOnly,
+        ] {
             let mut b = VectorBuilder::new();
             b.register_column(VectorConfig {
                 column: "v".into(),
@@ -1596,11 +2529,13 @@ mod tests {
         }
     }
 
-    /// Building a column with `RerankCodec::Sq8` round-trips through
-    /// the reader. The codec discriminator surfaces on
-    /// `ColumnReader.rerank_codec`; the codec_meta region carries
-    /// `scale[dim] + offset[dim]` plus per-doc norms for L2Sq. The
-    /// on-disk `full[]` region shrinks to `n_docs * dim` u8 codes.
+    /// building a column with `RerankCodec::Sq8Residual`
+    /// round-trips through the reader. The codec discriminator
+    /// surfaces on `ColumnReader.rerank_codec`; the codec_meta
+    /// region carries `scale[dim] + offset[dim]` (always) plus
+    /// per-doc norms (L2Sq only). The on-disk `full[]` region is
+    /// `n_docs × 2·dim` bytes for `Sq8Residual`: one u8 code plus
+    /// one i8 residual per dimension.
     #[test]
     fn open_round_trips_sq8_codec_discriminator_l2sq() {
         let dim = 32usize;
@@ -1613,7 +2548,7 @@ mod tests {
             n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Sq8,
+            rerank_codec: RerankCodec::Sq8Residual,
         })
         .expect("register column");
         for i in 0..n_docs {
@@ -1627,136 +2562,94 @@ mod tests {
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         assert_eq!(r.columns.len(), 1);
         let col = &r.columns[0];
-        assert_eq!(col.rerank_codec, RerankCodec::Sq8);
-        assert_ne!(col.codec_meta_off, 0, "Sq8 must declare codec_meta_off > 0");
-        assert_eq!(col.doc_ids_off - col.full_off, (col.n_docs as usize) * dim);
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
 
+        // codec_meta_off must be non-zero for Sq8 — codec_meta
+        // sits inside the open-time region between cluster_idx
+        // and the per-cluster blocks.
+        assert_ne!(col.codec_meta_off, 0, "Sq8 must declare codec_meta_off > 0");
+        // full[] is n_docs × 2·dim (code + residual sidecar),
+        // interleaved into the per-cluster blocks region. The
+        // full portion is `region_size - n_docs × (code_bytes + 4)`.
+        let cb = col.quant.code_bytes();
+        let region_size = (col.subsection_range.len() - 4) - col.per_cluster_blocks_off;
+        let actual_full_size = region_size - (col.n_docs as usize) * (cb + 4);
+        assert_eq!(actual_full_size, (col.n_docs as usize) * dim * 2);
+
+        // sq8_meta materialised at open: per-cluster scale +
+        // offset (Sq8PerCluster layout — n_cent × dim floats
+        // each), per-doc norms present for L2Sq.
         let meta = col
             .sq8_meta
             .as_ref()
             .expect("Sq8 column must materialise sq8_meta at open");
-        assert_eq!(meta.scale.len(), (col.n_cent as usize) * dim);
-        assert_eq!(meta.offset.len(), (col.n_cent as usize) * dim);
-        let norms = meta
-            .per_doc_norms
+        let Sq8ColumnMeta::Eager {
+            scale,
+            offset,
+            per_doc_norms,
+        } = meta
+        else {
+            panic!("eager open must materialise Sq8 metadata");
+        };
+        assert_eq!(scale.len(), (col.n_cent as usize) * dim);
+        assert_eq!(offset.len(), (col.n_cent as usize) * dim);
+        let norms = per_doc_norms
             .as_ref()
             .expect("L2Sq Sq8 column must carry per-doc norms");
         assert_eq!(norms.len(), col.n_docs as usize);
     }
 
-    /// Cosine Sq8 columns carry per-doc decoded norms so rerank can
-    /// normalize the decoded vector before computing cosine distance.
+    /// `Sq8Residual` (the default codec) round-trips through the
+    /// reader. The on-disk `full[]` body is `n_docs × 2·dim` bytes
+    /// (`[code dim u8 ‖ residual dim i8]`); codec_meta matches Sq8
+    /// (per-cluster scale/offset + per-doc norms). The residual leg
+    /// rides in `full[]`, not codec_meta.
     #[test]
-    fn open_sq8_cosine_carries_per_doc_norms() {
-        let dim = 16usize;
+    fn open_round_trips_sq8_residual_codec_default() {
+        let dim = 32usize;
         let n_cent = 4usize;
-        let n_docs = 32u32;
+        let n_docs = 64u32;
         let mut b = VectorBuilder::new();
+        // Register via the struct default for rerank_codec to pin
+        // that the build default is Sq8Residual.
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
             n_cent,
-            rot_seed: 11,
-            metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8,
-        })
-        .expect("register column");
-        for i in 0..n_docs {
-            let mut v: Vec<f32> = (0..dim)
-                .map(|j| (i + j as u32) as f32 * 0.1 + 0.5)
-                .collect();
-            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            for x in &mut v {
-                *x /= norm;
-            }
-            b.add(0, &v).expect("add");
-        }
-        let blob = b.finish().expect("finish");
-        let json =
-            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":11,"metric":"cosine"}]"#.to_string();
-        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
-        let col = &r.columns[0];
-        let meta = col.sq8_meta.as_ref().expect("Sq8 must carry sq8_meta");
-        let norms = meta
-            .per_doc_norms
-            .as_ref()
-            .expect("Cosine Sq8 must carry per-doc norms");
-        assert_eq!(norms.len(), n_docs as usize);
-        assert_eq!(meta.scale.len(), n_cent * dim);
-        assert_eq!(meta.offset.len(), n_cent * dim);
-    }
-
-    /// Pins the per-doc-norms indexing contract: the on-disk norms
-    /// array is indexed by position in `full[]` (matching the rerank
-    /// shortlist's `pos`), not by `doc_id`.
-    #[test]
-    fn sq8_per_doc_norms_indexed_by_pos_not_doc_id() {
-        let dim = 16usize;
-        let n_cent = 4usize;
-        let n_docs = 32u32;
-        let make = |i: u32| -> Vec<f32> {
-            let s = 1.0 + (i as f32) * 0.5;
-            (0..dim).map(|j| s + (j as f32) * 0.1).collect()
-        };
-        let mut b = VectorBuilder::new();
-        b.register_column(VectorConfig {
-            column: "v".into(),
-            dim,
-            n_cent,
-            rot_seed: 23,
+            rot_seed: 7,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Sq8,
+            rerank_codec: RerankCodec::default(),
         })
         .expect("register column");
-        let mut planted = Vec::with_capacity(n_docs as usize);
         for i in 0..n_docs {
-            let v = make(i);
+            let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
             b.add(0, &v).expect("add");
-            planted.push(v);
         }
         let blob = b.finish().expect("finish");
 
         let json =
-            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":23,"metric":"l2sq"}]"#.to_string();
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
-        let meta = col.sq8_meta.as_ref().expect("Sq8 meta present");
-        let norms_by_pos = meta
-            .per_doc_norms
-            .as_ref()
-            .expect("L2Sq Sq8 carries per-doc norms");
-
-        let insertion_norms: Vec<f32> = planted
-            .iter()
-            .map(|v| v.iter().map(|x| x * x).sum::<f32>())
-            .collect();
-        let n_matching = insertion_norms
-            .iter()
-            .zip(norms_by_pos.iter())
-            .filter(|(ins, pos_n)| (**ins - **pos_n).abs() < 0.5)
-            .count();
-        assert!(
-            n_matching < (n_docs as usize) / 2,
-            "expected clustered build to reorder docs across positions, got {n_matching}/{n_docs} near insertion order"
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
+        assert_ne!(
+            col.codec_meta_off, 0,
+            "Sq8Residual must declare codec_meta_off > 0"
         );
 
-        for i in [0u32, 7, 15, 23, 31] {
-            let hits = r
-                .search("v", &planted[i as usize], 1, 4, 64)
-                .expect("self-query");
-            assert_eq!(hits[0].0, i, "self-query top-1 doc_id for doc {i}");
-            assert!(
-                hits[0].1 <= 0.5,
-                "doc {i}: self-query distance {} too large",
-                hits[0].1
-            );
-        }
+        // full[] is n_docs × 2·dim (code + residual sidecar).
+        let cb = col.quant.code_bytes();
+        let region_size = (col.subsection_range.len() - 4) - col.per_cluster_blocks_off;
+        let actual_full_size = region_size - (col.n_docs as usize) * (cb + 4);
+        assert_eq!(actual_full_size, (col.n_docs as usize) * dim * 2);
+        assert!(col.sq8_meta.is_some());
     }
 
-    /// Sq8 build + open + self-query recovers the planted self-vector
-    /// at top-1 through codec-aware rerank.
-    #[test]
-    fn sq8_self_query_round_trips_top1_l2sq() {
+    /// End-to-end: a `Sq8Residual` cosine self-query returns the
+    /// planted doc as top-1. Exercises the residual refine pass in
+    /// the eager rerank path.
+    #[tokio::test]
+    async fn sq8_residual_self_query_round_trips_top1_cosine() {
         let dim = 32usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
@@ -1765,54 +2658,9 @@ mod tests {
             column: "v".into(),
             dim,
             n_cent,
-            rot_seed: 13,
-            metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Sq8,
-        })
-        .expect("register column");
-        let make = |i: u32| -> Vec<f32> {
-            (0..dim)
-                .map(|j| ((i.wrapping_mul(17) + j as u32 * 3) % 64) as f32 * 0.5)
-                .collect()
-        };
-        let mut all = Vec::with_capacity(n_docs as usize);
-        for i in 0..n_docs {
-            let v = make(i);
-            b.add(0, &v).expect("add");
-            all.push(v);
-        }
-        let blob = b.finish().expect("finish");
-
-        let json =
-            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
-        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
-        let hits = r
-            .search("v", &all[17], 5, 4, 20)
-            .expect("search must succeed on Sq8 column");
-        assert_eq!(hits[0].0, 17, "Sq8 self-query must recover self at top-1");
-        assert!(
-            hits[0].1 <= 1.0,
-            "Sq8 self-query distance {} should be small",
-            hits[0].1
-        );
-    }
-
-    /// Sq8 self-query top-1 round-trips under cosine too. The corpus
-    /// uses hashed unit vectors so the self-vector has a wide margin
-    /// over neighbors after quantization.
-    #[test]
-    fn sq8_self_query_round_trips_top1_cosine() {
-        let dim = 32usize;
-        let n_cent = 4usize;
-        let n_docs = 64u32;
-        let mut b = VectorBuilder::new();
-        b.register_column(VectorConfig {
-            column: "v".into(),
-            dim,
-            n_cent,
-            rot_seed: 19,
+            rot_seed: 29,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8,
+            rerank_codec: RerankCodec::Sq8Residual,
         })
         .expect("register column");
         let make = |i: u32| -> Vec<f32> {
@@ -1833,20 +2681,350 @@ mod tests {
             all.push(v);
         }
         let blob = b.finish().expect("finish");
+        let json =
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":29,"metric":"cosine"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let col = &r.columns[0];
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
+        let hits = r
+            .search("v", &all[42], 5, n_cent, 20)
+            .expect("search must succeed on Sq8Residual cosine column");
+        assert_eq!(
+            hits[0].0, 42,
+            "Sq8Residual cosine self-query must recover self"
+        );
+    }
+
+    /// + Sq8PerCluster: cosine Sq8 columns carry the
+    /// per-doc decoded-norm cache — the rerank kernel normalizes
+    /// the decoded vector with it (`1 − dot / |x_decoded|`). Only
+    /// negdot drops the norms (its `Σx²` term cancels out),
+    /// shrinking codec_meta from `8·n_cent·dim + 4·n_docs` to
+    /// `8·n_cent·dim`.
+    #[test]
+    fn open_sq8_cosine_carries_per_doc_norms() {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let n_docs = 32u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 11,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+        })
+        .expect("register column");
+        for i in 0..n_docs {
+            // Pre-normalised vectors so cosine has a meaningful
+            // reference; the test only checks the codec_meta shape,
+            // not the recall.
+            let mut v: Vec<f32> = (0..dim)
+                .map(|j| (i + j as u32) as f32 * 0.1 + 0.5)
+                .collect();
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut v {
+                *x /= norm;
+            }
+            b.add(0, &v).expect("add");
+        }
+        let blob = b.finish().expect("finish");
+        let json =
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":11,"metric":"cosine"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let col = &r.columns[0];
+        let meta = col.sq8_meta.as_ref().expect("Sq8 must carry sq8_meta");
+        let Sq8ColumnMeta::Eager {
+            scale,
+            offset,
+            per_doc_norms,
+        } = meta
+        else {
+            panic!("eager open must materialise Sq8 metadata");
+        };
+        let norms = per_doc_norms.as_ref().expect(
+            "Cosine Sq8 must carry per-doc norms to normalize the decoded vector at rerank",
+        );
+        assert_eq!(norms.len(), n_docs as usize);
+        assert_eq!(scale.len(), n_cent * dim);
+        assert_eq!(offset.len(), n_cent * dim);
+    }
+
+    /// pins the per-doc-norms indexing contract —
+    /// the on-disk norms array is indexed by **position in
+    /// `full[]`** (matching the rerank shortlist's `pos`),
+    /// not by `doc_id`. The two diverge whenever the writer
+    /// pool's cluster-contiguous order differs from insertion
+    /// order, which it does in practice (rows get scattered
+    /// across clusters by the k-means assignment, so pos ≠ id
+    /// for almost every doc).
+    ///
+    /// Pin: insert N docs whose decoded norms strictly increase
+    /// with insertion order, build, open, and assert that the
+    /// open-time norms array — read in pos order — does **not**
+    /// equal the insertion-order norms. If it does, we're
+    /// silently indexing the wrong way; an L2Sq distance lookup
+    /// would then return some other doc's norm and corrupt the
+    /// rerank ordering.
+    ///
+    /// We also recompute each `norms[pos]` from the planted
+    /// vectors via the per-pos `doc_id` and confirm it matches
+    /// — proving the pos-indexed lookup actually resolves to
+    /// "this doc's decoded L2 norm".
+    #[tokio::test]
+    async fn sq8_per_doc_norms_indexed_by_pos_not_doc_id() {
+        let dim = 16usize;
+        let n_cent = 4usize;
+        let n_docs = 32u32;
+        // Vectors whose L2 norm grows monotonically with doc_id,
+        // while their direction cycles by doc_id. That decouples
+        // insertion order from cluster order: k-means groups mostly
+        // by direction, not by the monotonic norm ramp, so pos order
+        // is observably different from doc_id order.
+        let make = |i: u32| -> Vec<f32> {
+            let s = 1.0 + (i as f32) * 0.5;
+            let phase = (i % n_cent as u32) as f32;
+            (0..dim)
+                .map(|j| {
+                    let sign = if (j + phase as usize) % n_cent < n_cent / 2 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    sign * (s + (j as f32) * 0.1)
+                })
+                .collect()
+        };
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 23,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+        })
+        .expect("register column");
+        let mut planted = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            planted.push(v);
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":16,"n_cent":4,"rot_seed":23,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let col = &r.columns[0];
+        let meta = col.sq8_meta.as_ref().expect("Sq8 meta present");
+        let Sq8ColumnMeta::Eager { per_doc_norms, .. } = meta else {
+            panic!("eager open must materialise Sq8 metadata");
+        };
+        let norms_by_pos = per_doc_norms
+            .as_ref()
+            .expect("L2Sq Sq8 carries per-doc norms");
+
+        // Insertion-order norms (computed against the fp32
+        // originals; these monotonically increase by design).
+        let insertion_norms: Vec<f32> = planted
+            .iter()
+            .map(|v| v.iter().map(|x| x * x).sum::<f32>())
+            .collect();
+
+        // If norms were indexed by doc_id, `norms_by_pos[i]`
+        // would equal `insertion_norms[i]` up to quantization
+        // (a few percent). Cluster-scattered builds reorder
+        // docs across positions, so the two sequences should
+        // disagree on most slots — this asserts the reorder
+        // actually happened (the pin would be vacuous if every
+        // doc landed at `pos = doc_id`).
+        let n_matching = insertion_norms
+            .iter()
+            .zip(norms_by_pos.iter())
+            .filter(|(ins, pos_n)| (**ins - **pos_n).abs() < 0.5)
+            .count();
+        assert!(
+            n_matching < n_docs as usize,
+            "expected k-means + rotation to scatter docs across positions, \
+             but norms_by_pos matches insertion_norms in {n_matching}/{n_docs} \
+             slots — test corpus may have landed all docs in pos == doc_id order, \
+             defeating the indexing pin"
+        );
+
+        // For every pos, confirm `norms_by_pos[pos]` equals the
+        // decoded L2 norm of the doc at that pos. We don't know
+        // the pos↔doc_id mapping from outside the reader, but a
+        // self-query against `planted[i]` should return doc_id=i
+        // at top-1; the returned distance should be ~0 (matches
+        // the quantized doc to itself). That same distance,
+        // recomputed via the kernel using doc_i's planted
+        // values, requires `norms_by_pos[pos_of(i)]` to be doc_i's
+        // decoded norm — exactly the contract we're pinning.
+        // A mis-index would surface as a non-zero self-distance
+        // larger than the quantization error tolerance.
+        for i in [0u32, 7, 15, 23, 31] {
+            // rerank_mult=64 → refine=64 ≥ n_docs=32 → every
+            // candidate is reranked. Removes the 1-bit shortlist
+            // as a confounding variable: any miss here is a real
+            // norms-indexing bug, not a Hamming-recall artifact.
+            let hits = r
+                .search("v", &planted[i as usize], 1, 4, 64)
+                .expect("self-query");
+            assert_eq!(hits[0].0, i, "self-query top-1 doc_id for doc {i}");
+            // Quantization noise bound: per-dim error ≤ scale/2
+            // ≈ span/510. For our corpus, dim spans are ~ 16, so
+            // |q-x|² ≤ dim · (span/510)² ≈ 16 · 0.001 ≈ 0.016.
+            // A norms-table mis-index would push this to the
+            // order of the other docs' norms (≥ 1 unit).
+            assert!(
+                hits[0].1 <= 0.5,
+                "doc {i}: self-query distance {} too large — likely norms \
+                 mis-indexed (pos vs doc_id swap)",
+                hits[0].1
+            );
+        }
+    }
+
+    /// an Sq8 build + open + self-query recovers the
+    /// planted self-vector at top-1. End-to-end through the
+    /// codec-aware rerank dispatch + Sq8Kernel — any layout drift
+    /// (codec_meta order, code stride, per-doc-norm indexing)
+    /// would surface as wrong-doc or out-of-bounds.
+    #[tokio::test]
+    async fn sq8_self_query_round_trips_top1_l2sq() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 13,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+        })
+        .expect("register column");
+        let make = |i: u32| -> Vec<f32> {
+            (0..dim)
+                .map(|j| ((i.wrapping_mul(17) + j as u32 * 3) % 64) as f32 * 0.5)
+                .collect()
+        };
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = b.finish().expect("finish");
+
+        let json =
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":13,"metric":"l2sq"}]"#.to_string();
+        let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        // Exhaustive rerank (rerank_mult=20 → refine=100 ≥ n_docs=64)
+        // so the test pins Sq8 codec correctness independently of
+        // the 1-bit shortlist's recall ceiling.
+        let hits = r
+            .search("v", &all[17], 5, 4, 20)
+            .expect("search must succeed on Sq8 column");
+        assert_eq!(hits[0].0, 17, "Sq8 self-query must recover self at top-1");
+        // Sq8 round-trip error: per-dim quantization step is
+        // `scale ≈ (max-min)/255`. For this corpus, dim values
+        // sit in [0, 31.5] so per-dim error ≲ 0.06, |q-x|² over
+        // 32 dims ≲ 32 × 0.06² ≈ 0.12. Pinning a generous bound
+        // to keep the test robust to RNG quirks.
+        assert!(
+            hits[0].1 <= 1.0,
+            "Sq8 self-query distance {} should be small (≤ 1.0)",
+            hits[0].1
+        );
+    }
+
+    /// Sq8 self-query top-1 round-trips under Cosine
+    /// too. Exercises the Cosine branch of `Sq8Kernel::distance_at`
+    /// (no per-doc-norm lookup, `dist = 1 − dot`).
+    ///
+    /// Corpus design (matters!): unit-norm vectors drawn from
+    /// hashed-uniform values per (doc, dim) so neighbor pairs land
+    /// at `dot ≈ 1/√dim ≈ 0.18` — gap to self of ~0.82, well above
+    /// the Sq8 quantization noise floor (~0.005 for this corpus).
+    /// An earlier draft used `((i·23 + j·5) % 50 + 1)` which made
+    /// adjacent docs near-parallel (dot ≈ 0.99) and triggered a
+    /// quantization-driven swap of doc 5 ↔ doc 42 on self-query —
+    /// real Sq8+Cosine behaviour on pathological inputs, not a
+    /// kernel bug, but not a useful pin for codec correctness.
+    /// Real cosine workloads (semantic embeddings) look like the
+    /// current corpus, not the pathological one.
+    #[tokio::test]
+    async fn sq8_self_query_round_trips_top1_cosine() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 19,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+        })
+        .expect("register column");
+        let make = |i: u32| -> Vec<f32> {
+            let raw: Vec<f32> = (0..dim)
+                .map(|j| {
+                    // Per-(doc, dim) hash → uniform u16 → fp32 in
+                    // [0, 1). Two docs from this generator have
+                    // expected dot product ≈ 1/√dim ≈ 0.18 after
+                    // L2-normalization.
+                    let h = (i.wrapping_mul(0x9E37_79B9)) ^ ((j as u32).wrapping_mul(0x85EB_CA77));
+                    let h = h.wrapping_mul(0xC2B2_AE35);
+                    ((h & 0xFFFF) as f32) / 65535.0
+                })
+                .collect();
+            let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            raw.into_iter().map(|x| x / norm).collect()
+        };
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v = make(i);
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = b.finish().expect("finish");
 
         let json =
             r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":19,"metric":"cosine"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        // Exhaustive rerank (rerank_mult=20 → refine=100 ≥ n_docs=64)
+        // so any failure here pins Sq8 codec correctness rather than
+        // 1-bit shortlist recall.
         let hits = r
             .search("v", &all[42], 5, 4, 20)
             .expect("search must succeed on Sq8 cosine column");
         assert_eq!(hits[0].0, 42, "Sq8 cosine self-query must recover self");
     }
 
-    /// Building with `RerankCodec::RabitqOnly` succeeds and the
-    /// on-disk segment carries a zero-length `full[]` region.
+    // -----------------------------------------------------------------
+    // `None` codec (no rerank column)
+    // -----------------------------------------------------------------
+    //
+    // The `None` codec drops the `full[]` region entirely. The
+    // 1-bit shortlist *is* the final ranking; the on-disk
+    // segment shrinks by ~30× at 1M × 384. Distance values
+    // returned from `search()` are `-estimate` (1-bit dot
+    // estimate, sign-flipped so smaller = closer holds) — not a
+    // true metric distance.
+
+    /// building with `RerankCodec::RabitqOnly` succeeds
+    /// and the on-disk segment carries a zero-length `full[]`
+    /// region. Also pins the directory-entry discriminator
+    /// (`codec_id = 3`) and the zero-byte codec_meta invariant
+    /// (`codec_meta_off = 0`).
     #[test]
-    fn open_round_trips_rabitq_only_codec_discriminator() {
+    fn open_round_trips_none_codec_discriminator() {
         let dim = 16usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
@@ -1859,7 +3037,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::RabitqOnly,
         })
-        .expect("register RabitqOnly column");
+        .expect("register None column");
         for i in 0..n_docs {
             let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
             b.add(0, &v).expect("add");
@@ -1871,27 +3049,39 @@ mod tests {
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         assert_eq!(r.columns.len(), 1);
         let col = &r.columns[0];
-        assert_eq!(col.rerank_codec, RerankCodec::RabitqOnly);
-        assert_eq!(col.codec_meta_off, 0);
         assert_eq!(
-            col.doc_ids_off, col.full_off,
-            "RabitqOnly segments have zero-length full[]"
+            col.rerank_codec,
+            RerankCodec::RabitqOnly,
+            "None build must surface as RerankCodec::RabitqOnly on the reader"
+        );
+        assert_eq!(
+            col.codec_meta_off, 0,
+            "None segments must write codec_meta_off = 0 (zero-byte meta region)"
+        );
+        // `None` segments have zero-length full[] (per_vec_bytes
+        // = 0), so each per-cluster block is just
+        // `[codes][doc_ids]` — the blocks region is exactly
+        // `n_docs × (code_bytes + 4)` with no full bytes.
+        let cb = col.quant.code_bytes();
+        let region_size = (col.subsection_range.len() - 4) - col.per_cluster_blocks_off;
+        assert_eq!(
+            region_size,
+            (n_docs as usize) * (cb + 4),
+            "None segments interleave no full[] bytes — blocks region is \
+             exactly n_docs × (code_bytes + 4)"
         );
         assert_eq!(col.n_docs, n_docs);
     }
 
-    /// A `RabitqOnly` column returns top-K directly from the 1-bit
-    /// shortlist. Distances are sign-flipped estimates so smaller is
-    /// still closer.
-    ///
-    /// Self-query must rank the planted vector at index 0 — the
-    /// 1-bit shortlist's score for the exact-match query is the
-    /// dot product against itself, which dominates every neighbour
-    /// at this dim/cluster shape. A weaker `.any(== self)` check
-    /// would mask a regression that demoted self into positions
-    /// 1–4.
-    #[test]
-    fn rabitq_only_self_query_ranks_self_first() {
+    /// a `None`-codec column's self-query returns
+    /// the planted vector inside the top-K of the 1-bit
+    /// shortlist. At dim=128 / n_docs=64 with a well-separated
+    /// corpus the 1-bit estimator's top-K reliably contains the
+    /// self-vector even without rerank — exactly the contract
+    /// `None` opts into. Returned distances are `-estimate`
+    /// (sign-flipped so smaller = closer holds).
+    #[tokio::test]
+    async fn none_self_query_in_top_k_via_shortlist_only() {
         let dim = 128usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
@@ -1904,7 +3094,12 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::RabitqOnly,
         })
-        .expect("register RabitqOnly column");
+        .expect("register None column");
+        // Angularly diverse corpus — hashed-uniform vectors,
+        // L2-normalized. Two docs from this generator have
+        // expected dot ≈ 1/√dim ≈ 0.09, so 1-bit estimates
+        // separate cleanly and the self-vector dominates the
+        // shortlist for its own query.
         let make = |i: u32| -> Vec<f32> {
             let raw: Vec<f32> = (0..dim)
                 .map(|j| {
@@ -1927,31 +3122,52 @@ mod tests {
             r#"[{"column":"v","dim":128,"n_cent":4,"rot_seed":11,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
 
+        // nprobe = n_cent so every cluster contributes to the
+        // shortlist — the test asserts the 1-bit shortlist's
+        // top-K contract, not the cluster-probing one. rerank_mult
+        // is intentionally ignored by the None path (asserted
+        // here by passing a value that would otherwise oversample).
         let hits = r
             .search("v", &all[17], 5, n_cent, 5)
-            .expect("RabitqOnly search must succeed");
-        assert!(!hits.is_empty(), "search must return some hits");
-        // Self-query must rank itself at index 0. `.any` masked
-        // demotion regressions — the planted vector's 1-bit
-        // shortlist score against itself is strictly greater than
-        // any neighbour's at this dim/cluster shape.
-        assert_eq!(
-            hits[0].0, 17,
-            "self-query must rank the planted vector at index 0, got {hits:?}"
+            .expect("None-codec search must succeed");
+        assert!(
+            !hits.is_empty(),
+            "None-codec search must return at least one hit"
         );
-        assert!(hits.iter().all(|(_, d)| d.is_finite()));
+        assert!(
+            hits.iter().any(|(did, _)| *did == 17),
+            "self-query must surface the planted vector in top-K, got {hits:?}"
+        );
+        // Distances are `-estimate` — non-positive for a
+        // self-query (the 1-bit dot estimate of a vector with
+        // itself is strictly positive after the random rotation).
+        assert!(
+            hits.iter().all(|(_, d)| d.is_finite()),
+            "all None-codec distances must be finite, got {hits:?}"
+        );
+        // Top-1's distance must be ≤ any other hit's (ascending
+        // sort contract).
         for w in hits.windows(2) {
             assert!(
                 w[0].1 <= w[1].1,
-                "RabitqOnly hits must be sorted ascending by distance, got {hits:?}"
+                "None-codec hits must be sorted ascending by distance, got {hits:?}"
             );
         }
     }
 
-    /// `RabitqOnly` search must not fetch a `full[]` range because
-    /// the column does not store one.
-    #[test]
-    fn rabitq_only_search_issues_no_full_region_fetch() {
+    /// a `None`-codec search over a counting
+    /// lazy source must not perform any range fetch past the
+    /// `doc_ids` region — proven indirectly via the total
+    /// range count: 2 centroids-region + 2 cluster-idx-region
+    /// + `2 × nprobe` (codes + doc_ids per probed cluster). A
+    /// regression that left the fat `full[]` `get_range` in
+    /// for None columns would surface as one extra range
+    /// request, which this asserts away. The structural
+    /// invariant (full[] is zero-length on disk) is pinned by
+    /// `open_round_trips_none_codec_discriminator`; this test
+    /// pins the read-path side.
+    #[tokio::test]
+    async fn none_search_issues_no_full_region_fetch() {
         let dim = 32usize;
         let n_cent = 4usize;
         let n_docs = 32u32;
@@ -1964,7 +3180,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::RabitqOnly,
         })
-        .expect("register RabitqOnly column");
+        .expect("register None column");
         for i in 0..n_docs {
             let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
             b.add(0, &v).expect("add");
@@ -1983,30 +3199,55 @@ mod tests {
         )
         .expect("open lazy");
 
+        // Reset counters: open() touches the directory + every
+        // sub-header. We only want to count search-time fetches.
         async_calls.store(0, AtomicOrdering::Relaxed);
         sync_calls.store(0, AtomicOrdering::Relaxed);
         let query: Vec<f32> = (0..dim).map(|j| j as f32 * 0.1).collect();
         let _ = r.search("v", &query, 5, n_cent, 5).expect("search");
 
+        // Upper-bound sync fetches for None / nprobe = n_cent:
+        //   centroids (1) + cluster_idx (1)
+        // + per-cluster codes (≤ n_cent)
+        // + per-cluster doc_ids (≤ n_cent)
+        // = at most 2 + 2·n_cent = 10
+        //
+        // The Fp32/Sq8 paths would add one more fat
+        // `full[]` get_range on top — that's the leak this
+        // test guards against. Empty clusters reduce the
+        // upper bound (per-cluster fetches skip on cnt == 0)
+        // but never raise it. Async should stay at 0 —
+        // warm-cache lazy never falls through to the async
+        // bridge for in-memory blobs.
         let sync_count = sync_calls.load(AtomicOrdering::Relaxed) as usize;
         let async_count = async_calls.load(AtomicOrdering::Relaxed);
         assert_eq!(
             async_count, 0,
-            "RabitqOnly search on warm lazy must not bridge to async"
+            "None-codec search on warm lazy must not bridge to async"
         );
         let max_expected = 2 + 2 * n_cent;
         assert!(
             sync_count <= max_expected,
-            "RabitqOnly search must issue at most {max_expected} sync fetches; got {sync_count}"
+            "None-codec search must issue at most 2 + 2·nprobe = {max_expected} \
+             sync fetches (centroids + cluster_idx + per-cluster codes + \
+             per-cluster doc_ids); got {sync_count} — any extra is a leaked \
+             full[] fetch"
         );
+        // A search that probed at least one non-empty cluster
+        // must issue ≥ 2 fetches after spatial cluster ordering
+        // and bounded range coalescing: centroids+idx plus at
+        // least one merged cluster block.
         assert!(
-            sync_count >= 4,
+            sync_count >= 2,
             "test corpus produced only empty clusters? got sync_count={sync_count}"
         );
     }
 
-    /// A directory entry carrying an unknown codec id errors as
-    /// `MalformedVersion` rather than guessing at a byte layout.
+    /// a directory entry carrying an unknown codec id
+    /// (anything outside `0..=3` — e.g. `255` from a corrupted /
+    /// future-format segment) errors as `MalformedVersion`. The
+    /// safety net catches both forward-compat reads (future codec
+    /// ids land in the gap) and on-disk corruption.
     #[test]
     fn open_rejects_segment_with_unknown_codec_id() {
         let (blob, json) = build_blob(64, 16, 4, Metric::L2Sq);
@@ -2038,28 +3279,38 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Diagnostic — Sq8 vs Fp32 recall on planted-cluster
+    // M3.b / lazy open + inline-`pos` search
+    // -----------------------------------------------------------------
+    //
+    // Open touches only the structural-decode regions (directory,
+    // sub-header, summary, centroids, cluster_idx). Search carries
+    // `pos = off + i` inline in the shortlist tuple — there is no
+    // `doc_to_pos` lookup table to populate (deleted in M4 after
+    // the audit confirmed zero external readers). The structural
+    // memory-ceiling tests below ride on these invariants.
+
+    // -----------------------------------------------------------------
+    // diagnostic — Sq8 vs Fp32 recall on planted-cluster
     // cosine corpus
     // -----------------------------------------------------------------
     //
-    // Planted-cluster cosine corpora can push Sq8 recall well outside
-    // the "< 0.005 drop on normalized embeddings" target envelope.
-    // The hypothesis is that the **per-column** Sq8 quantizer wastes
-    // most of its 256 buckets on cross-cluster spread: the per-dim
-    // global range across the full corpus is much wider than the
-    // intra-cluster spread, so within any one cluster only a handful
-    // of buckets are used. The intra-cluster cosine differences
-    // between top-K candidates then fall below the per-bucket
-    // quantization noise → reranks flip.
+    // The 1M × 384 bench measured Sq8 recall@10 = 0.860 vs Fp32 = 0.964
+    // — well outside the plan's "< 0.005 drop on normalized embeddings"
+    // envelope. The hypothesis is that the **per-column** Sq8 quantizer
+    // wastes most of its 256 buckets on cross-cluster spread: per-dim
+    // global range across 1M docs ≈ 0.4, intra-cluster spread ≈ 0.015,
+    // so within any one cluster only ~10 buckets are used. The intra-
+    // cluster cosine differences between top-K candidates are smaller
+    // than the per-bucket quantization noise → reranks flip.
     //
     // This `#[ignore]`-gated diagnostic reproduces the recall drop at
-    // a small scale and prints corpus geometry stats. Run with
-    // `cargo test --lib -- sq8_recall_diagnostic --ignored --nocapture`
-    // to inspect. Per-column-quantizer fix is decided based on what
-    // this prints.
-    #[test]
-    #[ignore = "Sq8 vs Fp32 recall diagnostic; ~10s; --ignored --nocapture"]
-    fn sq8_recall_diagnostic_planted_cluster_cosine() {
+    // 16k × 384 (1/64 scale) and prints corpus geometry stats. Run
+    // with `cargo test --lib -- sq8_recall_diagnostic --ignored
+    // --nocapture` to inspect. Per-column-quantizer fix (or fallback
+    // to Sq8 default) is decided based on what this prints.
+    #[tokio::test]
+    #[ignore = "recall diagnostic; ~10s; --ignored --nocapture"]
+    async fn sq8_recall_diagnostic_planted_cluster_cosine() {
         use rand::SeedableRng;
         use rand::rngs::StdRng;
         use rand_distr::{Distribution, StandardNormal};
@@ -2169,7 +3420,7 @@ mod tests {
             Bytes::from(b.finish().expect("finish"))
         };
         let fp32_blob = build(RerankCodec::Fp32);
-        let sq8_blob = build(RerankCodec::Sq8);
+        let sq8_blob = build(RerankCodec::Sq8Residual);
         eprintln!(
             "--- segment sizes ---\n\
              fp32: {:.2} MiB (1.00x)\n\
@@ -2190,7 +3441,7 @@ mod tests {
         let n_queries = 100usize;
         let k = 10usize;
         let nprobe = n_cent_ivf / 4;
-        let rerank_mult = 50usize; // Sq8 calibration floor at dim ≤ 384
+        let rerank_mult = 50usize; // plan-doc Sq8 floor at dim ≤ 384
         let ground_truth: Vec<std::collections::HashSet<u32>> = (0..n_queries)
             .map(|qi| {
                 let q = &all[qi];
@@ -2207,7 +3458,11 @@ mod tests {
             })
             .collect();
 
-        let recall_of = |reader: &VectorReader, label: &str| -> f32 {
+        eprintln!(
+            "--- recall@{k} on {n_queries} self-queries (nprobe={nprobe}, rerank_mult={rerank_mult}) ---"
+        );
+        let mut recalls = Vec::new();
+        for (reader, label) in [(&r_fp32, "fp32"), (&r_sq8, "sq8 ")] {
             let mut total_match = 0usize;
             for qi in 0..n_queries {
                 let hits = reader
@@ -2220,16 +3475,14 @@ mod tests {
             }
             let recall = total_match as f32 / (n_queries * k) as f32;
             eprintln!("recall@{k} ({label}): {recall:.4}");
-            recall
-        };
-
-        eprintln!(
-            "--- recall@{k} on {n_queries} self-queries (nprobe={nprobe}, rerank_mult={rerank_mult}) ---"
-        );
-        let r_fp = recall_of(&r_fp32, "fp32");
-        let r_sq = recall_of(&r_sq8, "sq8 ");
+            recalls.push(recall);
+        }
+        let r_fp = recalls[0];
+        let r_sq = recalls[1];
         eprintln!("drop (fp32 - sq8 ): {:.4}", r_fp - r_sq);
-        eprintln!("(target acceptance: drop must be \u{2264} 0.01)");
+        eprintln!(
+            "(plan acceptance #2: drop must be \u{2264} 0.01; bench measured 0.10 drop at 1M scale)"
+        );
 
         // -- Probe: vary rerank_mult to isolate shortlist depth vs rerank noise --
         eprintln!("\n--- rerank_mult sweep (Sq8, same corpus/queries) ---");
@@ -2279,18 +3532,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Lazy open + inline-`pos` search
-    // -----------------------------------------------------------------
-    //
-    // Open touches only the structural-decode regions (directory,
-    // sub-header, summary, centroids, cluster_idx). Search carries
-    // `pos = off + i` inline in the shortlist tuple — there is no
-    // `doc_to_pos` lookup table to populate. The structural
-    // memory-ceiling tests below ride on these invariants.
-
-    /// Search-shape corpus used by the inline-pos tests and the
-    /// sync-search / counting-source tests. Picks a non-trivial
+    /// Search-shape corpus used by the M3.b inline-pos tests and the
+    /// M3 sync-search / counting-source tests. Picks a non-trivial
     /// `n_docs ≥ n_cent` so each cluster has multiple candidates.
     fn build_search_corpus() -> (Bytes, String, Vec<Vec<f32>>) {
         let dim = 16usize;
@@ -2320,12 +3563,12 @@ mod tests {
         (Bytes::from(bytes), json, all)
     }
 
-    /// Self-query smoke: lazy default open must recover the
-    /// planted self-vector at top-1, confirming the inline-`pos`
-    /// rerank path returns the correct results on the
-    /// search-shape corpus that every test in this section uses.
-    #[test]
-    fn lazy_default_search_recovers_self_query() {
+    /// M3.b self-query smoke: lazy default open must
+    /// recover the planted self-vector at top-1, confirming the
+    /// inline-`pos` rerank path returns the correct results on
+    /// the search-shape corpus that every M3/M4 test uses.
+    #[tokio::test]
+    async fn lazy_default_search_recovers_self_query() {
         let (blob, json, all) = build_search_corpus();
         let r = VectorReader::open(blob, &json).expect("open");
         let hits = r
@@ -2335,19 +3578,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Sync `search()` on `Source::Lazy`
+    // sync `search()` on `Source::Lazy`
     // -----------------------------------------------------------------
     //
-    // These tests pin the contract: the *only* public entry point
-    // is sync `search()`. It works on every `Source` variant —
-    // `InMemory` and warm-cache `Source::Lazy` resolve every range
-    // through `try_get_range_sync` (zero-copy); cold-miss
-    // `Source::Lazy` bridges to the source's async `range()` via
+    // These tests pin the M3 contract per plan 002 Q9 (commit
+    // `2e351ba`): the *only* public entry point is sync
+    // `search()`. It works on every `Source` variant — `InMemory`
+    // and warm-cache `Source::Lazy` resolve every range through
+    // `try_get_range_sync` (zero-copy); cold-miss `Source::Lazy`
+    // bridges to the source's async `range()` via
     // `block_in_place + Handle::block_on` / one-shot
-    // `current_thread` `Runtime`, the same pattern the supertable's
-    // per-segment reader uses for the disk-cache fetch path. No
-    // `search_async` is exposed at the public surface; the
-    // cold-path async bridging is hidden inside
+    // `current_thread` `Runtime`, the same pattern
+    // `supertable::query::segment_reader` uses for the disk-cache
+    // fetch path. No `search_async` is exposed at the public
+    // surface; the cold-path async bridging is hidden inside
     // `Source::get_range`.
     //
     // A `CountingLazyByteSource` test helper wraps a `Bytes`
@@ -2377,6 +3621,19 @@ mod tests {
         /// If `true`, `try_get_range_sync` returns `None` for every
         /// in-bounds range — forces the caller to the async path.
         sync_disabled: AtomicBool,
+        /// Current in-flight `range()` futures (entry-bumped,
+        /// drop-decremented). pairs with
+        /// `max_in_flight` to pin that
+        /// [`Source::get_ranges_parallel`] dispatches its cold
+        /// fetches concurrently rather than serially.
+        in_flight: StdArc<AtomicU64>,
+        max_in_flight: StdArc<AtomicU64>,
+        /// Per-`range()` artificial latency. Defaults to zero
+        /// (legacy callers); the parallel-dispatch test sets it
+        /// to a small delay so concurrent futures actually
+        /// overlap in wall-clock instead of completing in the
+        /// trivial sync slice path inside `range`.
+        async_latency_us: AtomicU64,
     }
 
     impl CountingLazyByteSource {
@@ -2386,6 +3643,9 @@ mod tests {
                 async_calls: StdArc::new(AtomicU64::new(0)),
                 sync_calls: StdArc::new(AtomicU64::new(0)),
                 sync_disabled: AtomicBool::new(false),
+                in_flight: StdArc::new(AtomicU64::new(0)),
+                max_in_flight: StdArc::new(AtomicU64::new(0)),
+                async_latency_us: AtomicU64::new(0),
             }
         }
 
@@ -2400,6 +3660,56 @@ mod tests {
         fn disable_sync(&self) {
             self.sync_disabled.store(true, AtomicOrdering::Relaxed);
         }
+
+        /// Max-concurrent observer — sampled at every `range()`
+        /// entry. Concurrent fetches will produce a value `> 1`;
+        /// serial fetches stay at `1`.
+        fn max_in_flight_counter(&self) -> StdArc<AtomicU64> {
+            StdArc::clone(&self.max_in_flight)
+        }
+
+        /// Set per-`range()` artificial latency. Used by the
+        /// parallel-dispatch test to ensure concurrent futures
+        /// overlap in wall-clock (without latency, the trivial
+        /// `bytes.slice(...)` body of `range()` resolves
+        /// instantaneously and in-flight peaks at 1 even when
+        /// many futures were spawned together).
+        fn set_async_latency(&self, latency: std::time::Duration) {
+            self.async_latency_us
+                .store(latency.as_micros() as u64, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// RAII guard: bumps `in_flight` on construct, decrements
+    /// on drop, and bumps `max_in_flight` if the new in-flight
+    /// count exceeds the previous max. Pairs with
+    /// [`CountingLazyByteSource::max_in_flight_counter`] to give
+    /// the parallel-dispatch test a single observable for
+    /// "fetches actually overlapped."
+    struct InFlightGuard {
+        in_flight: StdArc<AtomicU64>,
+        max_in_flight: StdArc<AtomicU64>,
+    }
+
+    impl InFlightGuard {
+        fn enter(in_flight: StdArc<AtomicU64>, max_in_flight: StdArc<AtomicU64>) -> Self {
+            let now = in_flight.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            // Bump max_in_flight monotonically.
+            max_in_flight.fetch_max(now, AtomicOrdering::AcqRel);
+            Self {
+                in_flight,
+                max_in_flight,
+            }
+        }
+    }
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.in_flight.fetch_sub(1, AtomicOrdering::AcqRel);
+            // max_in_flight is monotonic by design; nothing to
+            // unwind on drop.
+            let _ = &self.max_in_flight;
+        }
     }
 
     #[async_trait::async_trait]
@@ -2410,6 +3720,14 @@ mod tests {
 
         async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
             self.async_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            let _guard = InFlightGuard::enter(
+                StdArc::clone(&self.in_flight),
+                StdArc::clone(&self.max_in_flight),
+            );
+            let latency_us = self.async_latency_us.load(AtomicOrdering::Relaxed);
+            if latency_us > 0 {
+                tokio::time::sleep(std::time::Duration::from_micros(latency_us)).await;
+            }
             let total = self.bytes.len() as u64;
             if start.saturating_add(len) > total {
                 return Err(LazyByteSourceError::OutOfBounds {
@@ -2441,8 +3759,8 @@ mod tests {
     /// `Source::InMemory` path. This is the steady-state shape the
     /// supertable reader sees today (the reader_cache is in-process,
     /// so every range is resident).
-    #[test]
-    fn search_on_lazy_source_with_warm_sync_cache_matches_in_memory() {
+    #[tokio::test]
+    async fn search_on_lazy_source_with_warm_sync_cache_matches_in_memory() {
         let (blob, json, all) = build_search_corpus();
         let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
@@ -2477,10 +3795,10 @@ mod tests {
     /// impl. Production callers always have an ambient runtime
     /// (the supertable owns one), so the `block_in_place +
     /// Handle::block_on` branch is what fires there; this test
-    /// exercises the no-ambient-runtime fallback to keep that
-    /// path live.
-    #[test]
-    fn search_on_lazy_source_with_no_sync_fallback_bridges_to_async() {
+    /// exercises the no-ambient-runtime fallback branch to
+    /// keep that path live.
+    #[tokio::test]
+    async fn search_on_lazy_source_with_no_sync_fallback_bridges_to_async() {
         let (blob, json, all) = build_search_corpus();
         let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory baseline");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
@@ -2513,8 +3831,9 @@ mod tests {
         );
     }
 
-    /// Range-counting budget. Sync `search()` issues per-region
-    /// / per-cluster `Source::get_range` calls:
+    /// Range-counting test (plan 011 M3 budget). Sync `search()`
+    /// issues per-region / per-cluster `Source::get_range`
+    /// calls:
     ///
     /// - 1 range for centroids
     /// - 1 range for cluster_idx
@@ -2522,14 +3841,14 @@ mod tests {
     /// - 1 range per probed cluster's doc_ids
     /// - 1 fat range for the rerank batch in `full[]`
     ///
-    /// At `nprobe = N` with all probed clusters non-empty:
-    /// `2 + 2N + 1 = 2N + 3` ranges. The corpus here has
-    /// `n_cent = 4` and the test uses `nprobe = 4`, so the
-    /// worst-case budget is `2·4 + 3 = 11`. The production
-    /// shape (`nprobe = 8` on a 1M corpus) is
-    /// `2·8 + 3 = 19` — a future layout that interleaves
-    /// codes + doc_ids per cluster would drop this further by
-    /// turning the per-cluster pair into a single range.
+    /// On v0 layout at `nprobe = N` with all probed clusters
+    /// non-empty: `2 + 2N + 1 = 2N + 3` ranges. The corpus here
+    /// has `n_cent = 4` and the test uses `nprobe = 4`, so the
+    /// worst-case budget is `2·4 + 3 = 11`. The plan's
+    /// production budget (`nprobe = 8` on a 1M corpus) is
+    /// `2·8 + 3 = 19` — and 013 M1's v1 layout drops this further
+    /// by interleaving codes + doc_ids per cluster (one range
+    /// per cluster instead of two).
     ///
     /// Forcing `try_get_range_sync` off makes every range route
     /// through the source's async `range()` via the block_on
@@ -2538,11 +3857,11 @@ mod tests {
     /// `search()` request".
     ///
     /// A regression that smuggles in extra range fetches — e.g.
-    /// reintroducing the whole-subsection fallback, or pulling
-    /// the full `doc_ids` region over the wire at open — surfaces
-    /// here rather than at the production object-store harness.
-    #[test]
-    fn search_cold_first_search_range_count_per_cluster() {
+    /// reintroducing the whole-subsection fallback, or pulling the
+    /// full `doc_ids` region over the wire at open — surfaces here
+    /// rather than at the production S3 harness in 013.
+    #[tokio::test]
+    async fn search_cold_first_search_range_count_per_cluster() {
         let (blob, json, all) = build_search_corpus();
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
@@ -2573,16 +3892,14 @@ mod tests {
 
         let async_calls_for_first_search =
             async_counter.load(AtomicOrdering::Relaxed) - async_after_open;
-        // Worst-case at nprobe=4, all clusters non-empty:
-        //   centroids + cluster_idx + nprobe*(codes + doc_ids) + 1 fat full[] = 11.
-        // Lower bound is 3 (centroids + cluster_idx + fat full[]) when
-        // every probed cluster is empty, but for this corpus every
-        // cluster has docs.
+        // At nprobe=4 with this corpus, all probed clusters are
+        // non-empty. Spatial cluster ordering can merge the
+        // cluster blocks into fewer physical GETs.
         assert!(
-            (3..=11).contains(&(async_calls_for_first_search as usize)),
+            (2..=5).contains(&(async_calls_for_first_search as usize)),
             "per-cluster path: cold first search expected to issue \
-             3..=11 ranges (centroids + cluster_idx + per-cluster \
-             codes/doc_ids + 1 fat rerank range). Got {async_calls_for_first_search}."
+             2..=5 ranges (centroids+cluster_idx + coalesced/interleaved \
+             cluster blocks). Got {async_calls_for_first_search}."
         );
     }
 
@@ -2591,8 +3908,8 @@ mod tests {
     /// results as `Source::InMemory`. Locks in the contract that
     /// the trait-based path doesn't accidentally diverge from the
     /// enum-based fast path.
-    #[test]
-    fn search_matches_in_memory_through_bytes_lazy_source() {
+    #[tokio::test]
+    async fn search_matches_in_memory_through_bytes_lazy_source() {
         let (blob, json, all) = build_search_corpus();
         let r_mem = VectorReader::open(blob.clone(), &json).expect("InMemory baseline");
         let lazy_src: StdArc<dyn LazyByteSource> = StdArc::new(BytesLazyByteSource::new(blob));
@@ -2615,28 +3932,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Memory-ceiling unit tests
+    // § Acceptance #2 — memory-ceiling unit test
     // -----------------------------------------------------------------
     //
-    // Headline guarantee: resident set per open vector segment is
-    // bounded by `O(n_cent × dim × 4 + small)`, independent of
-    // `n_docs`. Concretely: opening a `Source::Lazy` over a
-    // mmap-backed `BytesLazyByteSource` at 1M × 384 with
+    // The headline guarantee is "resident set per open
+    // vector segment is bounded by O(n_cent × dim × 4 + small)",
+    // independent of `n_docs`. Acceptance criterion #2 spells it
+    // out: opening a `Source::Lazy` over a mmap-backed
+    // `BytesLazyByteSource` at 1M × 384 with
     // `OpenOptions { verify_crc: false }` must leave the process
     // RSS delta ≤ 10 MB per opened column.
     //
-    // Why mmap specifically: this is how the disk cache feeds
-    // bytes into `SuperfileReader` —
-    // `Bytes::from_owner(Arc<Mmap>)`. The kernel never faults
-    // the bulk codes/full/doc_ids pages on the default path
-    // because nothing in `open_with_source` accesses them: the
-    // CRC scan is gated on `verify_crc`, search uses inline
-    // `pos` so no `doc_ids` walk happens, and the
-    // structural-decode bytes (outer header + dir + sub_header)
-    // are a handful of pages. The resident allocation is
-    // dominated by the rotation matrix (≈ 590 KB at dim=384)
-    // and small column metadata — well inside the 10 MB ceiling
-    // at any practical `n_docs`.
+    // Why mmap specifically: this is exactly how the disk cache
+    // (003 M5) feeds bytes into `SuperfileReader` —
+    // `Bytes::from_owner(Arc<Mmap>)`. The kernel never faults the
+    // bulk codes/full/doc_ids pages on the default path because
+    // nothing in `open_with_source` accesses them: the CRC scan
+    // is gated on `verify_crc`, search uses inline `pos` (M3.b)
+    // so no `doc_ids` walk happens, and the structural-decode
+    // bytes (outer header + dir + sub_header) are a handful of
+    // pages. The resident allocation is dominated by the rotation
+    // matrix (≈ 590 KB at dim=384) and small column metadata —
+    // well inside the 10 MB ceiling at any practical
+    // `n_docs`.
     //
     // Companion smoke test below (`mem_ceiling_lazy_open_smoke`)
     // runs in default `cargo test --lib` at a smaller scale so
@@ -2667,10 +3985,10 @@ mod tests {
     /// Build an `(n_docs × dim)` corpus, register a single
     /// vector column with the requested IVF shape, and stream
     /// the resulting unified-blob bytes to `tmp` via
-    /// `VectorBuilder::finish_to`. The streaming write avoids
-    /// materializing a 1.5 GiB `Vec<u8>` in the test's address
-    /// space at 1M × 384 — the build's transient peak doesn't
-    /// survive the `before` RSS snapshot.
+    /// `VectorBuilder::finish_to` (plan 010 M5). The streaming
+    /// write avoids materializing a 1.5 GiB `Vec<u8>` in the
+    /// test's address space at 1M × 384 — the build's transient
+    /// peak doesn't survive the `before` RSS snapshot.
     ///
     /// Deterministic per-row vector: `seed = i × 0x9E3779B1`
     /// folded through a linear congruential step per dim slot.
@@ -2761,7 +4079,7 @@ mod tests {
         (delta, n_cols)
     }
 
-    /// Memory-ceiling assertion at production scale.
+    /// **acceptance criterion #2 (plan-spec scale).**
     ///
     /// 1 M × 384, `n_cent = 1024`. `#[ignore]`-gated because
     /// the `VectorBuilder.finish_to(...)` call takes ~35 s in
@@ -2773,9 +4091,10 @@ mod tests {
     /// ```
     ///
     /// A regression that re-introduces eager subsection
-    /// materialization or that scans `doc_ids` at open will
-    /// push per-column RSS past the 10 MB ceiling and fail
-    /// here rather than at the 100 M production OOM.
+    /// materialization (the pre-011 behaviour) or that scans
+    /// `doc_ids` at open will push per-column RSS past the
+    /// 10 MB ceiling and fail here rather than at the 100 M
+    /// production OOM.
     #[test]
     #[ignore]
     fn mem_ceiling_lazy_open_under_10mib() {
@@ -2798,25 +4117,25 @@ mod tests {
 
         assert!(
             per_col_mib <= 10.0,
-            "lazy open RSS delta {per_col_mib:.3} MiB/col \
-             exceeds 10 MiB ceiling at 1M × {DIM}, \
-             n_cent={N_CENT} (total delta {delta_mib:.3} MiB \
-             over {n_cols} column(s))."
+            "acceptance #2: lazy open RSS delta \
+             {per_col_mib:.3} MiB/col exceeds 10 MiB ceiling \
+             at 1M × {DIM}, n_cent={N_CENT} (total delta \
+             {delta_mib:.3} MiB over {n_cols} column(s))."
         );
     }
 
-    /// Memory-ceiling assertion at smoke scale.
+    /// **acceptance criterion #2 (smoke scale).**
     ///
     /// 50 k × 64, `n_cent = 64`. Runs in default
     /// `cargo test --lib` (~1–2 s build) so every PR gets
     /// continuous feedback on the structural property: lazy
     /// open touches only the structural-decode pages, never
     /// the bulk codes/full/doc_ids regions. The 10 MiB ceiling
-    /// at the headline 1M × 384 scale is asserted at the same
-    /// value here because the resident allocation (mostly the
-    /// rotation matrix at `dim²·4` = 16 KB for dim=64) is
-    /// *smaller* at smoke scale, not larger — if this fires,
-    /// the bigger test will too.
+    /// at the plan's headline 1M × 384 scale is asserted at
+    /// the same value here because the resident allocation
+    /// (mostly the rotation matrix at `dim²·4` = 16 KB for
+    /// dim=64) is *smaller* at smoke scale, not larger — if
+    /// this fires, the bigger test will too.
     ///
     /// `dim = 64` keeps the corpus tiny (~13 MB on disk) and
     /// the rotation matrix Gram-Schmidt fast.
@@ -2848,47 +4167,48 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Supertable-scale memory ceiling
+    // — supertable-scale memory ceiling
     // -----------------------------------------------------------------
     //
-    // The single-segment `mem_ceiling_lazy_open_*` tests above pin
-    // the per-reader bound. These multi-segment variants pin the
-    // *supertable-shaped* bound: open N segments concurrently —
-    // same shape `Supertable::commit` produces (N =
-    // N_SEGMENTS_BENCH × num_cpus because the writer-pool sharding
-    // creates one segment per thread) — and assert the total anon
-    // RSS delta scales as `N × O(centroids + rotation + small)`,
-    // not as `N × subsection_size`.
+    // The single-segment `mem_ceiling_lazy_open_*` tests above pin the
+    // per-reader bound. These multi-segment variants pin the
+    // *supertable-shaped* bound: open N segments concurrently — same
+    // shape `Supertable::commit` produces (N = N_SEGMENTS_BENCH × num_cpus
+    // because `split_buffer_into_row_shards` shards each commit's
+    // buffer into one segment per writer-pool thread) — and assert the
+    // total anon RSS delta scales as `N × O(centroids + rotation +
+    // small)`, not as `N × subsection_size`.
     //
     // What this proves (and what it doesn't):
     //
-    // - PROVES: a supertable opened with the production
-    //   disk-cache path
-    //   (`Source::InMemory(Bytes::from_owner(mmap))` per segment)
-    //   keeps anon RSS bounded across an arbitrary number of
-    //   segments, with no per-doc anon term. Equivalent here
-    //   because `Bytes::from_owner` is zero-copy over the mmap,
-    //   and the lazy-open path doesn't touch `doc_ids[]` /
-    //   `full[]` at open time (inline `pos` removes the only
-    //   reason open ever touched `doc_ids[]`).
+    // - PROVES: a supertable opened with the production disk-cache
+    //   path (`Source::InMemory(Bytes::from_owner(mmap))` per segment —
+    //   see `supertable::reader_cache::disk::insert`) keeps anon
+    //   RSS bounded across an arbitrary number of segments, with no
+    //   per-doc anon term. Equivalent here because
+    //   `Bytes::from_owner` is zero-copy over the mmap, and the
+    //   lazy-open path doesn't touch `doc_ids[]` / `full[]` at
+    //   open time (M3.b's inline `pos` removes the only reason
+    //   open ever touched `doc_ids[]`).
     //
-    // - DOES NOT PROVE: the in-process `InMemoryReaderCache`
-    //   path (`Bytes::from(Vec)` per segment) has the same bound.
-    //   That path holds each segment's bytes in anon by
-    //   construction (no mmap involved). The in-memory cache is
-    //   the test/bench path; production attaches a
-    //   `StorageProvider` and routes through the disk cache. The
-    //   in-memory cache's anon cost is its declared contract.
+    // - DOES NOT PROVE: the in-process `InMemoryReaderCache` path
+    //   (`Bytes::from(Vec)` per segment — see
+    //   `supertable::reader_cache::in_memory::insert`) has the same
+    //   bound. That path holds each segment's bytes in anon by
+    //   construction (no mmap involved). The in-memory cache is the
+    //   test/bench path; production attaches a `StorageProvider` and
+    //   routes through the disk cache. A separate test for the
+    //   in-memory cache path isn't a 011 deliverable — that path's
+    //   anon cost is its declared contract.
     //
     // The bench's 10M × 4-commit × num_cpus-thread shape produces
-    // exactly the topology these tests exercise. The smoke
-    // variant mirrors the bench's *layout* at a tiny corpus size
-    // (4 segments × 50 k docs × 64 dim) so every PR catches
-    // regressions (~5 s build). The `#[ignore]`'d production-scale
-    // variant uses the bench's actual per-segment shape (16
-    // segments × 625 k docs × 384 dim × n_cent_per_segment
-    // matching the bench's `n_cent_total / 4`) and runs only when
-    // called out.
+    // exactly the topology these tests exercise. The smoke variant
+    // mirrors the bench's *layout* at a tiny corpus size (4 segments
+    // × 50 k docs × 64 dim) so every PR catches regressions
+    // (~5 s build). The `#[ignore]`'d plan-spec variant uses the
+    // bench's actual per-segment shape (16 segments × 625 k docs ×
+    // 384 dim × n_cent_per_segment matching the bench's
+    // `n_cent_total / 4`) and runs only when called out.
 
     /// Open `N` segment files (built by `build_corpus_to_file`) via
     /// `Source::Lazy(BytesLazyByteSource over Arc<Mmap>)` and return
@@ -2948,7 +4268,7 @@ mod tests {
         (delta, n_cols_total, n_segments)
     }
 
-    /// Supertable-scale memory ceiling — smoke.
+    /// **supertable-scale memory ceiling (smoke).**
     ///
     /// Mirrors the bench's 4-commit × num_cpus-thread shape at a
     /// tiny corpus size. Builds 4 segment files (each 50 k × 64
@@ -3002,7 +4322,7 @@ mod tests {
         drop(tmps);
     }
 
-    /// Supertable-scale memory ceiling — production shape.
+    /// **supertable-scale memory ceiling (plan-spec).**
     ///
     /// Mirrors the bench's actual 10M × 4-commit ×
     /// 4-thread-writer-pool topology: 16 segments × 625 k docs ×
@@ -3078,34 +4398,34 @@ mod tests {
         drop(tmps);
     }
 
-    /// Many-segments stress test — 100M aspiration shape.
+    /// **many-segments stress test (100M
+    /// aspiration shape).**
     ///
     /// The honest scale test for "100M docs across a supertable"
     /// can't materialise 100M production-shape segments on a
     /// developer box (the per-segment 625k × 384 shape used in
     /// the bench produces ~960 MiB on disk × 160 segments = 150
     /// GiB of corpus). Instead, this test pins the *structural*
-    /// memory bound by varying the high-cardinality axis
-    /// (segment count) at a thin per-segment shape:
-    /// **100 segments × 50 k docs × 128 dim × 128 n_cent**.
+    /// memory bound by varying the high-cardinality axis (segment
+    /// count) at a thin per-segment shape: **100 segments × 50 k
+    /// docs × 128 dim × 128 n_cent**.
     ///
     /// What this proves:
     ///
     /// - Per-segment open allocation is `O(n_cent × dim × 4 +
     ///   rotation + small)` — no `n_docs` term. At this shape:
     ///   centroids 64 KiB + rotation matrix 64 KiB + column
-    ///   metadata ≪ 1 MiB per segment. Total expected RSS
-    ///   delta ≪ 200 MiB across 100 segments; 400 MiB ceiling
-    ///   for allocator overhead + reader-struct fields.
+    ///   metadata ≪ 1 MiB per segment. Total expected RSS delta
+    ///   ≪ 200 MiB across 100 segments; 400 MiB ceiling for
+    ///   allocator overhead + reader-struct fields.
     ///
-    /// - With no per-doc resident state on the open path,
-    ///   segment count is the only scaling dimension. A
-    ///   regression that reintroduced any per-doc resident state
-    ///   — e.g. a returning lookup table at `n_docs × 4` bytes
-    ///   per column — would here allocate 100 × 50 k × 4 = 20
-    ///   MiB anon just for tables (small but growing); at the
-    ///   bench's 100 segments × 625 k the same regression is
-    ///   250 MiB.
+    /// - The deletion of `doc_to_pos` (M4) made segment-count
+    ///   the only scaling dimension. A regression that reintroduced
+    ///   any per-doc resident state — e.g. a returning lookup
+    ///   table at `n_docs × 4` bytes per column — would here
+    ///   allocate 100 × 50 k × 4 = 20 MiB anon just for tables
+    ///   (small but growing); at the bench's 100 segments × 625 k
+    ///   the same regression is 250 MiB.
     ///
     /// Each segment file is ~25 MiB on disk; the test writes
     /// ~2.5 GiB total to the tempdir. Build time is dominated by
@@ -3159,10 +4479,437 @@ mod tests {
             delta_mib <= 400.0,
             "many-segments lazy open RSS delta {delta_mib:.3} MiB exceeds 400 MiB ceiling \
              at {N_SEGMENTS} × {N_DOCS_PER_SEG} × {DIM}. A regression that reintroduced \
-             any per-doc resident state at open would push this much higher; keeping the \
-             bound structural is what this test guards."
+             any per-doc resident state would push this much higher; M4's deletion of \
+             doc_to_pos is what keeps the bound structural."
         );
 
         drop(tmps);
+    }
+
+    // -----------------------------------------------------------------
+    // VectorReader::open_lazy cold-open range budget + round-trip
+    // parity. The lazy open path fetches exact metadata ranges:
+    // outer header, directory + CRC, subsection headers, and Sq8
+    // codec_meta. It does not prefetch centroids, cluster_idx, or
+    // per-cluster blocks; those are search-time data.
+    // -----------------------------------------------------------------
+
+    fn build_small_segment(
+        dim: usize,
+        n_cent: usize,
+        n_docs: u32,
+        codec: RerankCodec,
+        metric: Metric,
+    ) -> (Bytes, String, Vec<Vec<f32>>) {
+        let mut b = VectorBuilder::new();
+        b.register_column(VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent,
+            rot_seed: 41,
+            metric,
+            rerank_codec: codec,
+        })
+        .expect("register column");
+        let mut all = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let v: Vec<f32> = (0..dim).map(|j| (i + j as u32) as f32 * 0.1).collect();
+            b.add(0, &v).expect("add");
+            all.push(v);
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let metric_str = match metric {
+            Metric::L2Sq => "l2sq",
+            Metric::Cosine => "cosine",
+            Metric::NegDot => "negdot",
+        };
+        let json = format!(
+            r#"[{{"column":"v","dim":{dim},"n_cent":{n_cent},"rot_seed":41,"metric":"{metric_str}"}}]"#,
+        );
+        (blob, json, all)
+    }
+
+    #[tokio::test]
+    async fn open_lazy_small_sq8_segment_fetches_exact_metadata_ranges() {
+        let (blob, json, _) =
+            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let async_counter = counting.async_counter();
+
+        let _reader = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy small Sq8");
+
+        let n_calls = async_counter.load(AtomicOrdering::Relaxed);
+        assert_eq!(
+            n_calls, 3,
+            "small Sq8 open_lazy must issue exactly 3 async range calls \
+             (outer header, directory+crc, subsection header); \
+             observed {n_calls}",
+        );
+    }
+
+    #[tokio::test]
+    async fn open_lazy_small_segment_fetches_no_codec_meta_for_non_sq8() {
+        for codec in [RerankCodec::Fp32, RerankCodec::RabitqOnly] {
+            let (blob, json, _) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
+            let counting = StdArc::new(CountingLazyByteSource::new(blob));
+            let async_counter = counting.async_counter();
+
+            let _reader = VectorReader::open_lazy(
+                StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+                &json,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("open_lazy {codec:?}: {e:?}"));
+
+            let n_calls = async_counter.load(AtomicOrdering::Relaxed);
+            assert_eq!(
+                n_calls, 3,
+                "open_lazy ({codec:?}) must issue exactly 3 async range calls \
+                 (outer header, directory+crc, subsection header); observed {n_calls}",
+            );
+        }
+    }
+
+    /// round-trip parity. A search against an
+    /// `open_lazy` reader returns the same `(doc_id, distance)`
+    /// hits as the eager `open()` path. Confirms the open-path
+    /// refactor (Phase A sub-header + Phase B codec_meta) and
+    /// the overlay round-trip preserve every search-critical
+    /// metadata field.
+    #[tokio::test]
+    async fn open_lazy_search_matches_eager_open_per_codec() {
+        for codec in [
+            RerankCodec::Fp32,
+            RerankCodec::Sq8Residual,
+            RerankCodec::RabitqOnly,
+        ] {
+            let (blob, json, all) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
+            let r_eager = VectorReader::open(blob.clone(), &json)
+                .unwrap_or_else(|e| panic!("eager open {codec:?}: {e:?}"));
+            let counting = StdArc::new(CountingLazyByteSource::new(blob));
+            let r_lazy = VectorReader::open_lazy(
+                StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+                &json,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("open_lazy {codec:?}: {e:?}"));
+
+            for &q_idx in &[0usize, 7, 17, 31] {
+                let hits_eager = r_eager
+                    .search("v", &all[q_idx], 5, 4, 5)
+                    .unwrap_or_else(|e| panic!("eager search {codec:?}: {e:?}"));
+                let hits_lazy = r_lazy
+                    .search("v", &all[q_idx], 5, 4, 5)
+                    .unwrap_or_else(|e| panic!("lazy search {codec:?}: {e:?}"));
+                assert_eq!(
+                    hits_eager, hits_lazy,
+                    "search results must match between eager and lazy open \
+                     (codec {codec:?}, query {q_idx})",
+                );
+            }
+        }
+    }
+
+    /// Cold first search after `open_lazy` issues at most
+    /// `nprobe + 2` underlying async range GETs against the
+    /// LazyByteSource: centroids, cluster_idx, and one interleaved
+    /// cluster block per probed non-empty cluster. Rerank adds no
+    /// extra GET because full vectors ride inside the cluster blocks.
+    ///
+    /// Headline budget for the 013 plan's "First-search phase"
+    /// (≤ 12 ranges, ≤ 5 MB at 1M × 384 sq8, nprobe = 8). The
+    /// small-segment test here pins the structural shape; M5's
+    /// s3s-fs bench measures the real wall-clock against AWS-
+    /// shape RTTs.
+    ///
+    /// "At most" because some probed clusters can be empty
+    /// (zero-count entries skip the block fetch entirely); for a
+    /// well-distributed corpus the budget is hit exactly.
+    #[tokio::test]
+    async fn cold_first_search_after_open_lazy_within_nprobe_plus_one_ranges() {
+        let (blob, json, all) =
+            build_small_segment(32, 8, 128, RerankCodec::Sq8Residual, Metric::L2Sq);
+
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let async_counter = counting.async_counter();
+        // Disable BytesLazyByteSource's zero-copy sync path so
+        // every non-overlay read is forced through the async
+        // `range` bridge — that's what an object-store-backed
+        // source actually pays per region.
+        counting.disable_sync();
+
+        let r_lazy = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+
+        let after_open = async_counter.load(AtomicOrdering::Relaxed);
+        assert_eq!(
+            after_open, 3,
+            "Sq8 open_lazy must issue exactly the open-time metadata ranges \
+             (header, directory, subheader); codec_meta is deferred to the \
+             first search on the object-store path; observed {after_open}",
+        );
+
+        let nprobe = 4usize;
+        let _hits = r_lazy
+            .search("v", &all[0], 5, nprobe, 5)
+            .expect("cold first search");
+
+        let after_search = async_counter.load(AtomicOrdering::Relaxed);
+        let search_calls = after_search - after_open;
+        let max_expected = (nprobe + 1) as u64;
+        assert!(
+            search_calls <= max_expected,
+            "cold first search at nprobe={nprobe} must issue ≤ {max_expected} async \
+             range GETs (centroids+cluster_idx + one interleaved block per probed \
+             cluster); observed {search_calls}",
+        );
+        assert!(
+            search_calls >= 2,
+            "cold first search must issue at least 2 async range GETs (centroids+ \
+             cluster_idx + ≥1 cluster block); observed {search_calls} suggests \
+             search accidentally short-circuited the cold fetch paths",
+        );
+    }
+
+    /// cold first search must dispatch its
+    /// per-cluster block fetches **concurrently**, not
+    /// serially. The total range-GET count was already
+    /// pinned by the M3 budget test above; this test pins
+    /// the round-trip count.
+    ///
+    /// Each `range()` call holds an in-flight slot (RAII
+    /// guard); peak in-flight ≥ 2 proves the cluster fetches
+    /// overlapped. We pad `range()` with a small artificial
+    /// latency so a serial implementation completes each
+    /// future before the next is awaited — without the
+    /// latency, the trivial `bytes.slice(...)` body
+    /// resolves instantly and even a serial caller looks
+    /// concurrent (in-flight peaks at 1 indistinguishably).
+    ///
+    /// Runs on the multi-thread runtime for the same
+    /// `block_in_place` reason as the M3 test above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_first_search_dispatches_cluster_gets_concurrently() {
+        let (blob, json, all) =
+            build_small_segment(32, 8, 256, RerankCodec::Sq8Residual, Metric::L2Sq);
+
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        let async_counter = counting.async_counter();
+        let max_in_flight = counting.max_in_flight_counter();
+        counting.disable_sync();
+        counting.set_async_latency(std::time::Duration::from_millis(5));
+
+        let r_lazy = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+
+        // Reset max_in_flight after open (we only want to
+        // pin the search-side dispatch shape; open is its
+        // own M2 budget exercise).
+        max_in_flight.store(0, AtomicOrdering::Release);
+        let async_after_open = async_counter.load(AtomicOrdering::Relaxed);
+
+        let nprobe = 8usize;
+        let q = all[0].clone();
+        let hits = r_lazy
+            .search("v", &q, 5, nprobe, 5)
+            .expect("cold first search");
+        assert!(!hits.is_empty(), "self-query should return ≥ 1 hit");
+
+        let peak = max_in_flight.load(AtomicOrdering::Acquire);
+        let search_calls = async_counter.load(AtomicOrdering::Relaxed) - async_after_open;
+        if search_calls >= 3 {
+            // When coalescing still leaves multiple search-side
+            // ranges, they must overlap. Pre-M5 serial dispatch
+            // peaks at exactly 1.
+            assert!(
+                peak >= 2,
+                "cold first search per-cluster fetches must overlap when multiple \
+                 search-side ranges remain (peak in-flight ≥ 2); observed {peak} \
+                 across {search_calls} calls",
+            );
+        } else {
+            assert!(
+                peak >= 1,
+                "coalesced cold first search should still issue at least one \
+                 search-side async range; observed peak={peak}, calls={search_calls}",
+            );
+        }
+    }
+
+    /// round-trip parity for the unified
+    /// codes+doc_ids per-cluster fetch path. The combined block
+    /// gets sliced into a `codes` prefix and `doc_ids` suffix
+    /// inside the search hot loop; this test pins that the
+    /// slice boundaries land at exactly `count * code_bytes`
+    /// (i.e. the bit-identical results survive the refactor
+    /// from two separate ranges to one combined block).
+    #[tokio::test]
+    async fn m3_combined_cluster_fetch_matches_eager_open_per_codec() {
+        for codec in [
+            RerankCodec::Fp32,
+            RerankCodec::Sq8Residual,
+            RerankCodec::RabitqOnly,
+        ] {
+            let (blob, json, all) = build_small_segment(32, 4, 64, codec, Metric::L2Sq);
+            let r_eager = VectorReader::open(blob.clone(), &json)
+                .unwrap_or_else(|e| panic!("eager open {codec:?}: {e:?}"));
+            let counting = StdArc::new(CountingLazyByteSource::new(blob));
+            let r_lazy = VectorReader::open_lazy(
+                StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+                &json,
+                OpenOptions::for_object_store(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("open_lazy {codec:?}: {e:?}"));
+
+            for &q_idx in &[0usize, 7, 17, 31] {
+                let hits_eager = r_eager
+                    .search("v", &all[q_idx], 5, 4, 5)
+                    .unwrap_or_else(|e| panic!("eager search {codec:?}: {e:?}"));
+                let hits_lazy = r_lazy
+                    .search("v", &all[q_idx], 5, 4, 5)
+                    .unwrap_or_else(|e| panic!("lazy search {codec:?}: {e:?}"));
+                assert_eq!(
+                    hits_eager, hits_lazy,
+                    "M3 combined cluster fetch must produce bit-identical search \
+                     results vs eager (codec {codec:?}, query {q_idx})",
+                );
+            }
+        }
+    }
+
+    /// pins the `cluster_block_range` address math
+    /// against the 013 layout's per-cluster block spec
+    /// (`[codes: cnt*cb][doc_ids: cnt*4]`). Walks every non-
+    /// empty cluster and checks the block range size matches
+    /// `cnt × (cb + 4)` exactly, the start aligns with
+    /// `per_cluster_blocks_off + doc_off × (cb + 4)`, and the
+    /// codes/doc_ids halves slice in at the expected boundary
+    /// inside the fetched block.
+    #[test]
+    fn cluster_block_range_matches_v1_layout_invariant() {
+        let (blob, json, _) =
+            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let col = &r.columns[0];
+        let cb = col.quant.code_bytes();
+        let pvb = col.rerank_codec.per_vector_bytes(col.dim);
+        // Interleaved layout: each per-cluster block is
+        // `[codes][doc_ids][full]` at stride `cb + 4 + pvb`.
+        let stride = cb + 4 + pvb;
+
+        let cluster_idx_bytes = r
+            .source
+            .try_get_range_sync(
+                col.subsection_range.start + col.cluster_idx_off
+                    ..col.subsection_range.start + col.cluster_idx_off + (col.n_cent as usize) * 8,
+            )
+            .expect("cluster_idx must be resident in InMemory source");
+
+        let mut n_non_empty = 0usize;
+        for c in 0..col.n_cent {
+            let (off, cnt) = read_cluster_entry(&cluster_idx_bytes, c as usize);
+            if cnt == 0 {
+                continue;
+            }
+            n_non_empty += 1;
+            let block = col.cluster_block_range(off, cnt);
+            let expected_start =
+                col.subsection_range.start + col.per_cluster_blocks_off + (off as usize) * stride;
+            let expected_len = (cnt as usize) * stride;
+            assert_eq!(
+                block.start, expected_start,
+                "cluster {c} block start must equal \
+                 per_cluster_blocks_off + doc_off × stride",
+            );
+            assert_eq!(
+                block.len(),
+                expected_len,
+                "cluster {c} block size must equal cnt × (cb + 4 + per_vec_bytes)",
+            );
+            // Inside the fetched block, `[0..cnt*cb)` is codes,
+            // `[cnt*cb..cnt*(cb+4))` is doc_ids, and the remaining
+            // `cnt*pvb` bytes are the interleaved full[] vectors —
+            // the exact boundaries the search() hot path slices at.
+            let codes_end = (cnt as usize) * cb;
+            let doc_ids_end = codes_end + (cnt as usize) * 4;
+            assert!(
+                doc_ids_end <= block.len(),
+                "codes + doc_ids prefix must fit inside the block"
+            );
+            assert_eq!(
+                block.len() - doc_ids_end,
+                (cnt as usize) * pvb,
+                "full suffix must be cnt × per_vec_bytes bytes",
+            );
+        }
+        assert!(
+            n_non_empty > 0,
+            "test corpus must populate at least one cluster"
+        );
+    }
+
+    /// verify the `Source::Lazy` reader constructed
+    /// by `open_lazy` exposes the same column metadata as the
+    /// eager reader (dim, n_cent, n_docs, codec, sq8_meta shape).
+    /// The structural decode that produces `ColumnReader` runs
+    /// against the overlay; this test pins that every parsed
+    /// field surfaces unchanged.
+    #[tokio::test]
+    async fn open_lazy_column_metadata_matches_eager_open() {
+        let (blob, json, _) =
+            build_small_segment(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        // Simulate the object-store path: with no zero-copy sync read
+        // available, open defers Sq8 codec_meta to the first search,
+        // so the lazy column resolves to `Sq8ColumnMeta::Lazy`.
+        counting.disable_sync();
+        let r_lazy = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+
+        assert_eq!(r_eager.columns.len(), r_lazy.columns.len());
+        let col_eager = &r_eager.columns[0];
+        let col_lazy = &r_lazy.columns[0];
+        assert_eq!(col_eager.name, col_lazy.name);
+        assert_eq!(col_eager.dim, col_lazy.dim);
+        assert_eq!(col_eager.n_cent, col_lazy.n_cent);
+        assert_eq!(col_eager.n_docs, col_lazy.n_docs);
+        assert_eq!(col_eager.rerank_codec, col_lazy.rerank_codec);
+        assert_eq!(col_eager.metric, col_lazy.metric);
+
+        let meta_eager = col_eager.sq8_meta.as_ref().expect("eager Sq8 meta");
+        let meta_lazy = col_lazy.sq8_meta.as_ref().expect("lazy Sq8 meta");
+        assert!(
+            matches!(meta_eager, Sq8ColumnMeta::Eager { .. }),
+            "eager open should materialise Sq8 metadata"
+        );
+        assert!(
+            matches!(meta_lazy, Sq8ColumnMeta::Lazy { .. }),
+            "lazy open should defer Sq8 metadata to search"
+        );
     }
 }

@@ -20,6 +20,7 @@
 use crate::superfile::ReadError;
 use crate::superfile::format::{self, footer, kv};
 use crate::superfile::fts::reader::{BoolMode, FtsReader};
+use crate::superfile::fts::tokenize::Tokenizer as _;
 use crate::superfile::vector::reader::VectorReader;
 use arrow_array::Decimal128Array;
 use arrow_schema::Schema;
@@ -53,7 +54,13 @@ impl Default for OpenOptions {
 }
 
 pub struct SuperfileReader {
-    bytes: Bytes,
+    /// Full Parquet bytes, `Some` only for the eager [`open`]
+    /// path. The lazy [`open_lazy`] path (013 M4) drops the
+    /// whole-segment hold — pass-through SQL / external-Parquet
+    /// callers (`parquet_bytes`) see `None` and must take a
+    /// different path. Vector + FTS queries work on either,
+    /// since each carries its own source under the inner readers.
+    bytes: Option<Bytes>,
     schema: Arc<Schema>,
     id_column: String,
     n_docs: u64,
@@ -68,7 +75,7 @@ impl std::fmt::Debug for SuperfileReader {
             .field("n_docs", &self.n_docs)
             .field("has_fts", &self.fts.is_some())
             .field("has_vec", &self.vec.is_some())
-            .field("bytes_len", &self.bytes.len())
+            .field("bytes_len", &self.bytes.as_ref().map(|b| b.len()))
             .finish()
     }
 }
@@ -82,55 +89,180 @@ impl SuperfileReader {
         Self::open_with(bytes, OpenOptions::default())
     }
 
-    /// Open a superfile via a [`LazyByteSource`].
+    /// Open a superfile via a shared [`LazyByteSource`] (013 M4).
     ///
-    /// Unlike [`open`], `open_lazy` does not require the caller
-    /// to have materialized the full segment up-front. The
-    /// source pulls bytes on demand. Today's implementation
-    /// issues a single full-range fetch through the source
-    /// (the polymorphism point), then constructs the reader
-    /// through the existing `open()` path — so the per-call
-    /// memory cost still scales with segment size. Per-query
-    /// laziness ("≤ 3 ranges per query" — fetching only the
-    /// footer + the touched FTS posting list + the touched
-    /// vector cluster) requires teaching `FtsReader` +
-    /// `VectorReader` to fetch posting / cluster bytes through
-    /// the source on demand, which the trait shape already
-    /// supports but the inner readers don't yet exercise.
+    /// Cold-open range budget:
     ///
-    /// The async signature is what lets the supertable layer
-    /// wrap the source with a broadcast / cold-fetch
-    /// coordinator (see `ColdFetchMode`) — coalescing multiple
-    /// concurrent cold readers onto a single set of
-    /// range-GETs, or running the foreground reader in
-    /// parallel with a background disk-cache fill.
+    /// 1. **1-2 GETs** for the Parquet footer (`inf.*` KV
+    ///    metadata + Arrow schema), via
+    ///    `format::footer::read_parquet_metadata_lazy`.
+    /// 2. **3-4 GETs** for the embedded vector subsection, via
+    ///    `VectorReader::open_lazy` (outer header, directory + CRC,
+    ///    subsection headers, and Sq8 codec_meta when present).
+    /// 3. **3 GETs** for the embedded FTS subsection, via
+    ///    `FtsReader::open_lazy` (header, FST dictionary, doc-length
+    ///    tail; postings stay lazy until search).
+    ///
+    /// Total open budget is small exact metadata ranges rather than
+    /// whole-subsection/speculative slabs. Subsequent vector queries
+    /// fetch centroids, cluster indexes, and per-cluster blocks on
+    /// demand via the source.
+    ///
+    /// The returned reader does **not** hold the full segment;
+    /// `parquet_bytes()` returns `None`. Callers that need the
+    /// full Parquet bytes (DataFusion register, DuckDB,
+    /// pyarrow) must use the eager [`open`] path.
     ///
     /// [`open`]: SuperfileReader::open
     pub async fn open_lazy(
-        source: &dyn crate::superfile::LazyByteSource,
+        source: Arc<dyn crate::superfile::LazyByteSource>,
     ) -> Result<Self, ReadError> {
         Self::open_lazy_with(source, OpenOptions::default()).await
     }
 
     /// Like [`open_lazy`] but with explicit [`OpenOptions`].
     ///
+    /// Lazy opens do not run whole-segment CRC scans. Forcing CRC
+    /// verification here would require reading the full segment through
+    /// range GETs, which is exactly what the lazy path is meant to avoid;
+    /// the embedded vector/FTS lazy readers therefore use their
+    /// object-store options (`verify_crc = false`) while eager cache
+    /// promotion can verify after the full segment is materialized.
+    ///
     /// [`open_lazy`]: SuperfileReader::open_lazy
     pub async fn open_lazy_with(
-        source: &dyn crate::superfile::LazyByteSource,
-        opts: OpenOptions,
+        source: Arc<dyn crate::superfile::LazyByteSource>,
+        _opts: OpenOptions,
     ) -> Result<Self, ReadError> {
-        let size = source.size();
-        let bytes = source.range(0, size).await.map_err(|e| match e {
-            crate::superfile::LazyByteSourceError::Storage(se) => {
-                ReadError::MalformedKv(format!("lazy source storage: {se}"))
+        use parquet::arrow::parquet_to_arrow_schema;
+
+        // 1. Fetch the Parquet footer (≤ 2 GETs).
+        let metadata = footer::read_parquet_metadata_lazy(
+            source.as_ref(),
+            // 64 KiB is plenty for typical superfile footers
+            // (the footer carries `inf.*` KVs + a single row
+            // group's worth of column metadata; a few KiB to
+            // a few tens of KiB).
+            64 * 1024,
+        )
+        .await
+        .map_err(ReadError::Footer)?;
+        let kv_map = footer::extract_kv_map(&metadata).map_err(ReadError::Footer)?;
+
+        // 2. Validate required KVs + format version (same
+        //    checks as the eager `open_with` path).
+        for k in kv::REQUIRED {
+            if !kv_map.contains_key(*k) {
+                return Err(ReadError::MissingKv(k));
             }
-            crate::superfile::LazyByteSourceError::OutOfBounds { start, len, size } => {
-                ReadError::MalformedKv(format!(
-                    "lazy source out-of-bounds: start={start} len={len} size={size}"
-                ))
+        }
+        let format_value = kv_map.get(kv::FORMAT).expect("checked above");
+        if format_value != kv::FORMAT_VALUE {
+            return Err(ReadError::MalformedKv(format!(
+                "{} expected {:?}, got {:?}",
+                kv::FORMAT,
+                kv::FORMAT_VALUE,
+                format_value
+            )));
+        }
+        let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
+        let version = format::Version::parse(version_str)
+            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        if !version.is_compatible_with_current() {
+            return Err(ReadError::UnsupportedVersion(version_str.clone()));
+        }
+
+        let id_column = kv_map.get(kv::ID_COLUMN).expect("checked above").clone();
+        let n_docs: u64 = kv_map
+            .get(kv::N_DOCS)
+            .expect("checked above")
+            .parse()
+            .map_err(|_| ReadError::MalformedKv(format!("{} not a u64", kv::N_DOCS)))?;
+
+        // 3. Arrow schema from decoded Parquet metadata — no
+        //    extra range GET.
+        let file_meta = metadata.file_metadata();
+        let schema = Arc::new(
+            parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata())
+                .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?,
+        );
+
+        // 4 + 5. Vector + FTS subsections — Tail-fetch path:
+        //   fires both subsection fetches **concurrently** via
+        //   `futures::try_join!`. The two subsections live at
+        //   disjoint offsets (parquet body → fts → vec → footer
+        //   in the layout produced by `write_parquet_with_blobs`)
+        //   so neither depends on the other; on a network-backed
+        //   `LazyByteSource` this collapses two serial RTTs
+        //   into one parallel RTT. On warm/in-memory sources
+        //   both branches resolve through the sync zero-copy
+        //   path with no extra cost.
+        //
+        // Each branch validates its `inf.{fts,vec}.*` KV
+        // shape before starting any I/O so partial-KV
+        // misconfigurations fail fast (and don't trigger a
+        // wasted range GET).
+        let vec_present = all_present(&kv_map, kv::VEC_KEYS);
+        if !vec_present && any_present(&kv_map, kv::VEC_KEYS) {
+            return Err(ReadError::MalformedKv(
+                "partial inf.vec.* keys present".into(),
+            ));
+        }
+        let fts_present = all_present(&kv_map, kv::FTS_KEYS);
+        if !fts_present && any_present(&kv_map, kv::FTS_KEYS) {
+            return Err(ReadError::MalformedKv(
+                "partial inf.fts.* keys present".into(),
+            ));
+        }
+
+        let vec_fut = async {
+            if !vec_present {
+                return Ok::<_, ReadError>(None);
             }
-        })?;
-        Self::open_with(bytes, opts)
+            let off = parse_u64(&kv_map, kv::VEC_OFFSET)?;
+            let len = parse_u64(&kv_map, kv::VEC_LENGTH)?;
+            let cols_json = kv_map.get(kv::VEC_COLUMNS).expect("checked");
+            let sub: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(
+                crate::superfile::LazySubSource::new(Arc::clone(&source), off, len),
+            );
+            let reader = VectorReader::open_lazy(
+                sub,
+                cols_json,
+                crate::superfile::vector::reader::OpenOptions::for_object_store(),
+            )
+            .await?;
+            Ok(Some(reader))
+        };
+
+        let fts_fut = async {
+            if !fts_present {
+                return Ok::<_, ReadError>(None);
+            }
+            let off = parse_u64(&kv_map, kv::FTS_OFFSET)?;
+            let len = parse_u64(&kv_map, kv::FTS_LENGTH)?;
+            let cols_json = kv_map.get(kv::FTS_COLUMNS).expect("checked");
+            let sub: Arc<dyn crate::superfile::LazyByteSource> = Arc::new(
+                crate::superfile::LazySubSource::new(Arc::clone(&source), off, len),
+            );
+            let reader = FtsReader::open_lazy(
+                sub,
+                cols_json,
+                crate::superfile::fts::reader::OpenOptions::for_object_store(),
+            )
+            .await?;
+            Ok(Some(reader))
+        };
+
+        let (vec, fts) = futures::try_join!(vec_fut, fts_fut)?;
+
+        Ok(Self {
+            bytes: None,
+            schema,
+            id_column,
+            n_docs,
+            fts,
+            vec,
+        })
     }
 
     /// Open with explicit options. `OpenOptions { verify_crc: false }`
@@ -220,7 +352,7 @@ impl SuperfileReader {
         };
 
         Ok(Self {
-            bytes,
+            bytes: Some(bytes),
             schema,
             id_column,
             n_docs,
@@ -273,8 +405,17 @@ impl SuperfileReader {
     /// Pass-through to the raw Parquet bytes — the superfile is a
     /// valid Parquet file, so this works as input to any external
     /// Parquet reader (DataFusion, DuckDB, pyarrow, …).
-    pub fn parquet_bytes(&self) -> &Bytes {
-        &self.bytes
+    ///
+    /// Returns `None` for readers opened via [`open_lazy`] — the
+    /// lazy path (013 M4) does not materialize the full segment,
+    /// so external-Parquet pass-throughs need either the eager
+    /// [`open`] path or an explicit `LazyByteSource::range(0, size)`
+    /// against the source.
+    ///
+    /// [`open`]: SuperfileReader::open
+    /// [`open_lazy`]: SuperfileReader::open_lazy
+    pub fn parquet_bytes(&self) -> Option<&Bytes> {
+        self.bytes.as_ref()
     }
 
     /// Sequential scan of the `_id` column for an exact `target`
@@ -293,7 +434,13 @@ impl SuperfileReader {
     /// parquet metadata on the reader (see TODO in module-level
     /// comments).
     pub fn id_lookup(&self, target: i128) -> Result<Option<u32>, ReadError> {
-        let builder = ParquetRecordBatchReaderBuilder::try_new(self.bytes.clone())
+        let bytes = self.bytes.clone().ok_or_else(|| {
+            ReadError::Io(std::io::Error::other(
+                "id_lookup requires an eager-opened superfile; this reader was opened via \
+                 the lazy path and does not hold the full segment bytes",
+            ))
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
             .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
         // _id is always at index 0
         let descriptor = builder.parquet_schema().clone();
@@ -342,7 +489,7 @@ impl SuperfileReader {
     /// `query` is tokenized by the same v1 tokenizer used at build
     /// time (`AsciiLowerTokenizer`). Returns `(local_doc_id, score)`
     /// ordered by descending score.
-    pub fn bm25_search(
+    pub async fn bm25_search(
         &self,
         column: &str,
         query: &str,
@@ -350,10 +497,10 @@ impl SuperfileReader {
         mode: BoolMode,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let tok = crate::superfile::fts::tokenize::AsciiLowerTokenizer;
-        use crate::superfile::fts::tokenize::Tokenizer as _;
         let term_strings: Vec<String> = tok.tokenize(query).collect();
         let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
         self.bm25_search_pretokenized(column, &term_refs, k, mode)
+            .await
     }
 
     /// Pre-tokenized variant of [`Self::bm25_search`] — the caller
@@ -371,7 +518,7 @@ impl SuperfileReader {
     /// — the FST keys are stored in that form. Callers using the
     /// v1 tokenizer can produce them via
     /// `AsciiLowerTokenizer.tokenize(query)`.
-    pub fn bm25_search_pretokenized(
+    pub async fn bm25_search_pretokenized(
         &self,
         column: &str,
         terms: &[&str],
@@ -381,7 +528,7 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.search(column, terms, k, mode)?)
+        Ok(fts.search(column, terms, k, mode).await?)
     }
 
     /// Prefix-expanded BM25 search.
@@ -397,7 +544,7 @@ impl SuperfileReader {
     ///
     /// Returns an empty `Vec` if no indexed term begins with
     /// `prefix` or if `k == 0`.
-    pub fn bm25_search_prefix(
+    pub async fn bm25_search_prefix(
         &self,
         column: &str,
         prefix: &str,
@@ -410,7 +557,7 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes());
+        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -421,7 +568,7 @@ impl SuperfileReader {
             .iter()
             .filter_map(|b| std::str::from_utf8(b).ok())
             .collect();
-        Ok(fts.search(column, &term_strings, k, BoolMode::Or)?)
+        Ok(fts.search(column, &term_strings, k, BoolMode::Or).await?)
     }
 
     /// Multi-term OR BM25 search restricted to a doc_id sub-range.
@@ -438,7 +585,7 @@ impl SuperfileReader {
     /// here — they already finish in microseconds via
     /// [`Self::bm25_search_pretokenized`]; the supertable layer
     /// should keep them on the un-ranged path.
-    pub fn bm25_search_or_range_pretokenized(
+    pub async fn bm25_search_or_range_pretokenized(
         &self,
         column: &str,
         terms: &[&str],
@@ -449,7 +596,9 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.search_or_range_pretokenized(column, terms, k, doc_id_start, doc_id_end)?)
+        Ok(fts
+            .search_or_range_pretokenized(column, terms, k, doc_id_start, doc_id_end)
+            .await?)
     }
 
     /// Prefix-expanded BM25 search restricted to a doc_id sub-range.
@@ -462,7 +611,7 @@ impl SuperfileReader {
     /// queries; the per-sub-range expansion is identical (same FST,
     /// same column) so each sub-range expands locally rather than
     /// passing pre-expanded terms across the task boundary.
-    pub fn bm25_search_prefix_range(
+    pub async fn bm25_search_prefix_range(
         &self,
         column: &str,
         prefix: &str,
@@ -477,7 +626,7 @@ impl SuperfileReader {
             return Ok(Vec::new());
         }
         let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes());
+        let term_bytes = fts.iter_terms_with_prefix(column, lowered.as_bytes())?;
         if term_bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -485,12 +634,14 @@ impl SuperfileReader {
             .iter()
             .filter_map(|b| std::str::from_utf8(b).ok())
             .collect();
-        Ok(fts.search_or_range_pretokenized(column, &term_strings, k, doc_id_start, doc_id_end)?)
+        Ok(fts
+            .search_or_range_pretokenized(column, &term_strings, k, doc_id_start, doc_id_end)
+            .await?)
     }
 
     /// Multi-column BM25 search with per-column weights ("most
     /// fields" semantics: per-column scores summed by weight).
-    pub fn bm25_search_multi(
+    pub async fn bm25_search_multi(
         &self,
         columns: &[(&str, f32)],
         query: &str,
@@ -500,7 +651,7 @@ impl SuperfileReader {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts.search_multi(columns, query, k, mode)?)
+        Ok(fts.search_multi(columns, query, k, mode).await?)
     }
 
     /// Single-column vector kNN against a named vector index.
@@ -510,17 +661,18 @@ impl SuperfileReader {
     /// picks defaults that recover ≥0.9 recall@10 on typical IVF
     /// setups.
     ///
-    /// Sync — every public surface in `src/` is sync. Per-range
-    /// byte access routes through
-    /// [`crate::superfile::vector::reader::Source::get_range`],
-    /// which is itself sync and bridges to the underlying
-    /// async `LazyByteSource::range` only on cold
-    /// `Source::Lazy` misses (via `block_in_place +
-    /// Handle::block_on`, same pattern as the
-    /// supertable query path's per-segment reader). On
-    /// `Source::InMemory` and on warm-cache `Source::Lazy`
-    /// (`BytesLazyByteSource`, mmap-backed) every fetch
-    /// resolves zero-copy on the sync fast path.
+    /// Sync — every public surface in `src/` is sync (plan 002 Q9).
+    /// Per-range byte access routes through
+    /// [`crate::superfile::lazy_source::Source::get_range`] /
+    /// `get_ranges_parallel`, which resolve zero-copy on the sync
+    /// fast path for `Source::InMemory` and warm-cache `Source::Lazy`
+    /// (`BytesLazyByteSource`, mmap-backed). Only a cold `Source::Lazy`
+    /// miss bridges to the underlying async `LazyByteSource::range`
+    /// internally. The supertable fan-out
+    /// ([`crate::supertable::handle::SupertableReader::vector_search`])
+    /// drives this on the `reader_pool` rayon threads, so per-segment
+    /// CPU (centroid + 1-bit code scoring, rerank) runs in one pool
+    /// with work-stealing rather than oversubscribing tokio workers.
     pub fn vector_search(
         &self,
         column: &str,
@@ -531,7 +683,8 @@ impl SuperfileReader {
         let v = self
             .vec()
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
-        Ok(v.search(column, query, k, options.nprobe, options.rerank_mult)?)
+        let rerank_mult = v.public_rerank_mult(column, options.rerank_mult());
+        Ok(v.search(column, query, k, options.nprobe, rerank_mult)?)
     }
 }
 
@@ -544,33 +697,28 @@ impl SuperfileReader {
 ///   slower. Default `8`, internally clamped to `[1, n_cent]`. For a
 ///   typical `n_cent ≈ sqrt(n_docs)` setup this means 1/8th of the
 ///   index per query.
-/// - `rerank_mult`: number of `k * rerank_mult` candidates passed
-///   from the 1-bit RaBitQ shortlist into the full-precision rerank.
-///   Higher = better recall, slower. Default `20`. With smaller
-///   values (e.g. `5`) recall@10 drops to ~50% on a 10k×384 corpus
-///   because the 1-bit estimate noise drops true neighbors out of
-///   the shortlist before rerank can recover them — see
-///   `tests/recall.rs` for the measurements behind the default.
 ///
-/// The defaults are deliberately conservative; the bench harness
-/// has the measured 1M / 10M recall-vs-latency curves and may
-/// motivate a smaller default later.
+/// - `rerank_mult`: number of coarse candidates per requested hit to
+///   feed into exact/Sq8 rerank. Higher = better recall, slower.
 #[derive(Debug, Clone, Copy)]
 pub struct VectorSearchOptions {
     pub nprobe: usize,
-    pub rerank_mult: usize,
+    rerank_mult: usize,
 }
 
 impl VectorSearchOptions {
-    /// Builder default: `nprobe = 8`, `rerank_mult = 20`.
     pub const DEFAULT_NPROBE: usize = 8;
-    pub const DEFAULT_RERANK_MULT: usize = 20;
 
-    /// Construct with both defaults applied.
+    /// Internal rerank multiplier. `k * RERANK_MULT` candidates
+    /// from the 1-bit RaBitQ shortlist enter Sq8/residual rerank.
+    /// Bench-validated: recall saturates at 4 on 10M×384 cosine.
+    pub const RERANK_MULT: usize = 4;
+
+    /// Construct with defaults applied.
     pub fn new() -> Self {
         Self {
             nprobe: Self::DEFAULT_NPROBE,
-            rerank_mult: Self::DEFAULT_RERANK_MULT,
+            rerank_mult: Self::RERANK_MULT,
         }
     }
 
@@ -580,10 +728,15 @@ impl VectorSearchOptions {
         self
     }
 
-    /// Override the rerank candidate multiplier.
+    /// Override the rerank multiplier. Values below 1 are clamped
+    /// to 1 so `k > 0` always admits at least `k` coarse candidates.
     pub fn with_rerank_mult(mut self, n: usize) -> Self {
-        self.rerank_mult = n;
+        self.rerank_mult = n.max(1);
         self
+    }
+
+    pub fn rerank_mult(&self) -> usize {
+        self.rerank_mult
     }
 }
 
@@ -711,12 +864,13 @@ mod tests {
         assert!(r.vec().is_none());
     }
 
-    #[test]
-    fn bm25_search_finds_matching_docs() {
+    #[tokio::test]
+    async fn bm25_search_finds_matching_docs() {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let hits = r
             .bm25_search("title", "rust", 5, BoolMode::Or)
+            .await
             .expect("BM25 search");
         // docs 0 and 2 contain "rust"; both should appear.
         let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
@@ -724,8 +878,8 @@ mod tests {
         assert!(doc_ids.contains(&2));
     }
 
-    #[test]
-    fn bm25_search_errors_when_no_fts() {
+    #[tokio::test]
+    async fn bm25_search_errors_when_no_fts() {
         // Build a superfile with no FTS, no vec.
         let schema = schema_with_text();
         let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![], None);
@@ -739,6 +893,7 @@ mod tests {
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
             .bm25_search("nope", "x", 1, BoolMode::Or)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
     }
@@ -807,23 +962,22 @@ mod tests {
     fn vector_search_options_default_values() {
         let opts = VectorSearchOptions::default();
         assert_eq!(opts.nprobe, 8);
-        assert_eq!(opts.rerank_mult, 20);
+        assert_eq!(opts.rerank_mult(), 4);
         let opts2 = VectorSearchOptions::new();
         assert_eq!(opts.nprobe, opts2.nprobe);
-        assert_eq!(opts.rerank_mult, opts2.rerank_mult);
     }
 
     #[test]
     fn vector_search_options_builder_chains() {
         let opts = VectorSearchOptions::new()
             .with_nprobe(2)
-            .with_rerank_mult(50);
+            .with_rerank_mult(32);
         assert_eq!(opts.nprobe, 2);
-        assert_eq!(opts.rerank_mult, 50);
+        assert_eq!(opts.rerank_mult(), 32);
     }
 
-    #[test]
-    fn vector_search_with_default_options_succeeds() {
+    #[tokio::test]
+    async fn vector_search_with_default_options_succeeds() {
         // Confirms the default options path actually executes without
         // panicking; the recall is exercised in tests/recall.rs.
         let bytes = build_vector_only_superfile();
@@ -838,8 +992,8 @@ mod tests {
         assert!(!hits.is_empty());
     }
 
-    #[test]
-    fn vector_search_finds_self() {
+    #[tokio::test]
+    async fn vector_search_finds_self() {
         let bytes = build_vector_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         // Query equal to doc 2's vector → top hit must be doc 2.
@@ -848,14 +1002,7 @@ mod tests {
         q[5] = 0.5;
         normalize(&mut q);
         let hits = r
-            .vector_search(
-                "emb",
-                &q,
-                1,
-                VectorSearchOptions::new()
-                    .with_nprobe(4)
-                    .with_rerank_mult(5),
-            )
+            .vector_search("emb", &q, 1, VectorSearchOptions::new().with_nprobe(4))
             .expect("vector search");
         assert_eq!(hits[0].0, 2);
     }
@@ -865,7 +1012,10 @@ mod tests {
         // The whole buffer should still be a valid Parquet file.
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
-        let p = r.parquet_bytes().clone();
+        let p = r
+            .parquet_bytes()
+            .expect("eager open should retain parquet bytes")
+            .clone();
         let builder = ParquetRecordBatchReaderBuilder::try_new(p)
             .expect("try_new ParquetRecordBatchReaderBuilder");
         let mut reader = builder.build().expect("build parquet reader");
@@ -874,18 +1024,19 @@ mod tests {
         assert_eq!(batch.num_columns(), 2);
     }
 
-    #[test]
-    fn unknown_column_in_search_propagates_fts_error() {
+    #[tokio::test]
+    async fn unknown_column_in_search_propagates_fts_error() {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let err = r
             .bm25_search("nonexistent", "rust", 5, BoolMode::Or)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::Fts(_)));
     }
 
-    #[test]
-    fn bm25_search_multi_combines_columns() {
+    #[tokio::test]
+    async fn bm25_search_multi_combines_columns() {
         // Build a 2-FTS-column file.
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
@@ -918,6 +1069,7 @@ mod tests {
         let r = SuperfileReader::open(bytes).expect("open superfile");
         let hits = r
             .bm25_search_multi(&[("title", 1.0), ("body", 1.0)], "rust", 3, BoolMode::Or)
+            .await
             .expect("BM25 multi-column search");
         // Both doc 0 (title:rust) and doc 1 (body:rust) hit.
         let doc_ids: std::collections::HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();

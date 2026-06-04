@@ -184,8 +184,7 @@ fn supertable_to_global_ids(
 }
 
 fn supertable_search_global(st: &Supertable, query: &str, k: usize, chunk_size: usize) -> Vec<u64> {
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search("title", query, k, BoolMode::Or)
         .expect("supertable bm25");
     supertable_to_global_ids(st, hits, chunk_size)
@@ -197,8 +196,7 @@ fn supertable_search_and_global(
     k: usize,
     chunk_size: usize,
 ) -> Vec<u64> {
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search("title", query, k, BoolMode::And)
         .expect("supertable bm25 AND");
     supertable_to_global_ids(st, hits, chunk_size)
@@ -210,8 +208,7 @@ fn supertable_prefix_global(
     k: usize,
     chunk_size: usize,
 ) -> Vec<u64> {
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search_prefix("title", prefix, k)
         .expect("supertable bm25_prefix");
     supertable_to_global_ids(st, hits, chunk_size)
@@ -489,7 +486,9 @@ fn prefix_skip_prunes_segments_without_matching_lex_range() {
     corp[0].1.push_str(" quokka_unique");
     let infino = build_supertable(&corp, SEGMENTS);
     let r = infino.reader();
-    let hits = r.bm25_search_prefix("title", "quokka", 5).expect("prefix");
+    let hits = infino
+        .bm25_search_prefix("title", "quokka", 5)
+        .expect("prefix");
     assert_eq!(hits.len(), 1);
     let manifest = r.manifest();
     let target_uri = manifest.superfiles[0].uri;

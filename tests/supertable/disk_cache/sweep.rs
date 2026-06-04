@@ -61,7 +61,7 @@ fn build_test_bytes() -> Bytes {
 }
 
 async fn seed(storage: &dyn StorageProvider, uri: SuperfileUri, bytes: Bytes) {
-    let path = format!("data/seg-{}.sf", uri.0);
+    let path = uri.storage_path();
     storage.put_atomic(&path, bytes).await.expect("seed");
 }
 
@@ -81,6 +81,7 @@ fn cache_with_threshold(
         mmap_sweep_interval_secs: sweep_interval_secs,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
     (dir, store)
@@ -175,6 +176,7 @@ async fn data_remains_correct_after_madv_dontneed() {
     let fts = reader.fts().expect("fts");
     let hits = fts
         .search("title", &["special"], 10, BoolMode::Or)
+        .await
         .expect("bm25 after MADV_DONTNEED");
     assert_eq!(
         hits.len(),

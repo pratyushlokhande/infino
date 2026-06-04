@@ -114,8 +114,8 @@ fn build_reader_with_sample_size(
     VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader")
 }
 
-#[test]
-fn recall_under_undersized_reservoir_matches_brute_force() {
+#[tokio::test]
+async fn recall_under_undersized_reservoir_matches_brute_force() {
     let dim = 32;
     let n_cent = 8;
     let n_docs = 2_000;
@@ -143,7 +143,7 @@ fn recall_under_undersized_reservoir_matches_brute_force() {
     // because it skips the rerank step entirely and is covered
     // separately by `rabitq_only_self_query_ranks_self_first` in
     // reader.rs.
-    for codec in [RerankCodec::Fp32, RerankCodec::Sq8] {
+    for codec in [RerankCodec::Fp32, RerankCodec::Sq8Residual] {
         let reader = build_reader_with_sample_size(&flat, dim, n_docs, n_cent, sample_size, codec);
         let mut total_recall = 0.0f32;
         for q_idx in queries {
@@ -187,8 +187,8 @@ fn recall_under_undersized_reservoir_matches_brute_force() {
     }
 }
 
-#[test]
-fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
+#[tokio::test]
+async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
     // Sanity check: when the corpus fits inside the default
     // reservoir (which is the normal regime for unit tests), the
     // result should be self-NN-perfect just like the full-corpus path.

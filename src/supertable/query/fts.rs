@@ -1,14 +1,13 @@
-//! BM25 fan-out methods on [`super::super::SupertableReader`].
+//! BM25 fan-out on [`Supertable`](super::super::Supertable).
 //!
 //! ## Public API
 //!
 //! ```ignore
-//! let reader = supertable.reader();
 //! let hits: Vec<SuperfileHit> =
-//!     reader.bm25_search("title", "rust async", 10, BoolMode::Or)?;
+//!     supertable.bm25_search("title", "rust async", 10, BoolMode::Or)?;
 //!
 //! let prefix_hits: Vec<SuperfileHit> =
-//!     reader.bm25_search_prefix("title", "rus", 10)?;
+//!     supertable.bm25_search_prefix("title", "rus", 10)?;
 //! ```
 //!
 //! Both methods return [`SuperfileHit`]s sorted by score *descending*
@@ -18,9 +17,9 @@
 //!
 //! ## Strategy
 //!
-//! The public API style is methods on the reader. The
-//! reader holds a pinned `Arc<Manifest>`; for each visible segment
-//! we:
+//! Internally pins a snapshot reader and drives the async
+//! kernel to completion via the sync→async bridge. The reader
+//! holds a pinned `Arc<Manifest>`; for each visible segment we:
 //!
 //!   1. Fetch the segment's `SuperfileReader` from the store.
 //!   2. Delegate to `SuperfileReader::bm25_search` /
@@ -38,7 +37,7 @@
 //! BM25's IDF is computed from per-segment `n_docs` and `df`,
 //! so a rare term in a small segment can score higher than the
 //! same term in a larger segment. This is the classical sharded-
-//! BM25 problem (Lucene, Elasticsearch all face it):
+//! BM25 problem:
 //! treating per-segment scores as comparable is a documented
 //! approximation, accepted in v1 because (a) global IDF would
 //! require either a manifest-wide df table or a two-pass query
@@ -57,13 +56,11 @@
 
 use std::sync::Arc;
 
-use rayon::prelude::*;
-
 use crate::superfile::SuperfileReader;
 pub use crate::superfile::fts::reader::BoolMode;
 use crate::superfile::fts::tokenize::{AsciiLowerTokenizer, Tokenizer};
 use crate::supertable::error::QueryError;
-use crate::supertable::handle::SupertableReader;
+use crate::supertable::handle::{Supertable, SupertableReader};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
 use crate::supertable::reader_cache::SuperfileReaderCache;
 
@@ -84,8 +81,12 @@ impl SupertableReader {
     /// Empty supertable (no superfiles) returns an empty `Vec`
     /// without consulting the store.
     ///
+    /// `pub(crate)` async kernel — the public surface is the sync
+    /// [`Supertable::bm25_search`], which drives this via the
+    /// sync→async bridge after applying the read-consistency policy.
+    ///
     /// [`AsciiLowerTokenizer`]: crate::superfile::fts::tokenize::AsciiLowerTokenizer
-    pub fn bm25_search(
+    pub(crate) async fn bm25_search(
         &self,
         column: &str,
         query: &str,
@@ -98,7 +99,8 @@ impl SupertableReader {
         let manifest = self.manifest();
         let store = Arc::clone(&manifest.options.store);
         let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-        let pool = Arc::clone(&manifest.options.reader_pool);
+        let storage = manifest.options.storage.as_ref().map(Arc::clone);
+        let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let tombstone_cache = self.tombstone_cache.clone();
         let now = std::time::Instant::now();
@@ -130,7 +132,8 @@ impl SupertableReader {
                 crate::supertable::query::hierarchical_iter::load_and_flatten(
                     manifest.as_ref(),
                     &kept,
-                )?
+                )
+                .await?
             }
             None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
                 manifest.as_ref(),
@@ -158,26 +161,38 @@ impl SupertableReader {
         if kept.is_empty() {
             return Ok(Vec::new());
         }
-        let work_units =
-            build_or_work_units(&kept, mode, term_refs.len(), pool.current_num_threads());
+        let work_units = build_or_work_units(&kept, mode, term_refs.len(), pool_threads);
 
-        let per_unit: Result<Vec<Vec<SuperfileHit>>, QueryError> = pool.install(|| {
-            work_units
-                .par_iter()
-                .map(|unit| {
-                    let r = open_reader(&store, disk_cache.as_ref(), &unit.entry)?;
+        let term_arc: Arc<Vec<String>> = Arc::new(term_strings);
+        let column_arc = Arc::new(column_owned);
+
+        let handles: Vec<_> = work_units
+            .into_iter()
+            .map(|unit| {
+                let store = Arc::clone(&store);
+                let disk_cache = disk_cache.clone();
+                let storage = storage.clone();
+                let column_arc = Arc::clone(&column_arc);
+                let term_arc = Arc::clone(&term_arc);
+                let tombstone_cache = tombstone_cache.clone();
+                tokio::spawn(async move {
+                    let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &unit.entry)
+                        .await?;
+                    let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                     let hits = match unit.range {
                         Some((start, end)) => r
                             .bm25_search_or_range_pretokenized(
-                                &column_owned,
+                                &column_arc,
                                 &term_refs,
                                 k,
                                 start,
                                 end,
                             )
+                            .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                         None => r
-                            .bm25_search_pretokenized(&column_owned, &term_refs, k, mode)
+                            .bm25_search_pretokenized(&column_arc, &term_refs, k, mode)
+                            .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                     };
                     let mut tagged = tag_hits(&unit.entry, hits);
@@ -187,12 +202,19 @@ impl SupertableReader {
                         &mut tagged,
                         now,
                     )?;
-                    Ok(tagged)
+                    Ok::<_, QueryError>(tagged)
                 })
-                .collect()
-        });
+            })
+            .collect();
 
-        Ok(top_k_descending(per_unit?, k))
+        let per_unit: Vec<Vec<SuperfileHit>> = futures::future::try_join_all(
+            handles
+                .into_iter()
+                .map(|h| async move { h.await.map_err(|e| QueryError::Store(e.to_string()))? }),
+        )
+        .await?;
+
+        Ok(top_k_descending(per_unit, k))
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's
@@ -205,7 +227,10 @@ impl SupertableReader {
     ///
     /// Empty supertable (no superfiles) and `k == 0` short-circuit
     /// to an empty `Vec`.
-    pub fn bm25_search_prefix(
+    ///
+    /// `pub(crate)` async kernel — the public surface is the sync
+    /// [`Supertable::bm25_search_prefix`].
+    pub(crate) async fn bm25_search_prefix(
         &self,
         column: &str,
         prefix: &str,
@@ -217,7 +242,8 @@ impl SupertableReader {
         let manifest = self.manifest();
         let store = Arc::clone(&manifest.options.store);
         let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
-        let pool = Arc::clone(&manifest.options.reader_pool);
+        let storage = manifest.options.storage.as_ref().map(Arc::clone);
+        let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
         let tombstone_cache = self.tombstone_cache.clone();
@@ -230,7 +256,7 @@ impl SupertableReader {
         // tokenizer's interpretation of the prefix.
         let prefix_lower = prefix_owned.to_ascii_lowercase();
 
-        // M15c: hierarchical pruning. List-level prefix
+        // hierarchical pruning. List-level prefix
         // skip via term_range_union → lazy-load only the
         // surviving parts → flatten → per-segment
         // term-range skip + fan-out.
@@ -244,7 +270,8 @@ impl SupertableReader {
                 crate::supertable::query::hierarchical_iter::load_and_flatten(
                     manifest.as_ref(),
                     &kept,
-                )?
+                )
+                .await?
             }
             None => crate::supertable::query::hierarchical_iter::fallback_to_flat_segments(
                 manifest.as_ref(),
@@ -277,19 +304,31 @@ impl SupertableReader {
         // since the prefix path always runs BoolMode::Or and the
         // expansion typically yields ≥2 terms at the scales we
         // care about.
-        let work_units = build_or_work_units(&kept, BoolMode::Or, 2, pool.current_num_threads());
+        let work_units = build_or_work_units(&kept, BoolMode::Or, 2, pool_threads);
 
-        let per_unit: Result<Vec<Vec<SuperfileHit>>, QueryError> = pool.install(|| {
-            work_units
-                .par_iter()
-                .map(|unit| {
-                    let r = open_reader(&store, disk_cache.as_ref(), &unit.entry)?;
+        let column_arc = Arc::new(column_owned);
+        let prefix_arc = Arc::new(prefix_owned);
+
+        let handles: Vec<_> = work_units
+            .into_iter()
+            .map(|unit| {
+                let store = Arc::clone(&store);
+                let disk_cache = disk_cache.clone();
+                let storage = storage.clone();
+                let column_arc = Arc::clone(&column_arc);
+                let prefix_arc = Arc::clone(&prefix_arc);
+                let tombstone_cache = tombstone_cache.clone();
+                tokio::spawn(async move {
+                    let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &unit.entry)
+                        .await?;
                     let hits = match unit.range {
                         Some((start, end)) => r
-                            .bm25_search_prefix_range(&column_owned, &prefix_owned, k, start, end)
+                            .bm25_search_prefix_range(&column_arc, &prefix_arc, k, start, end)
+                            .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                         None => r
-                            .bm25_search_prefix(&column_owned, &prefix_owned, k)
+                            .bm25_search_prefix(&column_arc, &prefix_arc, k)
+                            .await
                             .map_err(|e| QueryError::Parquet(e.to_string()))?,
                     };
                     let mut tagged = tag_hits(&unit.entry, hits);
@@ -299,12 +338,52 @@ impl SupertableReader {
                         &mut tagged,
                         now,
                     )?;
-                    Ok(tagged)
+                    Ok::<_, QueryError>(tagged)
                 })
-                .collect()
-        });
+            })
+            .collect();
 
-        Ok(top_k_descending(per_unit?, k))
+        let per_unit: Vec<Vec<SuperfileHit>> = futures::future::try_join_all(
+            handles
+                .into_iter()
+                .map(|h| async move { h.await.map_err(|e| QueryError::Store(e.to_string()))? }),
+        )
+        .await?;
+
+        Ok(top_k_descending(per_unit, k))
+    }
+}
+
+impl Supertable {
+    /// Single-column BM25 search over the current snapshot.
+    ///
+    /// Pins a reader at call entry, applies the read-consistency
+    /// policy, and drives the internal async kernel to completion
+    /// via the sync→async bridge ([`Supertable::block_on_query`]).
+    /// Returns up to `k` hits sorted by BM25 score *descending*.
+    pub fn bm25_search(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        mode: BoolMode,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.ensure_fresh();
+        let reader = self.reader();
+        self.block_on_query(reader.bm25_search(column, query, k, mode))
+    }
+
+    /// Prefix-expanded BM25 search — see [`Supertable::bm25_search`]
+    /// for the bridge semantics.
+    pub fn bm25_search_prefix(
+        &self,
+        column: &str,
+        prefix: &str,
+        k: usize,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.ensure_fresh();
+        let reader = self.reader();
+        self.block_on_query(reader.bm25_search_prefix(column, prefix, k))
     }
 }
 
@@ -394,13 +473,21 @@ fn build_or_work_units(
     units
 }
 
-fn open_reader(
+async fn open_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<crate::supertable::reader_cache::DiskCacheStore>>,
+    storage: Option<&Arc<dyn crate::storage::StorageProvider>>,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
-    crate::supertable::query::superfile_reader::superfile_reader(store, disk_cache, &entry.uri)
-        .map_err(|e| QueryError::Store(e.to_string()))
+    crate::supertable::query::superfile_reader::superfile_reader(
+        store,
+        disk_cache,
+        storage,
+        &entry.uri,
+        entry.subsection_offsets.as_ref(),
+    )
+    .await
+    .map_err(|e| QueryError::Store(e.to_string()))
 }
 
 fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {
@@ -443,23 +530,45 @@ fn apply_tombstone_filter(
     Ok(())
 }
 
-/// Concatenate per-segment hits and return the top-k by descending
-/// score. Total-order on `f32` is broken by `score.partial_cmp`
-/// returning `None` for NaN — bm25 score arithmetic is built from
-/// real-valued idf + tf and never emits NaN, so we treat NaN as
-/// "least relevant" (sorted to the bottom) defensively.
+/// Merge per-segment hits and return the top-k by *descending*
+/// score (highest BM25 = most relevant). Uses a min-heap of size k
+/// so we never sort more than k elements.
 fn top_k_descending(per_segment: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
-    let mut all: Vec<SuperfileHit> = per_segment.into_iter().flatten().collect();
-    // pdqsort: same rationale as `top_k_ascending` in the vector
-    // path — cross-segment top-k merge, partial_cmp tie-break
-    // composes with (segment, local_doc_id) for total order.
-    all.sort_unstable_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    all.truncate(k);
-    all
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    #[derive(PartialEq)]
+    struct MinByScore(SuperfileHit);
+    impl Eq for MinByScore {}
+    impl PartialOrd for MinByScore {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for MinByScore {
+        fn cmp(&self, other: &Self) -> Ordering {
+            other
+                .0
+                .score
+                .partial_cmp(&self.0.score)
+                .unwrap_or(Ordering::Equal)
+        }
+    }
+
+    let mut heap = BinaryHeap::with_capacity(k + 1);
+    for hit in per_segment.into_iter().flatten() {
+        if heap.len() < k {
+            heap.push(MinByScore(hit));
+        } else if let Some(worst) = heap.peek()
+            && hit.score > worst.0.score
+        {
+            heap.pop();
+            heap.push(MinByScore(hit));
+        }
+    }
+    let mut result: Vec<SuperfileHit> = heap.into_iter().map(|m| m.0).collect();
+    result.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    result
 }
 
 /// Helper used by [`Manifest`] consumers in tests and downstream
@@ -563,18 +672,19 @@ mod tests {
         Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))
     }
 
-    #[test]
-    fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
+    #[tokio::test]
+    async fn bm25_search_empty_supertable_returns_empty_without_store_calls() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 5, BoolMode::Or)
+            .await
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn bm25_search_k_zero_short_circuits() {
+    #[tokio::test]
+    async fn bm25_search_k_zero_short_circuits() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
@@ -582,12 +692,13 @@ mod tests {
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 0, BoolMode::Or)
+            .await
             .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn bm25_search_returns_descending_score_order() {
+    #[tokio::test]
+    async fn bm25_search_returns_descending_score_order() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(
@@ -604,6 +715,7 @@ mod tests {
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 4, BoolMode::Or)
+            .await
             .expect("query");
         // Should return 3 hits (the python doc has no `rust`).
         assert_eq!(hits.len(), 3);
@@ -613,8 +725,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bm25_search_carries_segment_uri_for_each_hit() {
+    #[tokio::test]
+    async fn bm25_search_carries_segment_uri_for_each_hit() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust rust async"])).expect("a1");
@@ -626,6 +738,7 @@ mod tests {
         assert_eq!(r.n_superfiles(), 2);
         let hits = r
             .bm25_search("title", "rust", 5, BoolMode::Or)
+            .await
             .expect("query");
         assert_eq!(hits.len(), 2);
         // Both segment URIs should appear.
@@ -639,8 +752,8 @@ mod tests {
         assert_eq!(uris, expected);
     }
 
-    #[test]
-    fn bm25_search_oracle_top_k_set_matches_single_superfile() {
+    #[tokio::test]
+    async fn bm25_search_oracle_top_k_set_matches_single_superfile() {
         // Plant a corpus where the top-k under BM25 is unambiguous
         // regardless of per-segment-vs-global IDF variation: 3 docs
         // contain the rare term `nimblefox`, distributed across 3
@@ -678,6 +791,7 @@ mod tests {
         let oracle = build_oracle_superfile(&titles);
         let oracle_hits = oracle
             .bm25_search("title", "nimblefox", 5, BoolMode::Or)
+            .await
             .expect("oracle");
         // Oracle should find exactly 3 docs containing `nimblefox`.
         assert_eq!(oracle_hits.len(), 3);
@@ -688,6 +802,7 @@ mod tests {
         let st_reader = st.reader();
         let st_hits = st_reader
             .bm25_search("title", "nimblefox", 5, BoolMode::Or)
+            .await
             .expect("supertable query");
         assert_eq!(st_hits.len(), 3);
         // Resolve supertable hits to global doc-ids via segment
@@ -707,8 +822,8 @@ mod tests {
         assert_eq!(st_globals, oracle_set);
     }
 
-    #[test]
-    fn bm25_search_prefix_oracle_top_k_set_matches_single_superfile() {
+    #[tokio::test]
+    async fn bm25_search_prefix_oracle_top_k_set_matches_single_superfile() {
         let titles = vec![
             "rust async runtime",
             "rust embedded systems",
@@ -732,6 +847,7 @@ mod tests {
         let oracle = build_oracle_superfile(&titles);
         let oracle_hits = oracle
             .bm25_search_prefix("title", "rust", 5)
+            .await
             .expect("oracle");
         let oracle_globals: std::collections::HashSet<u32> =
             oracle_hits.iter().map(|(d, _)| *d).collect();
@@ -739,6 +855,7 @@ mod tests {
         let st_reader = st.reader();
         let st_hits = st_reader
             .bm25_search_prefix("title", "rust", 5)
+            .await
             .expect("supertable query");
         let manifest = st_reader.manifest();
         let st_globals: std::collections::HashSet<u32> = st_hits
@@ -759,20 +876,23 @@ mod tests {
         assert!(st_hits.len() >= 4);
     }
 
-    #[test]
-    fn bm25_search_prefix_unmatched_prefix_returns_empty() {
+    #[tokio::test]
+    async fn bm25_search_prefix_unmatched_prefix_returns_empty() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust async"])).expect("append");
         w.commit().expect("commit");
 
         let r = st.reader();
-        let hits = r.bm25_search_prefix("title", "zzzz", 10).expect("query");
+        let hits = r
+            .bm25_search_prefix("title", "zzzz", 10)
+            .await
+            .expect("query");
         assert!(hits.is_empty());
     }
 
-    #[test]
-    fn bm25_search_prefix_lowercases_input() {
+    #[tokio::test]
+    async fn bm25_search_prefix_lowercases_input() {
         // Index stores tokenized terms (lowercased); user provides
         // mixed-case prefix; we lowercase before expansion so the
         // FST walk finds the matching subtree.
@@ -783,12 +903,15 @@ mod tests {
         w.commit().expect("commit");
 
         let r = st.reader();
-        let hits = r.bm25_search_prefix("title", "RUST", 5).expect("query");
+        let hits = r
+            .bm25_search_prefix("title", "RUST", 5)
+            .await
+            .expect("query");
         assert_eq!(hits.len(), 1);
     }
 
-    #[test]
-    fn bm25_search_unknown_column_errors() {
+    #[tokio::test]
+    async fn bm25_search_unknown_column_errors() {
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
         w.append(&build_batch(0, &["rust"])).expect("append");
@@ -797,12 +920,13 @@ mod tests {
         let r = st.reader();
         let err = r
             .bm25_search("missing_column", "rust", 5, BoolMode::Or)
+            .await
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
     }
 
-    #[test]
-    fn bm25_search_results_global_top_k_caps_at_k() {
+    #[tokio::test]
+    async fn bm25_search_results_global_top_k_caps_at_k() {
         // 4 superfiles × 1 doc each = 4 hits; ask for k=2; expect 2.
         let st = Supertable::create(options_one_segment_per_commit()).expect("create");
         let mut w = st.writer().expect("writer");
@@ -814,6 +938,7 @@ mod tests {
         let r = st.reader();
         let hits = r
             .bm25_search("title", "rust", 2, BoolMode::Or)
+            .await
             .expect("query");
         assert_eq!(hits.len(), 2);
     }

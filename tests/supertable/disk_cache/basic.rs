@@ -136,7 +136,7 @@ fn build_test_superfile_bytes() -> Bytes {
 }
 
 async fn seed_segment(storage: &dyn StorageProvider, uri: SuperfileUri, bytes: Bytes) {
-    let path = format!("data/seg-{}.sf", uri.0);
+    let path = uri.storage_path();
     storage.put_atomic(&path, bytes).await.expect("seed put");
 }
 
@@ -155,6 +155,7 @@ fn fresh_cache_with_storage(
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
     (cache_dir, store)
@@ -252,7 +253,7 @@ async fn reader_returns_working_superfile_reader() {
     // Sanity: the mmap-backed reader exposes an FTS reader
     // and the indexed terms include our planted token.
     let fts = reader.fts().expect("fts reader");
-    let title_terms = fts.iter_column_terms("title");
+    let title_terms = fts.iter_column_terms("title").expect("iter terms");
     assert!(
         title_terms.iter().any(|t| t.as_slice() == b"alpha"),
         "mmap-backed reader must expose the planted FTS term"
@@ -295,6 +296,7 @@ async fn eviction_respects_pinned_set() {
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let cache = DiskCacheStore::new(Arc::clone(&local), cfg, pinned).expect("cache");
 
@@ -343,6 +345,7 @@ async fn lru_evicts_oldest_unpinned_when_budget_pressure_hits() {
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");
 
@@ -391,6 +394,7 @@ async fn reservation_race_preserves_budget_invariant() {
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");
 

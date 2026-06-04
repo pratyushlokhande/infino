@@ -76,8 +76,8 @@ fn stats_track_commits_on_in_process_supertable() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn stats_show_manifest_parts_when_storage_attached() {
+#[test]
+fn stats_show_manifest_parts_when_storage_attached() {
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -111,7 +111,6 @@ async fn stats_show_manifest_parts_when_storage_attached() {
     // n_manifest_parts_loaded should equal n_manifest_parts.
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
     let consumer_stats = consumer.stats();
     assert_eq!(consumer_stats.manifest_id, 1);
@@ -237,6 +236,7 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> = Arc::new(HashSet::new);
     let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned).expect("cache");

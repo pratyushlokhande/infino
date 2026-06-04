@@ -8,15 +8,16 @@
 //! re-run would silently risk mixing measurements against drifted
 //! data.
 //!
-//! ## Scale knob
+//! ## Scale policy
 //!
-//! [`n_docs`] returns `10_000_000` when `INFINO_BENCH_FULL=1` is set
-//! in the environment, otherwise `1_000_000`. Vector at 10M × 384 (f32)
-//! = 14.6 GB resident — needs a 32 GB+ machine. Superfile-shape benches
-//! pin themselves to 1M (one-segment scale); supertable-shape benches
-//! pin to 10M (sharding scale). Each topic's bench files name the
-//! pinned constant directly rather than calling this helper at
-//! benchmark time.
+//! Scale is fixed by *shape*, not by an environment variable:
+//! superfile-shape benches use [`SUPERFILE_DOCS`] (1M, one-segment
+//! scale), supertable-shape benches use [`SUPERTABLE_DOCS`] (10M,
+//! sharding scale). Vector at 10M × 384 (f32) = 14.6 GB resident —
+//! needs a 32 GB+ machine. There is deliberately no `INFINO_BENCH_FULL`
+//! knob: a bench's scale is a property of the shape it measures, so it
+//! lives in a `const` next to that bench, not behind an env toggle that
+//! silently means different things in different files.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -25,7 +26,7 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
+use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use memmap2::Mmap;
@@ -39,11 +40,31 @@ use infino::superfile::builder::{
     BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig as SfVectorConfig,
 };
 use infino::superfile::fts::builder::FtsBuilder;
+use infino::superfile::reader::VectorSearchOptions;
 use infino::superfile::vector::builder::{VectorBuilder, VectorConfig};
-use infino::superfile::vector::distance::{Metric, normalize};
+use infino::superfile::vector::distance::{Metric, distance, normalize};
 use infino::superfile::vector::reader::{OpenOptions, VectorReader};
 use infino::superfile::vector::rerank_codec::RerankCodec;
 use infino::test_helpers::default_tokenizer;
+
+// ─── Async bridge for in-memory bench helpers ─────────────────────────
+
+/// Drive an in-memory (no object-store I/O) async search to
+/// completion from sync bench code.
+///
+/// The query/search API is `async` (Option A). Bench helpers that
+/// operate on in-memory `VectorReader` / `FtsReader` / in-process
+/// `Supertable` readers never touch the object store, so their
+/// futures resolve `Ready` without a tokio reactor — a plain
+/// `futures::executor::block_on` drives them with no runtime setup
+/// and, unlike `tokio::runtime::block_on`, never panics when nested
+/// inside another runtime. Real-object-store benches (see
+/// `unified_object_store`) drive their futures on an explicit
+/// multi-thread tokio runtime instead, because object_store needs
+/// the tokio reactor.
+pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
+    futures::executor::block_on(fut)
+}
 
 // ─── Scale constants ──────────────────────────────────────────────────
 
@@ -66,15 +87,16 @@ pub const DIM: usize = 384;
 /// returns. Re-exported here so recall helpers stay engine-agnostic.
 pub type Hit = (u32, f32);
 
-/// Resolved doc count for the current bench run, gated by the
-/// `INFINO_BENCH_FULL` env var (10M when set, 1M otherwise).
-pub fn n_docs() -> usize {
-    if std::env::var("INFINO_BENCH_FULL").is_ok() {
-        10_000_000
-    } else {
-        1_000_000
-    }
-}
+/// Doc count for superfile-shape benches (one-segment scale). 1M ×
+/// 384 (f32) ≈ 1.5 GB — fits comfortably in RAM for the hot tier and
+/// is the single-superfile cold-open unit for the warm/cold tiers.
+pub const SUPERFILE_DOCS: usize = 1_000_000;
+
+/// Doc count for supertable-shape benches (scale-out / sharding
+/// scale). 10M × 384 (f32) ≈ 14.6 GB resident — needs a 32 GB+ box.
+/// This is the headline supertable scale that the warm/cold tiers run
+/// over the object store.
+pub const SUPERTABLE_DOCS: usize = 10_000_000;
 
 /// IVF cluster count. Conventionally `~sqrt(n_docs)`, snapped to a
 /// fixed value per scale band so 1M and 10M runs share a stable
@@ -219,6 +241,11 @@ impl MmapTextCorpus {
         (start..end).map(|idx| self.doc(idx)).collect()
     }
 }
+
+pub mod combined;
+pub mod grading;
+
+pub use combined::SequentialSyntheticCorpus;
 
 // ─── Vector corpus ────────────────────────────────────────────────────
 
@@ -413,6 +440,28 @@ pub fn generate_realistic_queries(
 
 // ─── Brute-force ground truth + recall ────────────────────────────────
 
+/// Brute-force kNN ground truth for any [`Metric`]. Returns top-k local
+/// doc_ids (no distances — recall only needs the id set).
+pub fn brute_force_topk(
+    vectors: &[f32],
+    n_docs: usize,
+    query: &[f32],
+    metric: Metric,
+    k: usize,
+) -> Vec<u32> {
+    assert_eq!(vectors.len(), n_docs * DIM);
+    assert_eq!(query.len(), DIM);
+    let mut scored: Vec<(u32, f32)> = (0..n_docs as u32)
+        .map(|i| {
+            let off = (i as usize) * DIM;
+            (i, distance(metric, query, &vectors[off..off + DIM]))
+        })
+        .collect();
+    scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
 /// Brute-force kNN ground truth for cosine distance on L2-normalized
 /// vectors. Returns top-k local doc_ids (no distances — recall only
 /// needs the id set).
@@ -480,6 +529,29 @@ pub fn mean_recall_infino(
         let hits = reader
             .search("v", q, k, nprobe, rerank_mult)
             .expect("vector search");
+        sum += recall_at_k(&hits, t);
+    }
+    sum / queries.len() as f32
+}
+
+/// Mean recall via production [`SuperfileReader::vector_search`].
+pub fn mean_recall_superfile(
+    reader: &SuperfileReader,
+    column: &str,
+    queries: &[Vec<f32>],
+    truths: &[Vec<u32>],
+    k: usize,
+    nprobe: usize,
+    rerank_mult: usize,
+) -> f32 {
+    let opts = VectorSearchOptions::new()
+        .with_nprobe(nprobe)
+        .with_rerank_mult(rerank_mult);
+    let mut sum = 0f32;
+    for (q, t) in queries.iter().zip(truths) {
+        let hits = reader
+            .vector_search(column, q, k, opts)
+            .expect("vector_search");
         sum += recall_at_k(&hits, t);
     }
     sum / queries.len() as f32
@@ -565,6 +637,62 @@ pub fn calibrate_infino(
     best
 }
 
+/// Sweep `(nprobe, rerank_mult)` values via [`SuperfileReader::vector_search`].
+pub fn calibrate_superfile(
+    reader: &SuperfileReader,
+    column: &str,
+    queries: &[Vec<f32>],
+    truths: &[Vec<u32>],
+    target_recall: f32,
+    probes: &[usize],
+    refines: &[usize],
+    p50_iter: usize,
+    k: usize,
+) -> Option<Calibrated> {
+    let mut best: Option<Calibrated> = None;
+    let mut peak_recall = 0f32;
+    for &probe in probes {
+        for &refine in refines {
+            let recall = mean_recall_superfile(reader, column, queries, truths, k, probe, refine);
+            if recall > peak_recall {
+                peak_recall = recall;
+            }
+            if recall < target_recall {
+                continue;
+            }
+            let q = &queries[0];
+            let opts = VectorSearchOptions::new()
+                .with_nprobe(probe)
+                .with_rerank_mult(refine);
+            let p50 = p50_micros(
+                || {
+                    let _ = reader
+                        .vector_search(column, q, k, opts)
+                        .expect("vector_search");
+                },
+                p50_iter,
+            );
+            let cand = Calibrated {
+                probe,
+                refine,
+                recall,
+                p50_micros: p50,
+            };
+            best = match best {
+                None => Some(cand),
+                Some(b) if cand.p50_micros < b.p50_micros => Some(cand),
+                Some(b) => Some(b),
+            };
+        }
+    }
+    if best.is_none() {
+        eprintln!(
+            "    [superfile] no point hit recall ≥ {target_recall:.2}; peak observed = {peak_recall:.3}"
+        );
+    }
+    best
+}
+
 // ─── Thin builder wrappers ────────────────────────────────────────────
 
 /// Build a stand-alone FTS index from a token corpus. Wrapper exists so
@@ -601,7 +729,7 @@ pub fn build_vector_index(
         n_cent,
         rot_seed: 7,
         metric,
-        rerank_codec: RerankCodec::Sq8,
+        rerank_codec: RerankCodec::Sq8Residual,
     })
     .expect("register column");
     for i in 0..n_docs {
@@ -630,8 +758,11 @@ pub fn open_vector_reader(blob: Vec<u8>, n_cent: usize, metric: Metric) -> Vecto
 /// Build a full superfile (FTS + vector) for end-to-end benches.
 pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u8> {
     let n = docs.len();
+    // `SuperfileBuilder` requires the id column to be
+    // `Decimal128(38, 0)` (the supertable's snowflake id type), not
+    // `UInt64` — match it so this helper actually builds.
     let schema = Arc::new(Schema::new(vec![
-        Field::new("doc_id", DataType::UInt64, false),
+        Field::new("doc_id", DataType::Decimal128(38, 0), false),
         Field::new("title", DataType::LargeUtf8, false),
     ]));
     let opts = BuilderOptions::new(
@@ -646,13 +777,59 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
             n_cent,
             rot_seed: 7,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8,
+            rerank_codec: RerankCodec::Sq8Residual,
         }],
         Some(default_tokenizer()),
     );
 
     let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-    let ids = UInt64Array::from((0..n as u64).collect::<Vec<_>>());
+    let ids: Decimal128Array = (0..n as u64)
+        .map(|i| Some(i as i128))
+        .collect::<Decimal128Array>()
+        .with_precision_and_scale(38, 0)
+        .expect("decimal128 with_precision_and_scale");
+    let titles = LargeStringArray::from(docs.iter().map(String::as_str).collect::<Vec<_>>());
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
+        .expect("build RecordBatch");
+    b.add_batch(&batch, &[vectors]).expect("add_batch");
+    b.finish().expect("finish builder")
+}
+
+/// Build a full superfile (FTS + vector) with an explicit metric.
+pub fn build_superfile_with_metric(
+    docs: &[String],
+    vectors: &[f32],
+    n_cent: usize,
+    metric: Metric,
+) -> Vec<u8> {
+    let n = docs.len();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::Decimal128(38, 0), false),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig {
+            column: "title".into(),
+        }],
+        vec![SfVectorConfig {
+            column: "emb".into(),
+            dim: DIM,
+            n_cent,
+            rot_seed: 7,
+            metric,
+            rerank_codec: RerankCodec::Sq8Residual,
+        }],
+        Some(default_tokenizer()),
+    );
+
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let ids: Decimal128Array = (0..n as u64)
+        .map(|i| Some(i as i128))
+        .collect::<Decimal128Array>()
+        .with_precision_and_scale(38, 0)
+        .expect("decimal128 with_precision_and_scale");
     let titles = LargeStringArray::from(docs.iter().map(String::as_str).collect::<Vec<_>>());
     let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
         .expect("build RecordBatch");

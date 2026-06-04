@@ -129,7 +129,7 @@ fn build_test_bytes() -> Bytes {
 }
 
 async fn seed(storage: &dyn StorageProvider, uri: SuperfileUri, bytes: Bytes) {
-    let path = format!("data/seg-{}.sf", uri.0);
+    let path = uri.storage_path();
     storage.put_atomic(&path, bytes).await.expect("seed");
 }
 
@@ -148,6 +148,7 @@ fn fresh_cache(
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: true,
+        ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
     (dir, store)
@@ -177,7 +178,7 @@ async fn hybrid_reader_returns_working_superfile_reader() {
     let reader = cache.reader(&uri).await.expect("reader");
     // Sanity: in-memory-bytes-backed reader serves FTS terms.
     let fts = reader.fts().expect("fts");
-    let terms = fts.iter_column_terms("title");
+    let terms = fts.iter_column_terms("title").expect("iter terms");
     assert!(terms.iter().any(|t| t.as_slice() == b"alpha"));
 }
 

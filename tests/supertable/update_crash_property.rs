@@ -49,6 +49,7 @@ fn make_disk_cache(
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
         cold_fetch_streams: 4,
         cold_fetch_chunk_bytes: 1 << 20,
+        prefetch_concurrency: 8,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
@@ -81,7 +82,6 @@ async fn seed_partial_state(
     }
     let ws = WalStore::new(Arc::clone(&storage));
     let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-        .await
         .expect("open for ids");
     let manifest = st.reader().manifest().clone();
     let id_min = manifest
@@ -154,7 +154,6 @@ async fn recover_and_assert_complete(
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
     )
-    .await
     .expect("open");
 
     let ws = WalStore::new(Arc::clone(&storage));
@@ -262,7 +261,6 @@ async fn recovery_is_idempotent_under_repeated_open() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
     )
-    .await
     .expect("re-open");
     let ws = WalStore::new(Arc::clone(&storage));
     // The wal_id either matches a Complete doc OR is absent

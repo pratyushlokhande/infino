@@ -16,13 +16,13 @@
 //!      that the existing segment-level skip + fan-out
 //!      code consumes.
 //!
-//! Sync bridge via the shared `runtime_bridge::bridge_sync_to_async`.
-//! The query paths stay sync end-to-end; callers don't acquire any
-//! runtime knowledge.
+//! `async` end-to-end: the query paths that call these helpers
+//! are themselves async and run on the owning tokio runtime, so
+//! part-load GETs are driven by that runtime's reactor (no sync
+//! bridge, no throwaway runtime).
 
 use std::sync::Arc;
 
-use crate::runtime_bridge::bridge_sync_to_async;
 use crate::supertable::error::QueryError;
 use crate::supertable::manifest::part::{ManifestPart, PartId};
 use crate::supertable::manifest::{Manifest, SuperfileEntry};
@@ -38,9 +38,9 @@ use crate::supertable::manifest::{Manifest, SuperfileEntry};
 /// parallel so wall-clock is `max(per-part GET latency)`
 /// not the serial sum.
 ///
-/// Sync→async bridge via the shared
-/// [`bridge_sync_to_async`].
-pub fn load_kept_parts(
+/// `await`s each part load on the caller's runtime; cold lazy
+/// parts' GETs run on that runtime's reactor.
+pub async fn load_kept_parts(
     manifest: &Manifest,
     kept_part_ids: &[PartId],
 ) -> Result<Vec<Arc<ManifestPart>>, QueryError> {
@@ -55,16 +55,12 @@ pub fn load_kept_parts(
         })
         .collect();
 
-    let drive = async move {
-        let loaded = futures::future::join_all(load_futs).await;
-        let mut out = Vec::with_capacity(loaded.len());
-        for r in loaded {
-            out.push(r.map_err(|e| QueryError::Store(format!("part load: {e}")))?);
-        }
-        Ok::<Vec<Arc<ManifestPart>>, QueryError>(out)
-    };
-
-    bridge_sync_to_async(drive)
+    let loaded = futures::future::join_all(load_futs).await;
+    let mut out = Vec::with_capacity(loaded.len());
+    for r in loaded {
+        out.push(r.map_err(|e| QueryError::Store(format!("part load: {e}")))?);
+    }
+    Ok(out)
 }
 
 /// Concatenate the loaded parts' superfiles into a flat
@@ -82,11 +78,11 @@ pub fn flatten_segments(parts: &[Arc<ManifestPart>]) -> Vec<Arc<SuperfileEntry>>
 
 /// Combined helper: lazy-load + flatten in one call. The
 /// common shape across query paths.
-pub fn load_and_flatten(
+pub async fn load_and_flatten(
     manifest: &Manifest,
     kept_part_ids: &[PartId],
 ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
-    let parts = load_kept_parts(manifest, kept_part_ids)?;
+    let parts = load_kept_parts(manifest, kept_part_ids).await?;
     Ok(flatten_segments(&parts))
 }
 

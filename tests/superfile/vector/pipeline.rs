@@ -55,8 +55,8 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
     (Bytes::from(bytes), json.to_string())
 }
 
-#[test]
-fn end_to_end_self_query_recovers_self() {
+#[tokio::test]
+async fn end_to_end_self_query_recovers_self() {
     let n_docs = 80u32;
     let (blob, json) = build_two_column_blob(n_docs);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
@@ -78,8 +78,8 @@ fn end_to_end_self_query_recovers_self() {
     );
 }
 
-#[test]
-fn end_to_end_l2sq_self_query_distance_is_zero() {
+#[tokio::test]
+async fn end_to_end_l2sq_self_query_distance_is_zero() {
     let (blob, json) = build_two_column_blob(80);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
     let target = 5u32;
@@ -92,8 +92,8 @@ fn end_to_end_l2sq_self_query_distance_is_zero() {
     assert!(hits[0].1 < 1e-3, "self L2² should be ~0, got {}", hits[0].1);
 }
 
-#[test]
-fn end_to_end_multi_column_routing_isolated() {
+#[tokio::test]
+async fn end_to_end_multi_column_routing_isolated() {
     let (blob, json) = build_two_column_blob(60);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
 
@@ -108,8 +108,8 @@ fn end_to_end_multi_column_routing_isolated() {
     assert!(err.is_err());
 }
 
-#[test]
-fn end_to_end_top_k_limits_results() {
+#[tokio::test]
+async fn end_to_end_top_k_limits_results() {
     let (blob, json) = build_two_column_blob(80);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
     let q: Vec<f32> = vec![0.3; 16];
@@ -135,8 +135,8 @@ fn end_to_end_summary_per_column() {
     assert!(r.summary("nonexistent").is_none());
 }
 
-#[test]
-fn end_to_end_planted_clusters_recovered() {
+#[tokio::test]
+async fn end_to_end_planted_clusters_recovered() {
     // Plant 3 well-separated clusters in dim=16; verify nearest-neighbor
     // for a query at one center pulls back docs from that cluster.
     let dim = 16;
@@ -196,8 +196,8 @@ fn end_to_end_planted_clusters_recovered() {
     }
 }
 
-#[test]
-fn end_to_end_results_sorted_by_distance() {
+#[tokio::test]
+async fn end_to_end_results_sorted_by_distance() {
     let (blob, json) = build_two_column_blob(60);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
     let q = vec![0.5; 16];

@@ -29,6 +29,7 @@ fn make_disk_cache(
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
         cold_fetch_streams: 4,
         cold_fetch_chunk_bytes: 1 << 20,
+        prefetch_concurrency: 8,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
@@ -99,8 +100,7 @@ async fn writer_delete_tombstones_matching_rows() {
 
     // Follow-up FTS query against the deleted token returns no
     // hits.
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search("title", "bravo", 10, BoolMode::Or)
         .expect("fts");
     assert!(hits.is_empty(), "expected zero hits for tombstoned token");

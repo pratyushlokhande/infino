@@ -55,13 +55,14 @@ use bytes::Bytes;
 use chrono::Utc;
 use rayon::prelude::*;
 
-use crate::runtime_bridge::bridge_sync_to_async;
 use crate::superfile::builder::SuperfileBuilder;
 
 use super::error::BuildError;
 use super::handle::{Supertable, SupertableInner};
 use super::manifest::bloom::BloomBuilder;
-use super::manifest::{FtsSummary, ScalarStatsTable, SuperfileEntry, SuperfileUri, VectorSummary};
+use super::manifest::{
+    FtsSummary, ScalarStatsTable, SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
+};
 use super::mutations::{
     CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, OperationOutcome,
     PendingDelete, PendingUpdate,
@@ -718,7 +719,10 @@ impl SupertableWriter {
             let _ = wal_store.delete_state(wal_id).await;
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = bridge_sync_to_async(drive)?;
+        let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
+            Err(_) => self.inner.query_runtime().block_on(drive)?,
+        };
         Ok(OperationOutcome {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -788,7 +792,10 @@ impl SupertableWriter {
             let _ = wal_store.delete_state(wal_id).await;
             Ok::<_, MutationError>((n_t, n_nf))
         };
-        let (n_tombstoned, n_not_found) = bridge_sync_to_async(drive)?;
+        let (n_tombstoned, n_not_found) = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(drive))?,
+            Err(_) => self.inner.query_runtime().block_on(drive)?,
+        };
         Ok(OperationOutcome {
             wal_id: entry.wal_id,
             matched: entry.target_ids.len(),
@@ -961,6 +968,198 @@ fn build_one_shard(
     })
 }
 
+/// Pull the superfile's `(total_size, vec_off/len, fts_off/len)`
+/// out of the freshly-written parquet KV metadata so the manifest
+/// can carry it forward as a [`SubsectionOffsets`]. Returns `None`
+/// if the bytes don't parse — that path falls back to the pre-M6
+/// 2-RTT cold open shape rather than failing the publish.
+fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffsets> {
+    use crate::superfile::format::{footer::read_kv_metadata, kv};
+    let kvs = read_kv_metadata(bytes).ok()?;
+    let get = |k: &str| -> Option<u64> { kvs.get(k).and_then(|s| s.parse::<u64>().ok()) };
+    let vec = match (get(kv::VEC_OFFSET), get(kv::VEC_LENGTH)) {
+        (Some(o), Some(l)) if l > 0 => Some((o, l)),
+        _ => None,
+    };
+    let fts = match (get(kv::FTS_OFFSET), get(kv::FTS_LENGTH)) {
+        (Some(o), Some(l)) if l > 0 => Some((o, l)),
+        _ => None,
+    };
+    let total_size = bytes.len() as u64;
+    let vec_open_ranges = vec
+        .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
+        .unwrap_or_default();
+    let fts_open_ranges = fts
+        .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
+        .unwrap_or_default();
+
+    // capture the open-time batch bytes (parquet
+    // footer tail + vector open ranges + FTS open ranges) so the
+    // reader can resolve a segment's open metadata straight from
+    // the manifest part, issuing zero per-segment open GETs.
+    let open_blob = build_open_blob(bytes, total_size, &vec_open_ranges, &fts_open_ranges);
+
+    Some(SubsectionOffsets {
+        total_size,
+        vec,
+        fts,
+        vec_open_ranges,
+        fts_open_ranges,
+        open_blob,
+    })
+}
+
+/// Slice the bytes for the segment's open-time batch out of the
+/// freshly-written superfile so the manifest can carry them
+/// inline. Mirrors the cold-fetch open batch in
+/// `DiskCacheStore::cold_fetch_lazy_with_hints`: the parquet
+/// footer tail (matching the 64 KiB speculation length) plus each
+/// vector / FTS open range. Returns `(absolute_offset, bytes)`
+/// tuples; an empty `Vec` disables the inline-open fast path for
+/// this segment.
+fn build_open_blob(
+    bytes: &Bytes,
+    total_size: u64,
+    vec_open_ranges: &[(u64, u64)],
+    fts_open_ranges: &[(u64, u64)],
+) -> Vec<(u64, Vec<u8>)> {
+    // Must match `cold_fetch_lazy_with_hints`'s parquet tail
+    // speculation length so the overlay covers `source.tail()`.
+    const PARQUET_TAIL_SPEC: u64 = 64 * 1024;
+    let mut blob: Vec<(u64, Vec<u8>)> =
+        Vec::with_capacity(1 + vec_open_ranges.len() + fts_open_ranges.len());
+
+    let parquet_tail_len = PARQUET_TAIL_SPEC.min(total_size);
+    let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
+    let slice = |off: u64, len: u64| -> Option<Vec<u8>> {
+        let start = off as usize;
+        let end = start.checked_add(len as usize)?;
+        bytes.get(start..end).map(|s| s.to_vec())
+    };
+    if parquet_tail_len > 0 {
+        match slice(parquet_tail_start, parquet_tail_len) {
+            Some(b) => blob.push((parquet_tail_start, b)),
+            None => return Vec::new(),
+        }
+    }
+    for &(off, len) in vec_open_ranges.iter().chain(fts_open_ranges.iter()) {
+        match slice(off, len) {
+            Some(b) => blob.push((off, b)),
+            // A range we can't satisfy means the capture is
+            // inconsistent; disable the fast path rather than ship
+            // a partial overlay.
+            None => return Vec::new(),
+        }
+    }
+    blob
+}
+
+fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+    const OUTER_HEADER_SIZE: usize = 32;
+    const DIR_ENTRY_SIZE: usize = 64;
+    const SUB_HEADER_SIZE: usize = 56;
+    let start = off as usize;
+    let end = start.checked_add(len as usize)?;
+    let blob = bytes.get(start..end)?;
+    if blob.len() < OUTER_HEADER_SIZE + 4 {
+        return None;
+    }
+    let n_columns = read_u32_le(blob.get(12..16)?) as usize;
+    let dir_offset = read_u64_le(blob.get(24..32)?) as usize;
+    let dir_size = n_columns.checked_mul(DIR_ENTRY_SIZE)?;
+    let dir_end = dir_offset.checked_add(dir_size)?.checked_add(4)?;
+    let dir = blob.get(dir_offset..dir_offset + dir_size)?;
+
+    let mut ranges = vec![(off + dir_offset as u64, (dir_size + 4) as u64)];
+    ranges.push((off, OUTER_HEADER_SIZE as u64));
+    for i in 0..n_columns {
+        let entry = i * DIR_ENTRY_SIZE;
+        let subsection_off = read_u64_le(dir.get(entry + 24..entry + 32)?) as usize;
+        let subsection_len = read_u64_le(dir.get(entry + 32..entry + 40)?) as usize;
+        let codec_meta_off = read_u32_le(dir.get(entry + 56..entry + 60)?) as usize;
+        let codec_meta_size = read_u32_le(dir.get(entry + 60..entry + 64)?) as usize;
+        if subsection_off.checked_add(SUB_HEADER_SIZE)? > blob.len()
+            || subsection_off.checked_add(subsection_len)? > blob.len()
+        {
+            return None;
+        }
+        ranges.push((off + subsection_off as u64, SUB_HEADER_SIZE as u64));
+        let sub = blob.get(subsection_off..subsection_off + subsection_len)?;
+        let centroids_off = read_u64_le(sub.get(32..40)?) as usize;
+        let cluster_idx_off = read_u64_le(sub.get(40..48)?) as usize;
+        let cluster_idx_end = cluster_idx_off
+            .checked_add(8 * read_u32_le(dir.get(entry + 8..entry + 12)?) as usize)?;
+        if centroids_off < SUB_HEADER_SIZE || cluster_idx_end > subsection_len {
+            return None;
+        }
+        ranges.push((
+            off + subsection_off as u64 + centroids_off as u64,
+            (cluster_idx_end - centroids_off) as u64,
+        ));
+        if codec_meta_size > 0 {
+            let meta_end = codec_meta_off.checked_add(codec_meta_size)?;
+            if meta_end > subsection_len {
+                return None;
+            }
+        }
+    }
+    if dir_end > blob.len() {
+        return None;
+    }
+    Some(merge_ranges(ranges))
+}
+
+fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
+    const FTS_HEADER_SIZE: usize = 48;
+    let start = off as usize;
+    let end = start.checked_add(len as usize)?;
+    let blob = bytes.get(start..end)?;
+    if blob.len() < FTS_HEADER_SIZE {
+        return None;
+    }
+    let postings_offset = read_u64_le(blob.get(32..40)?) as usize;
+    let doc_lengths_offset = read_u64_le(blob.get(40..48)?) as usize;
+    if postings_offset > blob.len()
+        || doc_lengths_offset > blob.len()
+        || postings_offset > doc_lengths_offset
+    {
+        return None;
+    }
+    Some(merge_ranges(vec![
+        (off, postings_offset as u64),
+        (
+            off + doc_lengths_offset as u64,
+            (blob.len() - doc_lengths_offset) as u64,
+        ),
+    ]))
+}
+
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.retain(|&(_, len)| len > 0);
+    ranges.sort_unstable_by_key(|&(off, _)| off);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (off, len) in ranges {
+        let end = off + len;
+        if let Some((last_off, last_len)) = merged.last_mut() {
+            let last_end = *last_off + *last_len;
+            if off <= last_end {
+                *last_len = (*last_len).max(end - *last_off);
+                continue;
+            }
+        }
+        merged.push((off, len));
+    }
+    merged
+}
+
+fn read_u32_le(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().expect("u32 slice length"))
+}
+
+fn read_u64_le(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes.try_into().expect("u64 slice length"))
+}
+
 /// Per-shard publish artifacts produced in parallel before the
 /// serial manifest swap. One entry per non-empty shard.
 struct PreparedSegment {
@@ -990,8 +1189,14 @@ fn prepare_segment(
 
     let bytes_for_storage = inner.options.storage.is_some().then(|| shard.bytes.clone());
     let cache_attached = inner.options.disk_cache.is_some() && inner.options.storage.is_some();
+    // `bytes_for_store` (in-memory tier) is gated only on cache attachment —
+    // a cache-attached producer keeps segment bytes out of the unbounded
+    // in-memory store regardless of whether we pre-populate the disk cache.
     let bytes_for_store = (!cache_attached).then(|| shard.bytes.clone());
-    let bytes_for_cache = cache_attached.then(|| shard.bytes.clone());
+    // Pre-populating the disk cache is opt-out: a write-only producer that
+    // drops the cache right after ingest skips this wasted warm-fill.
+    let bytes_for_cache =
+        (cache_attached && inner.options.prepopulate_cache_on_commit).then(|| shard.bytes.clone());
 
     // Open the reader directly on shard bytes (not via the
     // in-memory `SuperfileReaderCache`). This lets the cache-attached
@@ -1009,7 +1214,9 @@ fn prepare_segment(
     let mut fts_summary: HashMap<String, FtsSummary> = HashMap::new();
     if let Some(fts_reader) = reader.fts() {
         for fc in &inner.options.fts_columns {
-            let terms = fts_reader.iter_column_terms(&fc.column);
+            let terms = fts_reader
+                .iter_column_terms(&fc.column)
+                .expect("FST bytes valid: segment just built");
             let n_terms_distinct = terms.len() as u32;
             let (min_term, max_term) = match (terms.first(), terms.last()) {
                 (Some(min), Some(max)) => (min.clone(), max.clone()),
@@ -1039,6 +1246,13 @@ fn prepare_segment(
         }
     }
 
+    // capture `(total_size, vec_off/len, fts_off/len)`
+    // from the freshly-written bytes' parquet KV metadata. Caching
+    // these on the manifest lets `DiskCacheStore::reader_with_hints`
+    // fire the parquet-footer, vector, and FTS subsection GETs in
+    // parallel on cold open (1 RTT instead of 2 sequential).
+    let subsection_offsets = build_subsection_offsets(&shard.bytes);
+
     let entry = Arc::new(SuperfileEntry {
         superfile_id: uuid::Uuid::new_v4(),
         uri,
@@ -1053,6 +1267,7 @@ fn prepare_segment(
         // emitted here remain unpartitioned (default).
         partition_key: Vec::new(),
         partition_hint: None,
+        subsection_offsets,
     });
 
     Ok(Some(PreparedSegment {
@@ -1140,16 +1355,17 @@ fn publish_superfiles(
         if !pending_cache_inserts.is_empty()
             && let Some(cache) = inner.options.disk_cache.as_ref().cloned()
         {
-            warm_cache_after_commit(&cache, pending_cache_inserts);
+            warm_cache_after_commit(inner, &cache, pending_cache_inserts);
         }
 
-        // Best-effort memory-budget enforcement. Each commit
-        // pre-populates the cache (above); sustained writers
-        // grow the working set linearly, so a post-commit
-        // check + sweep keeps the working set under the
-        // configured budget. Pages re-fault from disk on next
-        // access if needed; the cache entries themselves are
-        // unaffected.
+        // Best-effort memory-budget enforcement. When commits
+        // pre-populate the cache (above), sustained writers grow
+        // the working set linearly, so a post-commit check +
+        // sweep keeps the working set under the configured
+        // budget. Pages re-fault from disk on next access if
+        // needed; the cache entries themselves are unaffected.
+        // Runs regardless of pre-population so an externally
+        // warmed cache is still bounded.
         if let (Some(cache), Some(budget)) = (
             inner.options.disk_cache.as_ref(),
             inner.options.memory_budget_bytes,
@@ -1236,10 +1452,19 @@ pub(in crate::supertable) fn persist_commit(
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
 
-    // The writer's commit path is sync but the persistence layer is
-    // async. Cross the boundary through the shared
-    // `bridge_sync_to_async` (ambient `multi_thread` runtime when
-    // present, the process-wide owned runtime otherwise).
+    // The writer's commit path is sync but the persistence
+    // layer is async. Two cases:
+    //
+    // - **Sync caller** (no ambient tokio runtime): drive
+    //   the future on the supertable's owned `query_runtime`
+    //   (lazy-init the first time we hit this branch).
+    // - **Async caller** (inside a tokio runtime): use the
+    //   ambient runtime via `Handle::current().block_on`
+    //   wrapped in `block_in_place`. This avoids creating
+    //   (and later dropping) a second owned runtime — which
+    //   would otherwise panic at Drop with "cannot drop a
+    //   runtime in a context where blocking is not allowed".
+    //   Requires the ambient runtime to be `multi_thread`.
     let max_retries = opts.max_commit_retries.max(1);
     let drive = async move {
         let mut last_err: Option<crate::supertable::CommitError> = None;
@@ -1284,7 +1509,20 @@ pub(in crate::supertable) fn persist_commit(
         Err(last_err.unwrap_or(crate::supertable::CommitError::WriteContentionExhausted))
     };
 
-    let (new_list, new_segment_list) = bridge_sync_to_async(drive)?;
+    let (new_list, new_segment_list) = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // Ambient tokio runtime present — use it. Don't
+            // touch `inner.query_runtime()` so we don't risk
+            // dropping our owned runtime from within
+            // another's worker context.
+            tokio::task::block_in_place(|| handle.block_on(drive))?
+        }
+        Err(_) => {
+            // Sync caller; lazy-init the supertable's
+            // owned runtime.
+            inner.query_runtime().block_on(drive)?
+        }
+    };
 
     // Build the new in-memory Manifest with the persisted
     // list + a fresh ManifestPartLoader installed.
@@ -1559,7 +1797,7 @@ async fn try_commit_attempt(
     Ok(new_list)
 }
 
-/// M15a — build one `ManifestPart` from `superfiles` + the
+/// build one `ManifestPart` from `superfiles` + the
 /// matching `ManifestListEntry`. Encodes the part once,
 /// content-hashes it, and computes the list-level aggregate
 /// skip summaries that `list_prune` reads at query time.
@@ -1732,7 +1970,7 @@ fn encode_record_batch_ipc(batch: &arrow_array::RecordBatch) -> Result<Bytes, St
 }
 
 fn segment_storage_path(uri: &SuperfileUri) -> String {
-    format!("data/seg-{}.sf", uri.0)
+    uri.storage_path()
 }
 
 /// Multipart-upload variant of the writer's per-segment put.
@@ -1805,9 +2043,11 @@ async fn put_segment_multipart(
     Ok(())
 }
 
-/// M14b.2 — drive `DiskCacheStore::insert_warm` for each
-/// just-published segment via the shared sync→async
-/// [`bridge_sync_to_async`].
+/// Drive `DiskCacheStore::insert_warm` for each
+/// just-published segment via the same sync→async bridge
+/// the rest of the writer uses (`block_in_place +
+/// Handle::block_on` when an ambient runtime is present;
+/// `inner.query_runtime()` otherwise).
 ///
 /// Failures are swallowed with an `eprintln!` log line —
 /// the superfiles are already durable in storage and the
@@ -1815,6 +2055,7 @@ async fn put_segment_multipart(
 /// becomes a "warm load fails → next query cold-fetches"
 /// degradation, not a correctness break.
 fn warm_cache_after_commit(
+    inner: &SupertableInner,
     cache: &Arc<crate::supertable::reader_cache::DiskCacheStore>,
     pending: Vec<(SuperfileUri, Bytes)>,
 ) {
@@ -1823,14 +2064,21 @@ fn warm_cache_after_commit(
         for (uri, bytes) in pending {
             if let Err(e) = cache.insert_warm(&uri, bytes).await {
                 eprintln!(
-                    "supertable: M14b.2 warm cache pre-population failed for {}: {} \
+                    "supertable: warm cache pre-population failed for {}: {} \
                      (segment is durable in storage; first query will cold-fetch)",
                     uri.0, e
                 );
             }
         }
     };
-    bridge_sync_to_async(drive);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(drive));
+        }
+        Err(_) => {
+            inner.query_runtime().block_on(drive);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1960,8 +2208,8 @@ mod tests {
         assert_eq!(st.reader().n_superfiles(), 0);
     }
 
-    #[test]
-    fn segment_is_queryable_via_store() {
+    #[tokio::test]
+    async fn segment_is_queryable_via_store() {
         // The published segment's bytes are in the store; we
         // can fetch a SuperfileReader and run bm25_search on it.
         use crate::superfile::fts::reader::BoolMode;
@@ -1977,6 +2225,7 @@ mod tests {
         let sf_reader = store.reader(&segment.uri).expect("reader");
         let hits = sf_reader
             .bm25_search("title", "alpha", 10, BoolMode::Or)
+            .await
             .expect("bm25");
         // All 4 docs contain "alpha"; should all be returned.
         assert_eq!(hits.len(), 4);

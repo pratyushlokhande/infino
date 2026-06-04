@@ -227,8 +227,7 @@ fn bench_fts(c: &mut Criterion) {
     g.bench_function("clean", |b| {
         let st = fixture_clean();
         b.iter(|| {
-            let r = st.reader();
-            let hits = r
+            let hits = st
                 .bm25_search(
                     black_box("title"),
                     black_box(QUERY_TERM),
@@ -243,8 +242,7 @@ fn bench_fts(c: &mut Criterion) {
     g.bench_function("one_percent", |b| {
         let st = fixture_one_percent();
         b.iter(|| {
-            let r = st.reader();
-            let hits = r
+            let hits = st
                 .bm25_search(
                     black_box("title"),
                     black_box(QUERY_TERM),
@@ -259,8 +257,7 @@ fn bench_fts(c: &mut Criterion) {
     g.bench_function("ten_percent_churned", |b| {
         let st = fixture_ten_percent_churned();
         b.iter(|| {
-            let r = st.reader();
-            let hits = r
+            let hits = st
                 .bm25_search(
                     black_box("title"),
                     black_box(QUERY_TERM),

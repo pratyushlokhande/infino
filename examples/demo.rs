@@ -93,20 +93,27 @@ fn demo_superfile() -> Bytes {
 
     let reader = SuperfileReader::open(bytes.clone()).expect("open SuperfileReader");
 
-    // BM25 over the embedded FTS blob. Hits are (local_doc_id, score).
-    for q in ["brown", "fox", "missing"] {
-        let hits = reader
-            .bm25_search("title", q, 10, BoolMode::Or)
-            .expect("bm25_search");
-        println!("  bm25 {q:>8?} -> {} hit(s): {hits:?}", hits.len());
-    }
+    // The per-segment `SuperfileReader` query kernels are async; drive
+    // them on a throwaway runtime here (the supertable layer below
+    // exposes the sync public API instead).
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        // BM25 over the embedded FTS blob. Hits are (local_doc_id, score).
+        for q in ["brown", "fox", "missing"] {
+            let hits = reader
+                .bm25_search("title", q, 10, BoolMode::Or)
+                .await
+                .expect("bm25_search");
+            println!("  bm25 {q:>8?} -> {} hit(s): {hits:?}", hits.len());
+        }
 
-    // kNN over the embedded vector blob. Query with the doc's own
-    // embedding -> distance ~0 under cosine.
-    let knn = reader
-        .vector_search("emb", &emb, 10, VectorSearchOptions::default())
-        .expect("vector_search");
-    println!("  knn  self-query -> {} hit(s): {knn:?}", knn.len());
+        // kNN over the embedded vector blob. Query with the doc's own
+        // embedding -> distance ~0 under cosine.
+        let knn = reader
+            .vector_search("emb", &emb, 10, VectorSearchOptions::default())
+            .expect("vector_search");
+        println!("  knn  self-query -> {} hit(s): {knn:?}", knn.len());
+    });
     println!();
 
     bytes
@@ -169,7 +176,6 @@ fn demo_supertable() {
     // BM25 across both segments. SuperfileHit carries the source
     // segment + local_doc_id + score.
     let hits = st
-        .reader()
         .bm25_search("title", "fox", 10, BoolMode::Or)
         .expect("bm25 fan-out");
     println!("  bm25 \"fox\" across segments -> {} hit(s)", hits.len());

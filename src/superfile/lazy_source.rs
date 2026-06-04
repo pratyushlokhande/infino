@@ -12,25 +12,24 @@
 //! ## What "lazy" means here
 //!
 //! [`SuperfileReader::open_lazy`] accepts a source instead
-//! of bytes-in-hand. It asks the source for the full
-//! segment (`source.get_range(0..size)`) and constructs the
-//! same reader `open(bytes)` would. The caller no longer
-//! materializes the segment before calling; the source
-//! decides where the bytes come from (mmap of a local
-//! file, range-fetched object store, a coalescing
-//! broadcaster that fans one fetch out to many
-//! subscribers).
+//! of bytes-in-hand. The caller no longer materializes the
+//! segment before calling; the source decides where the
+//! bytes come from (mmap of a local file, range-fetched
+//! object store, a coalescing broadcaster that fans one
+//! fetch out to many subscribers).
 //!
-//! What it doesn't do *yet*: fetch only the bytes a
-//! specific BM25 / vector query touches. The inner FTS
-//! posting reader + vector cluster reader still take a
-//! full materialized buffer, so each `open_lazy` call
-//! still pulls the whole segment regardless of which
-//! queries will run against the resulting reader. Making
-//! per-query laziness work needs those inner readers to
-//! thread the source through their own lookups — the trait
-//! shape here is what makes that change source-compatible
-//! when it lands.
+//! Opening reads only the metadata ranges the reader needs,
+//! not the whole segment: the Parquet footer, then the FTS
+//! and vector section headers and directories. The inner
+//! readers thread the source through their own lookups, so
+//! queries fetch only the bytes they touch — `FtsReader`
+//! fetches each query term's posting list on demand (the
+//! postings region is never read in full), and `VectorReader`
+//! fetches centroids and then only the probed clusters'
+//! blocks. A source-opened [`SuperfileReader`] therefore does
+//! not retain the full segment; `parquet_bytes()` returns
+//! `None`, and pass-through Parquet callers use the eager
+//! `open` path instead.
 //!
 //! See [`SuperfileReader::open_lazy`].
 //!
@@ -38,6 +37,8 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::ops::Range;
+use std::sync::Arc;
 
 /// Source of byte ranges from an arbitrary backing.
 ///
@@ -81,6 +82,41 @@ pub trait LazyByteSource: Send + Sync {
     fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
         None
     }
+
+    /// Tail-fetch path: — fetch the last `len` bytes of the
+    /// backing object AND surface the total object size.
+    ///
+    /// Lets the cold-open path (parquet footer, format
+    /// trailer parsing) skip the upfront `head()` round-trip
+    /// it would otherwise need to learn `size` before issuing
+    /// a tail-relative range GET. Implementations backed by
+    /// object stores should override to issue a native
+    /// `bytes=-len` suffix range; implementations that
+    /// already know their size return it trivially via the
+    /// default impl below.
+    ///
+    /// Default impl: read `size()`, error if zero (the source
+    /// genuinely doesn't know its size and hasn't been
+    /// overridden to handle that case), else clamp `len` and
+    /// fall through to `range(size - len, len)`.
+    ///
+    /// Returns `(bytes, total_size)`. `bytes.len() == len`
+    /// when the object is at least `len` bytes; otherwise
+    /// the returned slice covers the entire object and
+    /// `total_size == bytes.len()`.
+    async fn tail(&self, len: u64) -> Result<(Bytes, u64), LazyByteSourceError> {
+        let size = self.size();
+        if size == 0 {
+            return Err(LazyByteSourceError::OutOfBounds {
+                start: 0,
+                len,
+                size: 0,
+            });
+        }
+        let len = len.min(size);
+        let bytes = self.range(size - len, len).await?;
+        Ok((bytes, size))
+    }
 }
 
 /// Errors surfaced by [`LazyByteSource`] implementations.
@@ -98,6 +134,217 @@ pub enum LazyByteSourceError {
     /// Caller requested a range outside `size()`.
     #[error("range out of bounds: start={start} len={len} size={size}")]
     OutOfBounds { start: u64, len: u64, size: u64 },
+}
+
+/// Backing for source-aware superfile sub-readers.
+///
+/// `InMemory` is the eager path: callers already hold the complete
+/// subsection and every access is a zero-copy [`Bytes::slice`].
+/// `Lazy` is a range-fetching source: mmap, object storage, or a
+/// foreground cold-fetch subscriber.
+#[derive(Clone)]
+pub enum Source {
+    InMemory(Bytes),
+    Lazy(Arc<dyn LazyByteSource>),
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InMemory(b) => f.debug_tuple("InMemory").field(&b.len()).finish(),
+            Self::Lazy(_) => f.debug_struct("Lazy").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl Source {
+    /// Total backing size in bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::InMemory(b) => b.len(),
+            Self::Lazy(s) => s.size() as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Best-effort sync fetch. Always succeeds for in-bounds
+    /// `InMemory` ranges; `Lazy` sources may return `Some` for
+    /// already-resident ranges.
+    pub fn try_get_range_sync(&self, range: Range<usize>) -> Option<Bytes> {
+        let start = range.start as u64;
+        let len = range.len() as u64;
+        match self {
+            Self::InMemory(b) => {
+                if range.end > b.len() {
+                    return None;
+                }
+                Some(b.slice(range))
+            }
+            Self::Lazy(s) => s.try_get_range_sync(start, len),
+        }
+    }
+
+    /// Sync range fetch with an internal async bridge for cold lazy
+    /// misses. Hot in-memory and mmap-backed paths resolve through
+    /// [`Self::try_get_range_sync`] and do not enter a runtime.
+    pub fn get_range(&self, range: Range<usize>) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(bytes) = self.try_get_range_sync(range.clone()) {
+            return Ok(bytes);
+        }
+        let Self::Lazy(s) = self else {
+            return Err(LazyByteSourceError::OutOfBounds {
+                start: range.start as u64,
+                len: range.len() as u64,
+                size: self.len() as u64,
+            });
+        };
+        let start = range.start as u64;
+        let len = range.len() as u64;
+        // All three runtime contexts (multi-thread worker, rayon
+        // reader-pool thread with no ambient runtime, or a
+        // `current_thread` test runtime) are handled by the shared
+        // bridge in `runtime_bridge`. Clone the `Arc` into the future
+        // so it is `Send + 'static`.
+        let src = Arc::clone(s);
+        crate::runtime_bridge::bridge_sync_to_async_send(async move { src.range(start, len).await })
+    }
+
+    /// Concurrent multi-range fetch. Sync-resident ranges are served
+    /// immediately; cold lazy misses are dispatched under one async
+    /// bridge and returned in input order.
+    pub fn get_ranges_parallel(
+        &self,
+        ranges: &[Range<usize>],
+    ) -> Result<Vec<Bytes>, LazyByteSourceError> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
+        let mut pending: Vec<(usize, u64, u64)> = Vec::new();
+        for (i, r) in ranges.iter().enumerate() {
+            if let Some(b) = self.try_get_range_sync(r.clone()) {
+                out.push(Some(b));
+                continue;
+            }
+            if !matches!(self, Self::Lazy(_)) {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start: r.start as u64,
+                    len: r.len() as u64,
+                    size: self.len() as u64,
+                });
+            }
+            pending.push((i, r.start as u64, r.len() as u64));
+            out.push(None);
+        }
+
+        if !pending.is_empty() {
+            let Self::Lazy(s) = self else {
+                unreachable!("pending non-empty implies Source::Lazy");
+            };
+            let src = Arc::clone(s);
+            let order: Vec<usize> = pending.iter().map(|(i, _, _)| *i).collect();
+            let fut = async move {
+                let futs = pending
+                    .into_iter()
+                    .map(|(_i, start, len)| {
+                        let s = Arc::clone(&src);
+                        async move { s.range(start, len).await }
+                    })
+                    .collect::<Vec<_>>();
+                futures::future::try_join_all(futs).await
+            };
+            // Shared bridge handles every runtime context; the future
+            // owns its `Arc` clones so it is `Send + 'static`.
+            let bytes: Vec<Bytes> = crate::runtime_bridge::bridge_sync_to_async_send(fut)?;
+            for (slot, b) in order.into_iter().zip(bytes) {
+                out[slot] = Some(b);
+            }
+        }
+
+        Ok(out
+            .into_iter()
+            .map(|b| b.expect("every slot filled by sync or async path"))
+            .collect())
+    }
+
+    /// Async single-range fetch. Sync-resident ranges (in-memory,
+    /// warm mmap, in-process cache hits) resolve with zero I/O;
+    /// cold `Lazy` misses `await` the source's async `range`
+    /// directly on the caller's runtime — no `block_on`, no
+    /// throwaway runtime, so the object-store client's reqwest
+    /// connections stay on the runtime that owns them.
+    pub async fn range_async(&self, range: Range<usize>) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(bytes) = self.try_get_range_sync(range.clone()) {
+            return Ok(bytes);
+        }
+        let Self::Lazy(s) = self else {
+            return Err(LazyByteSourceError::OutOfBounds {
+                start: range.start as u64,
+                len: range.len() as u64,
+                size: self.len() as u64,
+            });
+        };
+        s.range(range.start as u64, range.len() as u64).await
+    }
+
+    /// Async concurrent multi-range fetch. Sync-resident ranges are
+    /// served immediately; cold `Lazy` misses are dispatched as one
+    /// `try_join_all` batch and `await`ed on the caller's runtime.
+    /// Returns bytes in input order. This is the async sibling of
+    /// [`Self::get_ranges_parallel`] and carries the same ordering
+    /// and bounds-check contract without the sync→async bridge.
+    pub async fn get_ranges_parallel_async(
+        &self,
+        ranges: &[Range<usize>],
+    ) -> Result<Vec<Bytes>, LazyByteSourceError> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
+        let mut pending: Vec<(usize, u64, u64)> = Vec::new();
+        for (i, r) in ranges.iter().enumerate() {
+            if let Some(b) = self.try_get_range_sync(r.clone()) {
+                out.push(Some(b));
+                continue;
+            }
+            if !matches!(self, Self::Lazy(_)) {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start: r.start as u64,
+                    len: r.len() as u64,
+                    size: self.len() as u64,
+                });
+            }
+            pending.push((i, r.start as u64, r.len() as u64));
+            out.push(None);
+        }
+
+        if !pending.is_empty() {
+            let Self::Lazy(s) = self else {
+                unreachable!("pending non-empty implies Source::Lazy");
+            };
+            let order: Vec<usize> = pending.iter().map(|(i, _, _)| *i).collect();
+            let futs = pending
+                .into_iter()
+                .map(|(_i, start, len)| {
+                    let s = Arc::clone(s);
+                    async move { s.range(start, len).await }
+                })
+                .collect::<Vec<_>>();
+            let bytes = futures::future::try_join_all(futs).await?;
+            for (slot, b) in order.into_iter().zip(bytes) {
+                out[slot] = Some(b);
+            }
+        }
+
+        Ok(out
+            .into_iter()
+            .map(|b| b.expect("every slot filled by sync or async path"))
+            .collect())
+    }
 }
 
 /// In-memory `LazyByteSource` adapter — useful for tests and
@@ -146,6 +393,168 @@ impl LazyByteSource for BytesLazyByteSource {
         let s = start as usize;
         let e = s + len as usize;
         Some(self.bytes.slice(s..e))
+    }
+}
+
+/// Lazy sub-range path: — sub-range view onto another [`LazyByteSource`].
+///
+/// `SuperfileReader::open_lazy` uses this to hand a sub-region
+/// of the outer superfile (the vector subsection, the FTS
+/// subsection) through to the inner readers without each
+/// inner reader having to do absolute-offset arithmetic.
+///
+/// Every `range(start, len)` on the sub-source translates to
+/// `inner.range(offset + start, len)`. `size()` is the
+/// sub-region length (`len`), not the inner source's total.
+/// `try_get_range_sync` shifts the offset the same way and
+/// passes through to the inner.
+///
+/// Bounds: out-of-bounds requests (start + len > self.size())
+/// surface as `OutOfBounds` errors with `size = self.size`,
+/// not the inner's larger size — keeps caller-visible errors
+/// scoped to the slice the caller actually sees.
+pub struct LazySubSource {
+    inner: Arc<dyn LazyByteSource>,
+    /// Absolute offset of the sub-region's start inside the
+    /// inner source.
+    offset: u64,
+    /// Length of the sub-region.
+    len: u64,
+}
+
+impl LazySubSource {
+    pub fn new(inner: Arc<dyn LazyByteSource>, offset: u64, len: u64) -> Self {
+        debug_assert!(offset + len <= inner.size(), "sub-source overruns inner");
+        Self { inner, offset, len }
+    }
+}
+
+impl std::fmt::Debug for LazySubSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazySubSource")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl LazyByteSource for LazySubSource {
+    fn size(&self) -> u64 {
+        self.len
+    }
+
+    async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        if start.saturating_add(len) > self.len {
+            return Err(LazyByteSourceError::OutOfBounds {
+                start,
+                len,
+                size: self.len,
+            });
+        }
+        self.inner.range(self.offset + start, len).await
+    }
+
+    fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+        if start.saturating_add(len) > self.len {
+            return None;
+        }
+        self.inner.try_get_range_sync(self.offset + start, len)
+    }
+}
+
+/// Prefetched overlay: — overlay that serves pre-fetched byte ranges
+/// from memory and falls through to an underlying
+/// [`LazyByteSource`] on miss.
+///
+/// `VectorReader::open_lazy` uses this to install the 2–3
+/// open-time range fetches it issues against the underlying
+/// source, then hands the overlay to `open_with_source`. Every
+/// per-region read inside `open_with_source` (sub-header,
+/// codec_meta, etc.) lives inside one of the installed ranges
+/// and resolves zero-copy via [`Self::try_get_range_sync`] —
+/// no extra GETs against the underlying source.
+///
+/// Concurrency: `install` is non-mutating (`&self`) and uses
+/// an interior `Vec` to allow staged construction during
+/// `open_lazy`, then the overlay is wrapped in `Arc` and
+/// shared by every subsequent read. The Vec is read-only after
+/// the open completes, so the racy-read-during-install pattern
+/// the M2 open path actually uses is single-threaded.
+pub struct PrefetchedSource {
+    inner: Arc<dyn LazyByteSource>,
+    /// (absolute_start, bytes). One entry per pre-fetched
+    /// range. Lookup walks the vec linearly — the open-time
+    /// path installs ≤ 3 ranges per segment so the linear
+    /// scan is faster than a tree-keyed structure (cache-line
+    /// hot, no allocation).
+    prefetched: Vec<(u64, Bytes)>,
+}
+
+impl PrefetchedSource {
+    pub fn new(inner: Arc<dyn LazyByteSource>) -> Self {
+        Self {
+            inner,
+            prefetched: Vec::new(),
+        }
+    }
+
+    /// Install a pre-fetched range. `start` is the absolute
+    /// offset into the backing object; `bytes.len()` is the
+    /// range length. Subsequent `try_get_range_sync` /
+    /// `range` requests for any sub-range of
+    /// `[start..start + bytes.len())` resolve from this
+    /// buffer without touching the underlying source.
+    pub fn install(&mut self, start: u64, bytes: Bytes) {
+        self.prefetched.push((start, bytes));
+    }
+
+    /// Lookup helper — returns a zero-copy slice if any
+    /// installed range covers the request.
+    fn lookup(&self, start: u64, len: u64) -> Option<Bytes> {
+        let req_end = start.checked_add(len)?;
+        for (p_start, p_bytes) in &self.prefetched {
+            let p_end = *p_start + p_bytes.len() as u64;
+            if *p_start <= start && req_end <= p_end {
+                let offset = (start - *p_start) as usize;
+                return Some(p_bytes.slice(offset..offset + len as usize));
+            }
+        }
+        None
+    }
+}
+
+impl std::fmt::Debug for PrefetchedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrefetchedSource")
+            .field("size", &self.inner.size())
+            .field("prefetched_count", &self.prefetched.len())
+            .field(
+                "prefetched_bytes",
+                &self.prefetched.iter().map(|(_, b)| b.len()).sum::<usize>(),
+            )
+            .finish()
+    }
+}
+
+#[async_trait]
+impl LazyByteSource for PrefetchedSource {
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(b) = self.lookup(start, len) {
+            return Ok(b);
+        }
+        self.inner.range(start, len).await
+    }
+
+    fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+        if let Some(b) = self.lookup(start, len) {
+            return Some(b);
+        }
+        self.inner.try_get_range_sync(start, len)
     }
 }
 
@@ -203,5 +612,122 @@ mod tests {
         let src = BytesLazyByteSource::new(Bytes::from(vec![0u8; 4]));
         assert!(src.try_get_range_sync(2, 100).is_none());
         assert!(src.try_get_range_sync(100, 0).is_none());
+    }
+
+    /// Prefetched overlay: — overlay serves an installed range
+    /// zero-copy via `try_get_range_sync` without calling
+    /// into the underlying source.
+    #[tokio::test]
+    async fn prefetched_source_serves_installed_range_zero_copy() {
+        let payload = Bytes::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let inner = Arc::new(BytesLazyByteSource::new(payload.clone()));
+        let mut overlay = PrefetchedSource::new(inner);
+        let installed = payload.slice(2..7);
+        overlay.install(2, installed.clone());
+
+        let got = overlay
+            .try_get_range_sync(3, 3)
+            .expect("installed range covers (3..6)");
+        assert_eq!(got.as_ref(), &payload[3..6]);
+
+        let async_got = overlay.range(3, 3).await.expect("async path also serves");
+        assert_eq!(async_got.as_ref(), &payload[3..6]);
+    }
+
+    /// Lazy sub-range path: — sub-source slices into a parent's range.
+    /// `range(start, len)` resolves against the parent at
+    /// `offset + start`; `size()` returns the slice length.
+    #[tokio::test]
+    async fn lazy_sub_source_translates_offsets_and_reports_slice_size() {
+        let payload = Bytes::from((0u8..32).collect::<Vec<_>>());
+        let inner: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(payload.clone()));
+        // Slice the middle 16 bytes (offset 8, len 16).
+        let sub = LazySubSource::new(Arc::clone(&inner), 8, 16);
+        assert_eq!(sub.size(), 16, "sub-source size must equal slice length");
+
+        let got = sub.range(0, 4).await.expect("range(0..4) in slice");
+        assert_eq!(got.as_ref(), &payload[8..12]);
+        let got = sub.range(12, 4).await.expect("range(12..16) in slice");
+        assert_eq!(got.as_ref(), &payload[20..24]);
+
+        let sync_got = sub.try_get_range_sync(2, 6).expect("sync in slice");
+        assert_eq!(sync_got.as_ref(), &payload[10..16]);
+    }
+
+    /// Lazy sub-range path: — out-of-bounds requests against a sub-source
+    /// surface with the slice's `size`, not the inner's larger
+    /// size — keeps the caller-visible error scoped to the slice
+    /// the caller actually addressed.
+    #[tokio::test]
+    async fn lazy_sub_source_out_of_bounds_uses_slice_size_in_error() {
+        let payload = Bytes::from(vec![0u8; 32]);
+        let inner: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(payload));
+        let sub = LazySubSource::new(Arc::clone(&inner), 8, 16);
+        let err = sub
+            .range(10, 10)
+            .await
+            .expect_err("10+10 overruns the 16-byte slice");
+        match err {
+            LazyByteSourceError::OutOfBounds { start, len, size } => {
+                assert_eq!(start, 10);
+                assert_eq!(len, 10);
+                assert_eq!(size, 16, "size must be the slice's, not the inner's");
+            }
+            other => panic!("expected OutOfBounds, got {other:?}"),
+        }
+        assert!(sub.try_get_range_sync(10, 10).is_none());
+    }
+
+    /// Prefetched overlay: — counting source confirms a range request
+    /// that hits the overlay never reaches the underlying source.
+    #[tokio::test]
+    async fn prefetched_source_overlay_hit_skips_underlying_range_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingSource {
+            inner: BytesLazyByteSource,
+            range_calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl LazyByteSource for CountingSource {
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+                self.range_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.range(start, len).await
+            }
+            fn try_get_range_sync(&self, _: u64, _: u64) -> Option<Bytes> {
+                None
+            }
+        }
+
+        let payload = Bytes::from(vec![0u8, 1, 2, 3, 4, 5, 6, 7]);
+        let counting = Arc::new(CountingSource {
+            inner: BytesLazyByteSource::new(payload.clone()),
+            range_calls: AtomicUsize::new(0),
+        });
+        let prefetched = counting.range(0, 4).await.expect("seed prefetch");
+        assert_eq!(counting.range_calls.load(Ordering::SeqCst), 1);
+
+        let mut overlay = PrefetchedSource::new(counting.clone());
+        overlay.install(0, prefetched);
+
+        let _ = overlay.range(1, 2).await.expect("overlay serves");
+        let _ = overlay.range(0, 4).await.expect("overlay serves");
+        assert_eq!(
+            counting.range_calls.load(Ordering::SeqCst),
+            1,
+            "overlay hits must not bump the underlying range counter"
+        );
+
+        let _ = overlay.range(4, 4).await.expect("miss falls through");
+        assert_eq!(
+            counting.range_calls.load(Ordering::SeqCst),
+            2,
+            "an overlay miss must reach the underlying source exactly once"
+        );
     }
 }

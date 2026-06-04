@@ -1,95 +1,110 @@
-//! Sync→async bridge for the sync public API on top of async storage.
+//! Sync→async bridge for sync public API on top of async storage.
 //!
 //! The supertable's public surface (writer.commit, reader queries,
 //! tombstone-cache refresh, lazy byte-source range fetches) is sync,
 //! but the storage trait + downstream object_store calls are async.
-//! **Every** call site that crosses that boundary routes through
-//! [`bridge_sync_to_async`] — there is exactly one bridge, so the
-//! policy below holds uniformly.
+//! Every call site that crosses that boundary lands here.
 //!
 //! ## Two modes
 //!
-//! - **Ambient `multi_thread` runtime present** — `block_in_place`
+//! - **Ambient `multi_thread` tokio runtime present** — `block_in_place`
 //!   tells the scheduler "I'm about to block this worker; rearrange,"
 //!   then `Handle::block_on` drives the future on the current thread.
-//!   Sibling workers keep making progress.
-//! - **No ambient runtime** — drive on a per-thread owned runtime (see
-//!   below). Sync callers (CLI tools, rayon reader/writer pool threads,
-//!   Python bindings via PyO3) land here.
+//!   Other tasks keep making progress on sibling workers.
+//! - **No ambient runtime** — build a one-shot `current_thread` runtime
+//!   and drive the future on it. Sync callers (CLI tools, rayon
+//!   workers, Python bindings via PyO3) land here.
 //!
-//! ## The owned runtime: thread-local `current_thread`
+//! ## Unsupported: `current_thread` ambient runtime
 //!
-//! Each thread that reaches the no-ambient path lazily builds and
-//! caches its **own `current_thread`** runtime in a `thread_local!`,
-//! reused for every later bridged call on that thread. Two properties
-//! matter:
-//!
-//! - **`current_thread`, not `multi_thread`.** The bridged work is a
-//!   short async drive (load N manifest parts, fetch a byte range, run
-//!   a commit) on the *calling* thread. A `current_thread` runtime polls
-//!   it inline — no worker thread, no cross-thread scheduler hand-off.
-//!   A `multi_thread` runtime's `block_on` adds per-poll coordination
-//!   with its worker that, on these sub-millisecond reads, measured
-//!   **+6–17%** on multi-term FTS search at 10M docs (the cost grows
-//!   with the per-query async work, e.g. the `join_all` over kept manifest
-//!   parts). Storage fan-out doesn't need worker threads anyway —
-//!   concurrent `join_all` GETs run on the reactor (remote) or the
-//!   blocking pool (local), neither bounded by the runtime's worker count.
-//! - **Thread-local, not shared.** A `current_thread` runtime can't be
-//!   driven by concurrent `block_on` calls from multiple threads, and
-//!   the reader pool calls the bridge from many rayon threads at once.
-//!   One runtime per thread keeps them independent (no shared-worker
-//!   contention) and amortizes the build cost across that thread's
-//!   calls — so this is not the per-call runtime construction the bridge
-//!   exists to avoid.
-//!
-//! ## Unsupported: re-entrancy and `current_thread` ambient runtimes
-//!
-//! `tokio::task::block_in_place` requires `multi_thread`. Two
-//! consequences, both documented requirements rather than handled cases:
-//!
-//! - A bridged future must **not synchronously re-enter the bridge** on
-//!   the same thread: inside `block_on`, `Handle::try_current()` returns
-//!   `Ok(...)`, so the nested call takes the `block_in_place` branch and
-//!   tokio panics (the owned runtime is `current_thread`). No current
-//!   path nests — the bridged futures are async all the way down.
-//! - Calling the sync API from inside a **`current_thread` ambient**
-//!   runtime panics for the same reason. Async callers must run on a
-//!   `multi_thread` runtime (the default for `#[tokio::main]`, axum,
-//!   actix, etc.) or wrap the call in `spawn_blocking`.
-
-use tokio::runtime::Runtime;
-
-thread_local! {
-    /// Per-thread `current_thread` runtime for the no-ambient path,
-    /// built on first use and reused for the thread's lifetime. See the
-    /// module docs for why it's thread-local `current_thread`.
-    static OWNED_RT: Runtime = new_owned_runtime();
-}
-
-fn new_owned_runtime() -> Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect(
-            "invariant: tokio current_thread Runtime build only fails on \
-             catastrophic OS resource exhaustion",
-        )
-}
+//! `tokio::task::block_in_place` requires `multi_thread`. If a caller
+//! invokes this from inside a `current_thread` tokio runtime,
+//! `Handle::try_current()` returns `Ok(...)`, we take the
+//! `block_in_place` branch, and tokio panics. There is no good
+//! detection primitive in tokio's public API for "this handle is from
+//! a current_thread runtime"; surfacing a typed error would require
+//! parsing `format!("{handle:?}")` or shipping our own probe. For now
+//! this is a documented requirement: async callers must run on a
+//! `multi_thread` runtime (the default for `#[tokio::main]`, axum,
+//! actix, etc.).
 
 /// Drive `fut` to completion from a sync context. Uses the ambient
 /// tokio runtime if present (via `block_in_place + Handle::block_on`),
-/// otherwise this thread's owned `current_thread` runtime.
+/// otherwise builds a tiny `current_thread` runtime for the call.
 ///
-/// Panics if called from inside a `current_thread` tokio runtime, or if
-/// a bridged future synchronously re-enters the bridge on the same
-/// thread (`block_in_place` requires `multi_thread`). See the module docs.
+/// Panics if called from inside a `current_thread` tokio runtime
+/// (`block_in_place` requires `multi_thread`). See the module-level
+/// docs.
 pub(crate) fn bridge_sync_to_async<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => OWNED_RT.with(|rt| rt.block_on(fut)),
+        Err(_) => build_current_thread_runtime().block_on(fut),
     }
+}
+
+/// Drive `fut` to completion from a sync context using a
+/// caller-supplied runtime for the no-ambient-runtime case (instead of
+/// a throwaway). The supertable query path passes its pooled
+/// `query_runtime` here so a sync query issued from a plain thread
+/// reuses the shared multi-thread runtime rather than spinning up a
+/// one-shot one per call.
+///
+/// Same `current_thread`-ambient caveat as [`bridge_sync_to_async`].
+pub(crate) fn bridge_on_runtime<F: std::future::Future>(
+    fut: F,
+    fallback: &tokio::runtime::Runtime,
+) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => fallback.block_on(fut),
+    }
+}
+
+/// Robust sync→async bridge for `Send + 'static` futures. Unlike
+/// [`bridge_sync_to_async`], this also handles being called from inside
+/// a `current_thread` runtime (where `block_in_place` is illegal and a
+/// nested runtime would panic) by driving the future on a dedicated
+/// thread. Used by the lazy byte-source range fetches, which can be
+/// called from any context — a multi-thread query worker, a rayon
+/// reader-pool thread (no ambient runtime), or a `current_thread`
+/// test runtime.
+///
+/// Three contexts:
+/// - **multi_thread ambient** — `block_in_place` + `Handle::block_on`.
+/// - **`current_thread` ambient** — drive on a spawned thread with its
+///   own one-shot `current_thread` runtime (can't block_in_place / nest).
+/// - **no ambient runtime** — build a one-shot `current_thread` runtime
+///   inline (no extra thread; this is the rayon-worker / CLI path).
+pub(crate) fn bridge_sync_to_async_send<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        Ok(_) => std::thread::spawn(move || build_current_thread_runtime().block_on(fut))
+            .join()
+            .expect("sync→async bridge worker thread panicked"),
+        Err(_) => build_current_thread_runtime().block_on(fut),
+    }
+}
+
+fn build_current_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect(
+            "invariant: tokio Runtime build only fails on \
+             catastrophic OS resource exhaustion",
+        )
 }

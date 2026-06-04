@@ -5,19 +5,30 @@
 //! + nprobe/rerank sweeps
 //! + correctness gate (`recall@10 ≥ 0.80` at high-recall config)
 //!
+//! Every phase uses the production path: [`SuperfileBuilder`] →
+//! [`SuperfileReader`] → [`SuperfileReader::vector_search`]. Hot
+//! opens the finished `.parquet` in memory; warm/cold commit the same bytes
+//! to object storage and read through [`DiskCacheStore::reader`].
+//!
 //! Pinned to 1M × 384. Supertable scale (10M × 384, sharded into N
 //! superfiles) lives in `benches/vector/supertable.rs`.
 //!
 //! ## Invocation
 //!
 //! ```text
-//! cargo bench --bench vector -- superfile_vec_build      # ingest only
-//! cargo bench --bench vector -- superfile_vec_search     # search only
+//! cargo bench --bench superfile_vector -- superfile_vec_build      # ingest only
+//! cargo bench --bench superfile_vector -- superfile_vec_search     # search only
 //! ```
 
 use std::hint::black_box;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
+use std::sync::Arc as ArrowArc;
+
+use crate::tiers::{self, Tier};
+use arrow_array::{Decimal128Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 // Calibrated `(probe, refine)` is intentionally not in the criterion ID:
@@ -26,13 +37,18 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 // calibration re-picks the lowest-p50 point. The chosen point is reported
 // in the markdown table instead.
 use crate::corpus::{self, Calibrated, DIM};
+use crate::fixture;
 use crate::{markdown, rss};
+use infino::superfile::SuperfileReader;
+use infino::superfile::builder::{BuilderOptions, SuperfileBuilder, VectorConfig};
+use infino::superfile::reader::VectorSearchOptions;
 use infino::superfile::vector::distance::Metric;
-use infino::superfile::vector::reader::{OpenOptions, VectorReader};
+use infino::superfile::vector::rerank_codec::RerankCodec;
+use infino::supertable::SuperfileUri;
 
 // ─── Constants ────────────────────────────────────────────────────────
 
-const N_DOCS: usize = 1_000_000;
+const N_DOCS: usize = corpus::SUPERFILE_DOCS;
 const TOP_K: usize = 10;
 const N_CORRECTNESS_QUERIES: usize = 20;
 const N_CALIBRATION_QUERIES: usize = 100;
@@ -57,6 +73,9 @@ const RECALL_TARGETS: &[f32] = &[0.90, 0.95, 0.99];
 const PROBES: &[usize] = &[1, 5, 10, 25, 50, 100, 200, 400, 800];
 const REFINES: &[usize] = &[1, 4, 16, 64, 256, 1024];
 
+const ID_COLUMN: &str = "doc_id";
+const VEC_COLUMN: &str = "v";
+
 // ─── Fixtures ────────────────────────────────────────────────────────
 
 static VECTORS: OnceLock<corpus::MmapVectorCorpus> = OnceLock::new();
@@ -64,8 +83,25 @@ static QUERIES_CORRECTNESS: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static QUERIES_CALIBRATION: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 static GROUND_TRUTH_CORRECTNESS: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
 static GROUND_TRUTH_CALIBRATION: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
-static INFINO_BLOB: OnceLock<Vec<u8>> = OnceLock::new();
+static SUPERFILE_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
 static CALIBRATIONS: OnceLock<Calibrations> = OnceLock::new();
+static SUPERFILE_OBJECT: OnceLock<tiers::SuperfileCommitted> = OnceLock::new();
+
+fn superfile_bytes() -> &'static [u8] {
+    SUPERFILE_BYTES.get_or_init(|| build_superfile_bytes(vectors()))
+}
+
+fn superfile_object() -> &'static tiers::SuperfileCommitted {
+    SUPERFILE_OBJECT.get_or_init(|| {
+        let blob = Bytes::from(superfile_bytes().to_vec());
+        eprintln!(
+            "[superfile_vec] committing {N_DOCS} docs to object storage for warm/cold tiers \
+             (production .parquet, {} MiB)...",
+            blob.len() / (1024 * 1024)
+        );
+        tiers::block_on(tiers::commit_superfile(&blob))
+    })
+}
 
 fn vectors() -> &'static [f32] {
     VECTORS
@@ -100,37 +136,72 @@ fn ground_truth_calibration() -> &'static [Vec<u32>] {
         .get_or_init(|| corpus::ground_truth(vectors(), N_DOCS, queries_calibration(), TOP_K))
 }
 
-fn infino_reader() -> VectorReader {
-    let blob = INFINO_BLOB.get_or_init(|| build_infino_blob(vectors()));
-    open_infino_reader(blob.clone())
+fn superfile_reader() -> SuperfileReader {
+    SuperfileReader::open(Bytes::from(superfile_bytes().to_vec())).expect("open superfile")
 }
 
-// ─── Builder ──────────────────────────────────────────────────────────
-
-fn build_infino_blob(vectors: &[f32]) -> Vec<u8> {
-    let n_cent = corpus::n_cent(N_DOCS);
-    let builder = corpus::build_vector_index(vectors, N_DOCS, n_cent, Metric::Cosine);
-    builder.finish().expect("finish vector builder")
+fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
+    VectorSearchOptions::new()
+        .with_nprobe(nprobe)
+        .with_rerank_mult(rerank_mult)
 }
 
-fn open_infino_reader(blob: Vec<u8>) -> VectorReader {
+// ─── Builder (production SuperfileBuilder) ───────────────────────────
+
+/// Same path as supertable commit: Arrow id column + vector slices →
+/// unified `.parquet` (Parquet body + embedded vector blob + `inf.*` KV).
+fn build_superfile_bytes(vectors: &[f32]) -> Vec<u8> {
     let n_cent = corpus::n_cent(N_DOCS);
-    let json =
-        format!(r#"[{{"column":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
-    VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
-        .expect("open VectorReader")
+    let schema = ArrowArc::new(Schema::new(vec![Field::new(
+        ID_COLUMN,
+        DataType::Decimal128(38, 0),
+        false,
+    )]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        ID_COLUMN,
+        vec![],
+        vec![VectorConfig {
+            column: VEC_COLUMN.into(),
+            dim: DIM,
+            n_cent,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+        }],
+        None,
+    );
+    let mut builder = SuperfileBuilder::new(opts).expect("SuperfileBuilder::new");
+    const CHUNK: usize = 65_536;
+    let mut start = 0;
+    while start < N_DOCS {
+        let len = CHUNK.min(N_DOCS - start);
+        let ids: Decimal128Array = (start as u64..(start + len) as u64)
+            .map(|i| Some(i as i128))
+            .collect::<Decimal128Array>()
+            .with_precision_and_scale(38, 0)
+            .expect("decimal128");
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![ArrowArc::new(ids)]).expect("RecordBatch");
+        builder
+            .add_batch(&batch, &[&vectors[start * DIM..(start + len) * DIM]])
+            .expect("add_batch");
+        start += len;
+    }
+    builder.finish().expect("SuperfileBuilder::finish")
 }
 
 // ─── Correctness ──────────────────────────────────────────────────────
 
-fn assert_infino_self_consistent(reader: &VectorReader) -> f32 {
+fn assert_infino_self_consistent(reader: &SuperfileReader) -> f32 {
     let qs = queries_correctness();
     let gt = ground_truth_correctness();
+    let opts = search_opts(CORRECTNESS_NPROBE, CORRECTNESS_RERANK_MULT);
     let mut total_recall = 0.0_f32;
     for (q, truth) in qs.iter().zip(gt.iter()) {
-        let hits = reader
-            .search("v", q, TOP_K, CORRECTNESS_NPROBE, CORRECTNESS_RERANK_MULT)
-            .expect("vector search");
+        let hits =
+            corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts) })
+                .expect("vector_search");
         assert_eq!(
             hits.len(),
             TOP_K,
@@ -157,16 +228,26 @@ struct Calibrations {
 
 fn calibrations() -> &'static Calibrations {
     CALIBRATIONS.get_or_init(|| {
-        let reader = infino_reader();
+        let reader = superfile_reader();
         let qs = queries_calibration();
         let gt = ground_truth_calibration();
 
         eprintln!(
-            "[superfile_vec_search] calibrating infino at recall targets {RECALL_TARGETS:?}..."
+            "[superfile_vec_search] calibrating superfile vector_search at recall targets {RECALL_TARGETS:?}..."
         );
         let mut inf: [Option<Calibrated>; 3] = [None; 3];
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            inf[i] = corpus::calibrate_infino(&reader, qs, gt, target, PROBES, REFINES, 21, TOP_K);
+            inf[i] = corpus::calibrate_superfile(
+                &reader,
+                VEC_COLUMN,
+                qs,
+                gt,
+                target,
+                PROBES,
+                REFINES,
+                21,
+                TOP_K,
+            );
             eprintln!("  recall ≥ {target:.2} | infino: {:?}", inf[i]);
         }
         Calibrations { infino: inf }
@@ -176,19 +257,24 @@ fn calibrations() -> &'static Calibrations {
 // ─── Bench entry ──────────────────────────────────────────────────────
 
 fn bench(c: &mut Criterion) {
-    // ---- Correctness phase (runs regardless of criterion filter) ---
-    eprintln!("[superfile_vec] correctness: building infino ({N_DOCS} docs)...");
-    let reader = infino_reader();
-    let recall = assert_infino_self_consistent(&reader);
-    eprintln!(
-        "[superfile_vec] correctness OK: infino recall@{TOP_K} = {recall:.3} (≥ {:.2})",
-        CORRECTNESS_RECALL_FLOOR
+    let run_build = fixture::supertable::criterion_filter_selects(
+        &["superfile_vec", "superfile_vector", "superfile_vec_build"],
+        &["superfile_vec_build"],
     );
-
-    artifact_report(N_DOCS, corpus::n_cent(N_DOCS), vectors());
+    let run_search = fixture::supertable::criterion_filter_selects(
+        &["superfile_vec", "superfile_vector", "superfile_vec_search"],
+        &[
+            "superfile_vec_hot_search",
+            "superfile_vec_warm_search",
+            "superfile_vec_cold_search",
+        ],
+    );
+    if !run_build && !run_search {
+        return;
+    }
 
     // ---- Ingest sub-bench (group: superfile_vec_build) -------------
-    {
+    if run_build {
         let v = vectors();
         let mut g = c.benchmark_group("superfile_vec_build");
         g.sample_size(10);
@@ -199,7 +285,7 @@ fn bench(c: &mut Criterion) {
         let rss_sample = rss::PeakSampler::start_default();
         let bench_id = format!("infino_build_{N_DOCS}docs");
         g.bench_function(bench_id.clone(), |b| {
-            b.iter_with_large_drop(|| build_infino_blob(black_box(v)));
+            b.iter_with_large_drop(|| build_superfile_bytes(black_box(v)));
         });
         g.finish();
         let stats = rss_sample.stop_stats();
@@ -207,13 +293,28 @@ fn bench(c: &mut Criterion) {
 
         emit_ingest_markdown();
     }
+    if !run_search {
+        return;
+    }
+
+    artifact_report(N_DOCS, corpus::n_cent(N_DOCS), vectors());
+
+    eprintln!(
+        "[superfile_vec] correctness: building shared superfile for correctness/search ({N_DOCS} docs)..."
+    );
+    let reader = superfile_reader();
+    let recall = assert_infino_self_consistent(&reader);
+    eprintln!(
+        "[superfile_vec] correctness OK: infino recall@{TOP_K} = {recall:.3} (≥ {:.2})",
+        CORRECTNESS_RECALL_FLOOR
+    );
 
     // ---- Search sub-bench (group: superfile_vec_search) ------------
     {
         let cal = calibrations();
         let qs = queries_calibration();
 
-        let mut g = c.benchmark_group("superfile_vec_search");
+        let mut g = c.benchmark_group(tiers::search_group_name("superfile_vec", Tier::Hot, None));
         g.sample_size(10);
         let rss_sample = rss::PeakSampler::start_default();
 
@@ -225,10 +326,14 @@ fn bench(c: &mut Criterion) {
                 // match this row against its prior baseline and print its
                 // own improved/regressed delta on subsequent runs.
                 let (p, r) = (c_inf.probe, c_inf.refine);
+                let opts = search_opts(p, r);
                 g.bench_function(format!("infino_{label}"), |b| {
                     let q = &qs[0];
                     b.iter(|| {
-                        let hits = reader.search("v", black_box(q), TOP_K, p, r).expect("kNN");
+                        let hits = corpus::block_on_inmem(async {
+                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
+                        })
+                        .expect("vector_search");
                         black_box(hits)
                     });
                 });
@@ -237,17 +342,13 @@ fn bench(c: &mut Criterion) {
 
         // Default-options baseline (what users get with no tuning).
         let q = &qs[0];
+        let default_opts = search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT);
         g.bench_function("infino_default_options_top10", |b| {
             b.iter(|| {
-                let hits = reader
-                    .search(
-                        black_box("v"),
-                        black_box(q),
-                        TOP_K,
-                        DEFAULT_NPROBE,
-                        DEFAULT_RERANK_MULT,
-                    )
-                    .expect("kNN");
+                let hits = corpus::block_on_inmem(async {
+                    reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, default_opts)
+                })
+                .expect("vector_search");
                 black_box(hits)
             });
         });
@@ -258,14 +359,16 @@ fn bench(c: &mut Criterion) {
             if nprobe > n_cent {
                 continue;
             }
+            let opts = search_opts(nprobe, DEFAULT_RERANK_MULT);
             g.bench_with_input(
                 BenchmarkId::new("infino_nprobe_sweep_rerank20", nprobe),
                 &nprobe,
-                |b, &np| {
+                |b, _| {
                     b.iter(|| {
-                        let hits = reader
-                            .search("v", black_box(q), TOP_K, np, DEFAULT_RERANK_MULT)
-                            .expect("kNN");
+                        let hits = corpus::block_on_inmem(async {
+                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
+                        })
+                        .expect("vector_search");
                         black_box(hits)
                     });
                 },
@@ -274,14 +377,16 @@ fn bench(c: &mut Criterion) {
 
         // rerank_mult sweep (nprobe fixed at default)
         for &rerank in &[1, 5, 10, 20, 50, 100] {
+            let opts = search_opts(DEFAULT_NPROBE, rerank);
             g.bench_with_input(
                 BenchmarkId::new("infino_rerank_sweep_nprobe8", rerank),
                 &rerank,
-                |b, &rm| {
+                |b, _| {
                     b.iter(|| {
-                        let hits = reader
-                            .search("v", black_box(q), TOP_K, DEFAULT_NPROBE, rm)
-                            .expect("kNN");
+                        let hits = corpus::block_on_inmem(async {
+                            reader.vector_search(VEC_COLUMN, black_box(q), TOP_K, opts)
+                        })
+                        .expect("vector_search");
                         black_box(hits)
                     });
                 },
@@ -306,7 +411,154 @@ fn bench(c: &mut Criterion) {
             stats,
         );
 
+        bench_superfile_vec_storage_tiers(c, cal, qs);
+
         emit_search_markdown();
+    }
+}
+
+fn bench_superfile_vec_storage_tiers(c: &mut Criterion, cal: &Calibrations, qs: &[Vec<f32>]) {
+    let committed = superfile_object();
+    let uri: SuperfileUri = committed.uri;
+    let q = &qs[0];
+
+    for tier in [Tier::Warm, Tier::Cold] {
+        let mut g = c.benchmark_group(tiers::search_group_name(
+            "superfile_vec",
+            tier,
+            Some(committed.storage_label),
+        ));
+        g.sample_size(10);
+        // Cold rebuilds a fresh cache + full S3 cold open per sample, so a
+        // single sample can exceed the 5s default and criterion warns it
+        // can't fit 10 samples. Give it room (the warm/hot rows are sub-ms
+        // and finish well inside the default, so only widen cold).
+        if tier == Tier::Cold {
+            g.measurement_time(Duration::from_secs(30));
+        }
+
+        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+            let Some(c_inf) = cal.infino[i] else {
+                continue;
+            };
+            let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
+            let (p, r) = (c_inf.probe, c_inf.refine);
+            let bench_id = format!("infino_{label}");
+
+            match tier {
+                Tier::Warm => {
+                    let storage = Arc::clone(&committed.storage);
+                    let (cache_dir, cache) = tiers::fresh_superfile_cache(storage.clone());
+                    let query = q.clone();
+                    let opts = search_opts(p, r);
+                    tiers::block_on(async {
+                        let reader = cache.reader(&uri).await.expect("warm prewarm open");
+                        tiers::wait_for_superfile_promotion(&cache, uri, Duration::from_secs(120))
+                            .await;
+                        let _ = reader
+                            .vector_search(VEC_COLUMN, &query, TOP_K, opts)
+                            .expect("warm prewarm search");
+                    });
+                    let cache_ref = Arc::clone(&cache);
+                    g.bench_function(&bench_id, |b| {
+                        let query = q.clone();
+                        b.iter(|| {
+                            let hits = tiers::block_on(async {
+                                let reader = cache_ref.reader(&uri).await.expect("warm reader");
+                                reader
+                                    .vector_search(VEC_COLUMN, &query, TOP_K, opts)
+                                    .expect("vector_search")
+                            });
+                            black_box(hits)
+                        });
+                    });
+                    drop(cache);
+                    drop(cache_dir);
+                }
+                Tier::Cold => {
+                    let storage = Arc::clone(&committed.storage);
+                    let query = q.clone();
+                    let opts = search_opts(p, r);
+                    g.bench_function(&bench_id, |b| {
+                        b.iter_custom(|iters| {
+                            let mut total = Duration::ZERO;
+                            for _ in 0..iters {
+                                let (cache_dir, cache) =
+                                    tiers::fresh_superfile_cache(Arc::clone(&storage));
+                                let t0 = Instant::now();
+                                tiers::block_on(async {
+                                    let reader = cache.reader(&uri).await.expect("cold reader");
+                                    let _ = reader
+                                        .vector_search(VEC_COLUMN, &query, TOP_K, opts)
+                                        .expect("cold vector_search");
+                                });
+                                total += t0.elapsed();
+                                drop(cache);
+                                drop(cache_dir);
+                            }
+                            total
+                        });
+                    });
+                }
+                Tier::Hot => {}
+            }
+        }
+
+        let bench_id = "infino_default_options_top10";
+        let default_opts = search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT);
+        match tier {
+            Tier::Warm => {
+                let storage = Arc::clone(&committed.storage);
+                let (cache_dir, cache) = tiers::fresh_superfile_cache(storage);
+                tiers::block_on(async {
+                    let _ = cache.reader(&uri).await.expect("open");
+                    tiers::wait_for_superfile_promotion(&cache, uri, Duration::from_secs(120))
+                        .await;
+                });
+                let cache_ref = Arc::clone(&cache);
+                let query = q.clone();
+                g.bench_function(bench_id, |b| {
+                    b.iter(|| {
+                        let hits = tiers::block_on(async {
+                            let reader = cache_ref.reader(&uri).await.expect("reader");
+                            reader
+                                .vector_search(VEC_COLUMN, &query, TOP_K, default_opts)
+                                .expect("vector_search")
+                        });
+                        black_box(hits)
+                    });
+                });
+                drop(cache);
+                drop(cache_dir);
+            }
+            Tier::Cold => {
+                let storage = Arc::clone(&committed.storage);
+                let query = q.clone();
+                g.bench_function(bench_id, |b| {
+                    b.iter_custom(|iters| {
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            let (cache_dir, cache) =
+                                tiers::fresh_superfile_cache(Arc::clone(&storage));
+                            let t0 = Instant::now();
+                            tiers::block_on(async {
+                                let reader = cache.reader(&uri).await.expect("reader");
+                                let _ = reader
+                                    .vector_search(VEC_COLUMN, &query, TOP_K, default_opts)
+                                    .expect("vector_search");
+                            });
+                            total += t0.elapsed();
+                            drop(cache);
+                            drop(cache_dir);
+                        }
+                        total
+                    });
+                });
+            }
+            Tier::Hot => {}
+        }
+
+        g.finish();
     }
 }
 
@@ -314,7 +566,7 @@ fn bench(c: &mut Criterion) {
 
 mod group_name {
     pub const SUPERFILE_VEC_BUILD: &str = "superfile_vec_build";
-    pub const SUPERFILE_VEC_SEARCH: &str = "superfile_vec_search";
+    pub const SUPERFILE_VEC_SEARCH: &str = "superfile_vec_hot_search";
 }
 
 fn emit_ingest_markdown() {
@@ -364,10 +616,14 @@ fn emit_search_markdown() {
         "### Superfile vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
     ));
     body.push_str(
-        "| Recall target | infino (probe, refine) | infino p50 | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+        "Hot = `SuperfileReader::open` in memory; warm/cold = same `.parquet` on object storage via \
+         `DiskCacheStore::reader` → `vector_search` (production cold/warm path).\n\n",
     );
     body.push_str(
-        "|---------------|------------------------|------------|----------|------------|---------|------------|\n",
+        "| Recall target | (p, r)     | hot        | warm       | cold       | Peak RSS | Median RSS | P90 RSS | Peak RSS Δ |\n",
+    );
+    body.push_str(
+        "|---------------|------------|------------|------------|------------|----------|------------|---------|------------|\n",
     );
 
     for (i, &target) in RECALL_TARGETS.iter().enumerate() {
@@ -375,19 +631,26 @@ fn emit_search_markdown() {
         let row_target = format!("{target:.2}");
         if let Some(c_inf) = cal.infino[i] {
             let id = format!("infino_{label}");
-            let ns = read_mean_ns(group, &id);
+            let hot = read_mean_ns(group, &id);
+            let warm = markdown::read_tier_mean_ns("superfile_vec", "warm", &id);
+            let cold = markdown::read_tier_mean_ns("superfile_vec", "cold", &id);
             let peak = rss::read_peak_rss_bytes(group, &id);
-            let p50 = ns.map(fmt_time).unwrap_or_else(|| "—".into());
             let rss_cell = peak.map(rss::fmt_bytes).unwrap_or_else(|| "—".into());
             let median_rss = rss::fmt_median_rss(group, &id);
             let p90_rss = rss::fmt_p90_rss(group, &id);
             let rss_delta = rss::fmt_peak_rss_delta(group, &id);
             body.push_str(&format!(
-                "| {row_target:13} | (p={}, r={}) | {p50:10} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
-                c_inf.probe, c_inf.refine
+                "| {row_target:13} | (p={}, r={}) | {} | {} | {} | {rss_cell} | {median_rss} | {p90_rss} | {rss_delta} |\n",
+                c_inf.probe,
+                c_inf.refine,
+                hot.map(fmt_time).unwrap_or_else(|| "—".into()),
+                warm.map(fmt_time).unwrap_or_else(|| "—".into()),
+                cold.map(fmt_time).unwrap_or_else(|| "—".into()),
             ));
         } else {
-            body.push_str(&format!("| {row_target:13} | — | — | — | — | — | — |\n"));
+            body.push_str(&format!(
+                "| {row_target:13} | — | — | — | — | — | — | — | — |\n"
+            ));
         }
     }
 
@@ -398,13 +661,27 @@ fn emit_search_markdown() {
     body.push_str("| Metric | Value |\n");
     body.push_str("|--------|-------|\n");
     let def = read_mean_ns(group, "infino_default_options_top10");
+    let def_warm =
+        markdown::read_tier_mean_ns("superfile_vec", "warm", "infino_default_options_top10");
+    let def_cold =
+        markdown::read_tier_mean_ns("superfile_vec", "cold", "infino_default_options_top10");
     let def_s = def.map(fmt_time).unwrap_or_else(|| "—".into());
     let def_rss = rss::read_peak_rss_bytes(group, "infino_default_options_top10")
         .map(rss::fmt_bytes)
         .unwrap_or_else(|| "—".into());
     let def_median = rss::fmt_median_rss(group, "infino_default_options_top10");
     let def_p90 = rss::fmt_p90_rss(group, "infino_default_options_top10");
-    body.push_str(&format!("| infino_default_options_top10 | {def_s} |\n"));
+    body.push_str(&format!(
+        "| infino_default_options_top10 (hot) | {def_s} |\n"
+    ));
+    body.push_str(&format!(
+        "| infino_default_options_top10 (warm) | {} |\n",
+        def_warm.map(fmt_time).unwrap_or_else(|| "—".into())
+    ));
+    body.push_str(&format!(
+        "| infino_default_options_top10 (cold) | {} |\n",
+        def_cold.map(fmt_time).unwrap_or_else(|| "—".into())
+    ));
     body.push_str(&format!(
         "| infino_default_options_top10_peak_rss | {def_rss} |\n"
     ));
@@ -430,20 +707,20 @@ fn artifact_report(n: usize, n_cent: usize, vectors: &[f32]) {
     use std::time::Instant;
 
     let t0 = Instant::now();
-    let blob = build_infino_blob(vectors);
+    let blob = build_superfile_bytes(vectors);
     let build_elapsed = t0.elapsed();
 
     let size_mib = blob.len() as f64 / (1024.0 * 1024.0);
 
     let t0 = Instant::now();
-    let reader = open_infino_reader(blob);
+    let reader = SuperfileReader::open(Bytes::from(blob)).expect("open superfile");
     let open_elapsed = t0.elapsed();
 
     let q = &queries_calibration()[0];
+    let opts = search_opts(DEFAULT_NPROBE, DEFAULT_RERANK_MULT);
     let t0 = Instant::now();
-    let _ = reader
-        .search("v", q, TOP_K, DEFAULT_NPROBE, DEFAULT_RERANK_MULT)
-        .expect("kNN");
+    let _ = corpus::block_on_inmem(async { reader.vector_search(VEC_COLUMN, q, TOP_K, opts) })
+        .expect("vector_search");
     let first_q_elapsed = t0.elapsed();
 
     eprintln!(

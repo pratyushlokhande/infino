@@ -108,8 +108,8 @@ fn build_reader(
     VectorReader::open(Bytes::from(bytes), &json).expect("open VectorReader")
 }
 
-#[test]
-fn oracle_l2sq_full_nprobe_recovers_exact_topk() {
+#[tokio::test]
+async fn oracle_l2sq_full_nprobe_recovers_exact_topk() {
     let dim = 32;
     let n = 200;
     let n_cent = 4;
@@ -136,8 +136,8 @@ fn oracle_l2sq_full_nprobe_recovers_exact_topk() {
     }
 }
 
-#[test]
-fn oracle_cosine_full_nprobe_recovers_exact_topk() {
+#[tokio::test]
+async fn oracle_cosine_full_nprobe_recovers_exact_topk() {
     let dim = 32;
     let n = 200;
     let n_cent = 4;
@@ -161,8 +161,8 @@ fn oracle_cosine_full_nprobe_recovers_exact_topk() {
     }
 }
 
-#[test]
-fn oracle_negdot_full_nprobe_recovers_exact_topk() {
+#[tokio::test]
+async fn oracle_negdot_full_nprobe_recovers_exact_topk() {
     let dim = 32;
     let n = 200;
     let n_cent = 4;
@@ -187,8 +187,8 @@ fn oracle_negdot_full_nprobe_recovers_exact_topk() {
     }
 }
 
-#[test]
-fn oracle_partial_nprobe_top1_preserved() {
+#[tokio::test]
+async fn oracle_partial_nprobe_top1_preserved() {
     // With reduced nprobe we may miss tail of the top-k, but the
     // single most-similar doc (= the query itself for self-query) is
     // still in the cluster the query lands in, so top-1 must
@@ -209,8 +209,8 @@ fn oracle_partial_nprobe_top1_preserved() {
     }
 }
 
-#[test]
-fn oracle_distances_match_brute_force_within_tolerance() {
+#[tokio::test]
+async fn oracle_distances_match_brute_force_within_tolerance() {
     // For full-nprobe + max rerank, our reported distance should
     // equal the brute-force distance to within float noise.
     let dim = 32;
@@ -236,8 +236,8 @@ fn oracle_distances_match_brute_force_within_tolerance() {
     }
 }
 
-#[test]
-fn oracle_nonself_query_topk_recovered() {
+#[tokio::test]
+async fn oracle_nonself_query_topk_recovered() {
     // Query is *not* a corpus member; both engines must agree on
     // top-k under full-nprobe. This isolates "is rerank correct"
     // from "do you find yourself".
@@ -267,8 +267,8 @@ fn oracle_nonself_query_topk_recovered() {
     );
 }
 
-#[test]
-fn oracle_topk_distance_ordering_matches_exact() {
+#[tokio::test]
+async fn oracle_topk_distance_ordering_matches_exact() {
     // The order of (doc, distance) pairs from our reader, after
     // full-nprobe, should agree with brute-force ordering modulo
     // tied scores. Test the strict-monotonicity invariant: distances

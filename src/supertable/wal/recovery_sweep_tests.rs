@@ -1,8 +1,9 @@
-//! Recovery-sweep integration tests.
+//! Recovery-sweep white-box tests.
 //!
-//! Drive `Supertable::open` against a pre-seeded `wal/mutations/`
-//! prefix and verify the open-time sweep completes the leftover
-//! WALs before returning.
+//! These drive `Supertable::open` against a pre-seeded
+//! `wal/mutations/` prefix and assert on WAL state documents and
+//! lease ownership directly — internal state that is not part of the
+//! public API — so they live in-crate rather than under `tests/`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -10,15 +11,15 @@ use std::sync::Arc;
 use chrono::Utc;
 use tempfile::TempDir;
 
-use infino::storage::{LocalFsStorageProvider, StorageProvider};
-use infino::supertable::Supertable;
-use infino::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
-use infino::supertable::wal::WalStore;
-use infino::supertable::wal::state_doc::{
+use crate::storage::{LocalFsStorageProvider, StorageProvider};
+use crate::supertable::Supertable;
+use crate::supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy};
+use crate::supertable::wal::WalStore;
+use crate::supertable::wal::state_doc::{
     OpKind, RowId, SCHEMA_VERSION, SupertableHandleId, TombstoneEntry, TombstoneOutcome, WalId,
     WalState, WalStateDoc,
 };
-use infino::test_helpers::{build_title_batch, default_supertable_options};
+use crate::test_helpers::{build_title_batch, default_supertable_options};
 
 fn make_disk_cache(
     storage: Arc<dyn StorageProvider>,
@@ -30,6 +31,7 @@ fn make_disk_cache(
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
         cold_fetch_streams: 4,
         cold_fetch_chunk_bytes: 1 << 20,
+        prefetch_concurrency: 8,
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
@@ -88,7 +90,6 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     let target_id;
     {
         let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open");
         let manifest = st.reader().manifest().clone();
         target_id = manifest
@@ -112,7 +113,6 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
     )
-    .await
     .expect("re-open");
     let (post, _etag) = ws.read(wal.wal_id).await.expect("read after sweep");
     assert_eq!(post.state, WalState::Complete);
@@ -122,13 +122,12 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     );
     // The tombstone bit is in the sidecar; a follow-up FTS query
     // against the same handle excludes the row.
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search(
             "title",
             "alpha",
             10,
-            infino::superfile::fts::reader::BoolMode::Or,
+            crate::superfile::fts::reader::BoolMode::Or,
         )
         .expect("fts");
     // The "alpha" row is local doc_id 0 — verify it's filtered.
@@ -137,31 +136,8 @@ async fn open_time_sweep_drives_pre_seeded_intent_walls_to_complete() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn operator_hatch_sweep_yields_same_report() {
-    let dir = TempDir::new().expect("tempdir");
-    let storage: Arc<dyn StorageProvider> =
-        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let opts = default_supertable_options().with_storage(Arc::clone(&storage));
-    let st = Supertable::create(opts).expect("create");
-    // Fresh handle on empty storage: zero work.
-    let report = st.run_recovery_sweep_once().await.expect("sweep");
-    assert_eq!(report.n_scanned, 0);
-    assert_eq!(report.n_already_complete, 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn in_memory_supertable_hatch_errors_cleanly() {
-    let st = Supertable::create(default_supertable_options()).expect("create");
-    let err = st.run_recovery_sweep_once().await.expect_err("must error");
-    assert!(matches!(
-        err,
-        infino::supertable::wal::recovery::RecoveryError::NoStorageAttached
-    ));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn create_with_existing_pointer_delegates_to_open() {
+#[test]
+fn create_with_existing_pointer_delegates_to_open() {
     // The point of `Supertable::create`'s create-or-open
     // shape: when storage already carries a committed pointer,
     // `create` MUST behave like `open` rather than silently
@@ -244,7 +220,6 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     let target_id;
     {
         let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
-            .await
             .expect("open for manifest");
         let manifest = st.reader().manifest().clone();
         target_id = manifest
@@ -257,7 +232,7 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
     }
     let now = Utc::now();
     let mut wal = seed_intent_delete_wal(target_id, 0xCAFE_BABE);
-    wal.lease = Some(infino::supertable::wal::state_doc::Lease {
+    wal.lease = Some(crate::supertable::wal::state_doc::Lease {
         // "Process A": some random owner id that's no longer
         // alive.
         owner: SupertableHandleId(0xDEAD_BEEF),
@@ -276,7 +251,6 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
             .with_storage(Arc::clone(&storage))
             .with_disk_cache(disk_cache),
     )
-    .await
     .expect("open after expired lease");
 
     // The WAL is now Complete; the new lease owner is the
@@ -294,13 +268,12 @@ async fn sweep_preempts_expired_lease_and_completes_wal() {
         "this handle should own the lease after preemption"
     );
     // FTS query no longer returns the tombstoned row.
-    let r = st.reader();
-    let hits = r
+    let hits = st
         .bm25_search(
             "title",
             "foo",
             10,
-            infino::superfile::fts::reader::BoolMode::Or,
+            crate::superfile::fts::reader::BoolMode::Or,
         )
         .expect("fts");
     for hit in &hits {

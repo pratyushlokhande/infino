@@ -353,6 +353,75 @@ pub struct SuperfileEntry {
     /// resulting bucket here on ingest. `None` under non-hash
     /// strategies and under the single-bucket Hash default.
     pub partition_hint: Option<u32>,
+    /// precomputed superfile layout offsets so the
+    /// cold-open path can fire the parquet-footer, vector
+    /// subsection, and FTS subsection GETs **in parallel** in a
+    /// single round-trip, without first reading the parquet KV
+    /// metadata to learn where each subsection lives.
+    ///
+    /// Populated by the writer at commit time from the
+    /// `ParquetParts` returned by `write_parquet_with_blobs` (so
+    /// the values are by construction consistent with what the
+    /// parquet KV metadata would later say).
+    ///
+    /// `None` on segments produced by pre-M6 writers; the cold
+    /// open path falls back to the 2-RTT shape (parquet tail
+    /// then vec/fts in parallel) — see
+    /// `DiskCacheStore::reader_with_hints`.
+    pub subsection_offsets: Option<SubsectionOffsets>,
+}
+
+/// superfile layout offsets cached on the manifest.
+///
+/// Knowing these up-front lets the cold-open path issue every
+/// subsection GET in parallel against the same superfile object,
+/// turning the canonical 2-RTT cold open (parquet tail → vec+fts
+/// in parallel) into a single round-trip.
+///
+/// All offsets are absolute byte positions within the superfile
+/// blob (matching `inf.vec.offset` / `inf.fts.offset` parquet KV
+/// values), and `total_size` matches what an S3 `HEAD` would
+/// return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubsectionOffsets {
+    /// Total byte count of the superfile blob. Lets the cold-open
+    /// path skip the upfront `HEAD` round-trip too — the same
+    /// information the suffix-range tail would otherwise return,
+    /// but available without any I/O.
+    pub total_size: u64,
+    /// Absolute `(offset, length)` of the vector subsection. `None`
+    /// when the segment carries no vector subsection.
+    pub vec: Option<(u64, u64)>,
+    /// Absolute `(offset, length)` of the FTS subsection. `None`
+    /// when the segment carries no FTS subsection.
+    pub fts: Option<(u64, u64)>,
+    /// Absolute ranges that fully cover vector open-time metadata.
+    /// The hinted cache path prefetches these in the first network
+    /// batch so `VectorReader::open_lazy` can resolve header,
+    /// directory, subheaders, and codec metadata from the overlay.
+    pub vec_open_ranges: Vec<(u64, u64)>,
+    /// Absolute ranges that fully cover FTS open-time metadata:
+    /// header+dictionary and doc-length tables. Query-time postings
+    /// stay lazy.
+    pub fts_open_ranges: Vec<(u64, u64)>,
+    /// the actual bytes covering the segment's
+    /// open-time batch (parquet footer tail + the
+    /// `vec_open_ranges` + the `fts_open_ranges`), carried inline
+    /// in the manifest part.
+    ///
+    /// When non-empty, the cold-fetch path installs these directly
+    /// into the reader's prefetch overlay and issues **zero**
+    /// open-time GETs against the segment object — the bytes
+    /// already arrived in the single part GET that `cold_open`
+    /// performs. The genuine first-touch per-segment cost then
+    /// collapses from 2 RTT-batches (open metadata + cluster
+    /// postings) to 1 (postings only).
+    ///
+    /// Each tuple is `(absolute_offset, bytes)`. Empty on segments
+    /// produced by pre-M7 writers, or when blob capture is disabled
+    /// — the path then falls back to fetching `vec_open_ranges` /
+    /// `fts_open_ranges` over the wire.
+    pub open_blob: Vec<(u64, Vec<u8>)>,
 }
 
 /// Opaque store key — wraps a UUID v4. The segment store treats
@@ -368,6 +437,25 @@ impl SuperfileUri {
     /// when assigning a key for a new segment's bytes.
     pub fn new_v4() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Object-store / LocalFS path for committed segment bytes.
+    /// `.sf.parquet` double suffix — on disk this is still valid
+    /// Parquet (row groups + optional embedded FTS/vector blobs +
+    /// footer), while the `.sf` marker flags it as a Superfile
+    /// segment without making the file look non-standard.
+    pub fn storage_path(self) -> String {
+        format!("data/seg-{}.sf.parquet", self.0)
+    }
+
+    /// Disk-cache filename for a promoted segment.
+    pub fn cache_filename(self) -> String {
+        format!("seg-{}.sf.parquet", self.0)
+    }
+
+    /// Disk-cache tempfile while a cold fetch is in flight.
+    pub fn cache_tmp_filename(self) -> String {
+        format!("seg-{}.sf.parquet.tmp", self.0)
     }
 }
 
@@ -594,6 +682,7 @@ mod tests {
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
             partition_hint: None,
+            subsection_offsets: None,
         })
     }
 
