@@ -155,51 +155,72 @@ Current numbers: 1M docs per tier, real AWS S3 (us-east-1), recorded
 <!-- BEGIN: bench/fts/superfile/ingest -->
 ### Superfile FTS — ingest, single-segment / in-memory (1M docs, Zipfian, 200 tokens/doc, 10K vocab)
 
-_Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
+_Host: unknown CPU · 10C/10T · macos/aarch64_
+
+Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable commit), through the engine-generic `run_fts` driver the cross-engine comparison also uses. Rows are by writer count: `1 writer` is the single-threaded build (and the index queries run against); `N writers` is the sharded parallel build. Bandwidth is over the logical input text payload. Δ is vs the previous run.
 
 | Build | Time | Throughput | Bandwidth | Peak RSS | Median RSS | P90 RSS |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 writer | 18.44 s (new) | 54.2 K/s (new) | 109.0 MB/s (new) | 5.55 GiB (new) | 3.66 GiB (new) | 4.59 GiB (new) |
-| 16 writers | 2.21 s (new) | 451.5 K/s (new) | 907.6 MB/s (new) | 7.98 GiB (new) | 7.15 GiB (new) | 7.90 GiB (new) |
+| 1 writer | 23.11 s (new) | 43.3 K/s (new) | 87.0 MB/s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
+| 10 writers | 3.80 s (new) | 262.9 K/s (new) | 528.4 MB/s (new) | 0 B (new) | 0 B (new) | 0 B (new) |
 <!-- END: bench/fts/superfile/ingest -->
 
 <!-- BEGIN: bench/fts/superfile/search -->
 ### Superfile FTS — search, single-segment / in-memory (1M docs)
 
-_Host: Intel(R) Xeon(R) Platinum 8488C · 8C/16T · 31 GiB RAM · linux/x86_64_
+_Host: unknown CPU · 10C/10T · macos/aarch64_
+
+Warm = `SuperfileReader::open` in memory (per-query p50); cold = same `.parquet` on object storage via `DiskCacheStore::reader` -> `bm25_search` (production cold path). Δ is vs the previous run.
 
 **OR queries**
 
-| Query | warm | Peak RSS | Median RSS | P90 RSS | cold |
-| --- | --- | --- | --- | --- | --- |
-| single_rare | 1.43 µs (new) | 4.20 GiB (new) | 4.20 GiB (new) | 4.20 GiB (new) | 199.76 ms (new) |
-| single_df1 | 914 ns (new) | 4.20 GiB (new) | 4.20 GiB (new) | 4.20 GiB (new) | 169.00 ms (new) |
-| single_common | 19.48 µs (new) | 4.20 GiB (new) | 4.20 GiB (new) | 4.20 GiB (new) | 203.42 ms (new) |
-| two_term_or | 271.51 µs (new) | 4.20 GiB (new) | 4.20 GiB (new) | 4.20 GiB (new) | 172.27 ms (new) |
-| three_wide_or | 2.50 ms (new) | 3.74 GiB (new) | 3.74 GiB (new) | 3.74 GiB (new) | 169.25 ms (new) |
-| three_similar_or | 10.63 ms (new) | 3.74 GiB (new) | 3.74 GiB (new) | 3.74 GiB (new) | 169.78 ms (new) |
-| five_term_or | 18.02 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 172.84 ms (new) |
-| ten_term_or | 52.98 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 224.68 ms (new) |
+| Query | warm | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
+| --- | --- | --- | --- | --- | --- | --- |
+| single_rare | 1.25 µs (+7.2% worse) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 1.67 s (new) |
+| single_df1 | 958 ns (+64.3% worse) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 7.88 µs (new) |
+| single_common | 18.33 µs (-6.2% better) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 1.68 s (new) |
+| two_term_or | 262.75 µs (+2.6% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.03 s (new) | 1.69 s (new) |
+| three_wide_or | 2.98 ms (-2.7% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 1.62 s (new) |
+| three_similar_or | 11.39 ms (-2.6% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.04 s (new) | 1.62 s (new) |
+| five_term_or | 20.29 ms (-0.7% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.67 s (new) |
+| ten_term_or | 65.84 ms (-2.5% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.73 s (new) |
 
 **AND queries**
 
-| Query | warm | Peak RSS | Median RSS | P90 RSS | cold |
-| --- | --- | --- | --- | --- | --- |
-| two_term_and | 227.52 µs (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 217.68 ms (new) |
-| three_wide_and | 3.87 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 229.61 ms (new) |
-| three_similar_and | 6.25 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 187.86 ms (new) |
-| five_term_and | 7.47 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 207.28 ms (new) |
-| ten_term_and | 8.75 ms (new) | 3.73 GiB (new) | 3.73 GiB (new) | 3.73 GiB (new) | 237.93 ms (new) |
+| Query | warm | Peak RSS | Median RSS | P90 RSS | cold open | cold search |
+| --- | --- | --- | --- | --- | --- | --- |
+| two_term_and | 282.79 µs (+4.5% worse) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.67 s (new) |
+| three_wide_and | 4.30 ms (-1.1% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.62 s (new) |
+| three_similar_and | 7.05 ms (-0.9% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.63 s (new) |
+| five_term_and | 8.54 ms (+1.5% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.08 s (new) | 1.66 s (new) |
+| ten_term_and | 10.31 ms (-0.1% ~) | 0 B (new) | 0 B (new) | 0 B (new) | 5.05 s (new) | 1.67 s (new) |
 
 **Per-algorithm probes (WAND+BMW vs MaxScore+BMM)**
 
 | Shape | WAND+BMW | MaxScore+BMM |
 | --- | --- | --- |
-| wide_3_or | 8.52 ms (new) | 2.49 ms (new) |
-| similar_3_or | 15.78 ms (new) | 10.35 ms (new) |
-| similar_5_or | 46.14 ms (new) | 18.00 ms (new) |
-| similar_10_or | 312.96 ms (new) | 53.29 ms (new) |
+| wide_3_or | 9.63 ms (+2.6% ~) | 3.04 ms (-0.0% ~) |
+| similar_3_or | 18.14 ms (+0.7% ~) | 11.89 ms (+0.7% ~) |
+| similar_5_or | 49.85 ms (+1.3% ~) | 20.29 ms (+0.7% ~) |
+| similar_10_or | 425.63 ms (+1.1% ~) | 67.01 ms (-1.3% ~) |
 <!-- END: bench/fts/superfile/search -->
+
+<!-- BEGIN: bench/fts/superfile/negation -->
+### Superfile FTS — negation (`-term`), warm (1M docs)
+
+_Host: unknown CPU · 10C/10T · macos/aarch64_
+
+Through the string `bm25_hits_async` path (parses the `-` sigil); a correctness gate (no hit contains a negated term) runs before timing. Δ is vs the previous run.
+
+**Negation queries**
+
+| Query | warm |
+| --- | --- |
+| mid_pos_common_neg | 1.63 ms (-0.4% ~) |
+| mid_pos_rare_neg | 27.96 µs (+1.1% ~) |
+| two_mid_or_common_neg | 4.55 ms (-0.8% ~) |
+| two_mid_and_common_neg | 5.15 ms (+3.2% worse) |
+<!-- END: bench/fts/superfile/negation -->
 
 ### FTS — supertable (multi-segment, 1M docs, real S3)
 
