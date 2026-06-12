@@ -44,21 +44,43 @@ pub struct ColdTiming {
 pub fn open_all_superfiles(consumer: &infino::supertable::Supertable) {
     let reader = consumer.reader();
     let manifest = reader.manifest();
-    let store = &manifest.options.store;
-    let disk_cache = manifest.options.disk_cache.as_ref();
-    let storage = manifest.options.storage.as_ref();
-    crate::tiers::block_on(async {
-        futures::future::try_join_all(manifest.superfiles.iter().map(|e| {
-            infino::supertable::query::superfile_reader::superfile_reader(
-                store,
-                disk_cache,
-                storage,
-                &e.uri,
-                e.subsection_offsets.as_ref(),
-            )
-        }))
-        .await
-        .expect("cold open: open superfile readers");
+    let store = manifest.options.store.clone();
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+    // Snapshot the per-superfile open inputs up front so each spawned task
+    // owns its data ('static). `tokio::spawn` per superfile distributes the
+    // per-open CPU parse across the runtime's worker threads — matching the
+    // production vector fan-out (`tokio::spawn` per superfile) instead of
+    // serializing all the parses on a single `try_join_all` poller.
+    let superfiles: Vec<_> = manifest
+        .superfiles
+        .iter()
+        .map(|e| (e.uri, e.subsection_offsets.clone()))
+        .collect();
+    crate::tiers::block_on(async move {
+        let handles: Vec<_> = superfiles
+            .into_iter()
+            .map(|(uri, offsets)| {
+                let store = store.clone();
+                let disk_cache = disk_cache.clone();
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    infino::supertable::query::superfile_reader::superfile_reader(
+                        &store,
+                        disk_cache.as_ref(),
+                        storage.as_ref(),
+                        &uri,
+                        offsets.as_ref(),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await
+                .expect("cold open: join superfile open task")
+                .expect("cold open: open superfile readers");
+        }
     });
 }
 
@@ -830,62 +852,74 @@ pub mod vector {
         include_warm: bool,
         include_cold: bool,
         cold_iters: usize,
+        skip_calibration: bool,
         log_prefix: &str,
         anchor: &str,
         title: String,
         note: &str,
     ) {
-        eprintln!(
-            "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
-            q_correct.len(),
-        );
-        let recall = mean_recall(
-            warm_reader,
-            column,
-            q_correct,
-            gt_correct,
-            k,
-            CORRECTNESS_NPROBE,
-            CORRECTNESS_RERANK_MULT,
-        );
-        assert!(
-            recall >= CORRECTNESS_RECALL_FLOOR,
-            "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
-        );
-        eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
-
-        let cal: Vec<Option<Calibrated>> = RECALL_TARGETS
-            .iter()
-            .map(|&target| {
-                eprintln!(
-                    "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
-                    q_cal.len(),
-                );
-                calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
-            })
-            .collect();
-
         let q0 = &q_cal[0];
         let mut rows: Vec<RecallRow> = Vec::new();
-        for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            match cal[i] {
-                Some(c) => rows.push(RecallRow {
-                    target: format!("{target:.2}"),
-                    params: format!("p={}, r={}", c.probe, c.refine),
-                    recall: format!("{:.3}", c.recall),
-                    warm: include_warm
-                        .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
-                    cold: include_cold.then(|| {
-                        measure_cold(&open_cold, column, q0, k, c.probe, c.refine, cold_iters)
+        if skip_calibration {
+            // Skip-calibration mode (INFINO_BENCH_SKIP_CALIBRATION): no
+            // correctness gate, no recall-target grid — just the fixed
+            // `(default_nprobe, default_rerank)` row below. Needs no ground
+            // truth and no warmed reader, so a cold-only run is fast and
+            // prod-shaped.
+            eprintln!(
+                "[{log_prefix}] skip-calibration: measuring only fixed (p={default_nprobe}, r={default_rerank})",
+            );
+        } else {
+            eprintln!(
+                "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
+                q_correct.len(),
+            );
+            let recall = mean_recall(
+                warm_reader,
+                column,
+                q_correct,
+                gt_correct,
+                k,
+                CORRECTNESS_NPROBE,
+                CORRECTNESS_RERANK_MULT,
+            );
+            assert!(
+                recall >= CORRECTNESS_RECALL_FLOOR,
+                "{log_prefix} vector recall@{k} {recall:.3} < floor {CORRECTNESS_RECALL_FLOOR:.2}"
+            );
+            eprintln!("[{log_prefix}] correctness OK: recall@{k} = {recall:.3}");
+
+            let cal: Vec<Option<Calibrated>> = RECALL_TARGETS
+                .iter()
+                .map(|&target| {
+                    eprintln!(
+                        "[{log_prefix}] calibrating recall@{target:.2}: grid over probes/refines ({} queries)...",
+                        q_cal.len(),
+                    );
+                    calibrate(warm_reader, column, q_cal, gt_cal, target, k, log_prefix)
+                })
+                .collect();
+
+            for (i, &target) in RECALL_TARGETS.iter().enumerate() {
+                match cal[i] {
+                    Some(c) => rows.push(RecallRow {
+                        target: format!("{target:.2}"),
+                        params: format!("p={}, r={}", c.probe, c.refine),
+                        recall: format!("{:.3}", c.recall),
+                        warm: include_warm
+                            .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
+                        cold: include_cold.then(|| {
+                            measure_cold(&open_cold, column, q0, k, c.probe, c.refine, cold_iters)
+                        }),
                     }),
-                }),
-                None => rows.push(RecallRow {
-                    target: format!("{target:.2}"),
-                    params: "—".into(),
-                    recall: "—".into(),
-                    warm: None,
-                    cold: None,
-                }),
+                    None => rows.push(RecallRow {
+                        target: format!("{target:.2}"),
+                        params: "—".into(),
+                        recall: "—".into(),
+                        warm: None,
+                        cold: None,
+                    }),
+                }
             }
         }
         rows.push(RecallRow {

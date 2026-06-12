@@ -505,6 +505,20 @@ fn supertable_search_cache_gib() -> Option<u64> {
         .filter(|&v| v > 0)
 }
 
+/// Concurrent background-fill permits for the bench disk cache. Raising
+/// `INFINO_BENCH_PREFETCH_CONCURRENCY` lets a many-segment supertable
+/// finish `wait_until_warm` within the timeout (256 segments promote in
+/// `ceil(256 / concurrency)` waves). Background memory scales as
+/// `concurrency × cold_fetch_streams × cold_fetch_chunk_bytes`, so e.g.
+/// 64 × 8 × 8 MiB ≈ 4 GiB of in-flight fill buffers.
+fn bench_prefetch_concurrency() -> usize {
+    std::env::var("INFINO_BENCH_PREFETCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or_else(|| DiskCacheConfig::default().prefetch_concurrency)
+}
+
 /// Fresh disk cache for ingest producers (8 GiB budget).
 ///
 /// Ingest attaches this cache only to keep superfile bytes out of the
@@ -589,11 +603,11 @@ fn fresh_disk_cache_with_mode(
         cold_fetch_mode,
         cold_fetch_streams: BENCH_COLD_FETCH_STREAMS,
         cold_fetch_chunk_bytes: BENCH_COLD_FETCH_CHUNK_BYTES,
+        prefetch_concurrency: bench_prefetch_concurrency(),
         mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
         verify_crc_on_open: false,
-        ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(storage, cfg).expect("DiskCacheStore");
     (dir, cache)
