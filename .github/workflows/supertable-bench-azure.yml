@@ -14,7 +14,7 @@ on:
         required: false
         default: supertable_all
         type: choice
-        options: [superfile, supertable, supertable_all, fts, vector, combined, sql, all]
+        options: [superfile, supertable, supertable_all, supertable_fts, supertable_vector, supertable_sql, all]
       docs:
         description: "Doc count (plain integer, NOT 1M/100K — those do not parse)"
         required: false
@@ -88,6 +88,8 @@ on:
       pr_number:       { type: string, required: false, default: "" }
       # Min |Δ%| vs main to flag in the PR comment; smaller is noise.
       noise_threshold_pct: { type: string, required: false, default: "10" }
+      # Fork PR ⇒ gate the run on maintainer approval (see `environment`).
+      is_fork_pr:      { type: boolean, required: false, default: false }
 
 permissions:
   id-token: write       # Azure OIDC federated login
@@ -111,10 +113,11 @@ env:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    # Run under the `ci` environment so the OIDC subject is
-    # repo:…:environment:ci — branch-independent, so one federated
-    # credential authorizes runs from any branch.
-    environment: ci
+    # `ci`: same-repo, no gate. `bench`: required reviewers, so a maintainer
+    # approves before secrets reach fork code. The env name is the OIDC
+    # subject (repo:…:environment:<name>) — each needs its own Azure
+    # federated credential.
+    environment: ${{ inputs.is_fork_pr && 'bench' || 'ci' }}
     # Auto-stop ceiling on VM billing; teardown runs on timeout.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
@@ -130,20 +133,18 @@ jobs:
         id: resolve
         run: |
           set -euo pipefail
-          # All benches live in the single `bench` cargo target; cells are
-          # selected with positional tokens (`<tier> <modality> [phase]`).
-          # Map the legacy `bench` input vocabulary to (a) the binary's
-          # args and (b) the report JSONs (target/infino-bench/<name>.json)
-          # used for baseline restore / publish.
+          # Map the `bench` input to (a) the cargo bench target's positional
+          # cell selectors and (b) the report JSONs it emits
+          # (target/infino-bench/<name>.json) for baseline restore / publish.
+          # The supertable_* tokens select one cell each: CI fans them out
+          # one-per-VM so a modality's numbers stay isolated.
           case "${{ inputs.bench }}" in
-            superfile)      args="superfile";             reports="superfile_fts superfile_vector sql" ;;
-            supertable)     args="supertable";            reports="supertable supertable_fts supertable_vector supertable_sql" ;;
-            supertable_all) args="supertable";            reports="supertable supertable_fts supertable_vector supertable_sql" ;;
-            fts)            args="supertable fts";        reports="supertable supertable_fts" ;;
-            vector)         args="supertable vector";     reports="supertable supertable_vector" ;;
-            combined)       args="supertable fts vector"; reports="supertable supertable_fts supertable_vector" ;;
-            sql)            args="superfile sql";         reports="sql" ;;
-            all)            args="all";                   reports="supertable supertable_fts supertable_vector supertable_sql superfile_fts superfile_vector sql" ;;
+            superfile)                 args="superfile";         reports="superfile_fts superfile_vector sql" ;;
+            supertable|supertable_all) args="supertable";        reports="supertable supertable_fts supertable_vector supertable_sql" ;;
+            supertable_fts)            args="supertable fts";    reports="supertable_fts" ;;
+            supertable_vector)         args="supertable vector"; reports="supertable_vector" ;;
+            supertable_sql)            args="supertable sql";    reports="supertable_sql" ;;
+            all)                       args="all";               reports="supertable supertable_fts supertable_vector supertable_sql superfile_fts superfile_vector sql" ;;
             *) echo "::error::unknown bench ${{ inputs.bench }}"; exit 1 ;;
           esac
           echo "args=$args"       >> "$GITHUB_OUTPUT"
