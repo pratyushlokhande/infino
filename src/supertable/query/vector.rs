@@ -286,29 +286,57 @@ impl SupertableReader {
         // Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
-        let kernel =
-            move |reader: Arc<SuperfileReader>,
-                  (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
-                let column = Arc::clone(&column_arc);
-                let query = Arc::clone(&query_arc);
-                async move {
-                    let res = match probe {
-                        Probe::Clusters(ids) => {
-                            reader
-                                .vector_search_clusters_filtered(
-                                    &column, &query, k, &ids, options, bitmap,
-                                )
-                                .await
-                        }
-                        Probe::Nprobe => {
-                            reader
-                                .vector_hits_filtered_async(&column, &query, k, options, bitmap)
-                                .await
-                        }
-                    };
-                    res.map_err(|e| QueryError::Parquet(e.to_string()))
+        // Per-superfile kernel + tombstone handling. Unfiltered kNN drops
+        // tombstoned rows only *after* the kernel's top-k is chosen, so a
+        // deleted row in the top-k would shrink the result with no backfill.
+        // Over-fetch by the superfile's tombstone count so that `k` live rows
+        // remain once the tombstoned ones are retained out. Filtered search
+        // already excludes tombstones up front (its allow-set is built with
+        // them subtracted in `candidate_bitmaps`), so it keeps `k`.
+        let body = move |reader: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         tombstone_cache: Option<Arc<SidecarCache>>,
+                         now: Instant,
+                         (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
+            let column = Arc::clone(&column_arc);
+            let query = Arc::clone(&query_arc);
+            async move {
+                let deleted = match tombstone_cache.as_ref() {
+                    Some(cache) => Some(
+                        cache
+                            .bitmap_for(entry.superfile_id, now)
+                            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?,
+                    ),
+                    None => None,
+                };
+                let overfetch = if bitmap.is_none() {
+                    deleted.as_ref().map_or(0, |d| d.len() as usize)
+                } else {
+                    0
+                };
+                let k_eff = k + overfetch;
+                let hits = match probe {
+                    Probe::Clusters(ids) => {
+                        reader
+                            .vector_search_clusters_filtered(
+                                &column, &query, k_eff, &ids, options, bitmap,
+                            )
+                            .await
+                    }
+                    Probe::Nprobe => {
+                        reader
+                            .vector_hits_filtered_async(&column, &query, k_eff, options, bitmap)
+                            .await
+                    }
                 }
-            };
+                .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                let mut tagged = dispatch::tag_hits(&entry, hits);
+                if let Some(d) = deleted.as_ref().filter(|d| !d.is_empty()) {
+                    tagged.retain(|h| !d.contains(h.local_doc_id));
+                }
+                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+            }
+        };
         // Filtered search holds a per-superfile RoaringBitmap while the
         // kernel builds its shortlist; wave-cap the fan-out by reader-pool
         // width so transient memory stays bounded. The unfiltered path
@@ -320,11 +348,11 @@ impl SupertableReader {
             while !units.is_empty() {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
-                collected.extend(dispatch::fanout(self, wave, kernel.clone()).await?);
+                collected.extend(dispatch::fanout_with(self, wave, body.clone()).await?);
             }
             collected
         } else {
-            dispatch::fanout(self, units, kernel).await?
+            dispatch::fanout_with(self, units, body).await?
         };
 
         Ok(top_k_ascending(per_superfile, k))
@@ -1023,6 +1051,97 @@ mod tests {
             .vector_hits("emb", &q, 7, VectorSearchOptions::new(), None)
             .expect("query");
         assert_eq!(hits.len(), 7);
+    }
+
+    /// Regression: after deletes, vector search must still return `k` *live*
+    /// rows when at least `k` remain. The tombstone filter runs on each
+    /// superfile's already-truncated top-k, so deleted rows in the top-k were
+    /// dropped with no backfill — a small-`k` search whose nearest rows are
+    /// all deleted returned fewer than `k` (empty at `k=1`).
+    #[test]
+    fn vector_search_backfills_past_deleted_rows() {
+        use datafusion::prelude::{Expr, col, lit};
+
+        use crate::{storage::LocalFsStorageProvider, supertable::storage::StorageProvider};
+
+        let dim = 16;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+
+        // Spread-out pseudo-random vectors (one superfile, local_doc_id == title
+        // index), so the nearest rows are scattered across clusters as in a real
+        // embedding workload.
+        let n = 64usize;
+        let pseudo = |i: usize, d: usize| -> f32 {
+            // Integer hash mixed down to [0, 1) — deterministic and spread,
+            // with no float literal that exceeds f32 precision.
+            let mut h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(
+                (d as u64)
+                    .wrapping_add(1)
+                    .wrapping_mul(0x2545_F491_4F6C_DD1D),
+            );
+            h ^= h >> 33;
+            ((h >> 40) & 0xFFFF) as f32 / 65536.0
+        };
+        let schema = st.options().schema.clone();
+        let titles = LargeStringArray::from((0..n).map(|i| format!("doc {i}")).collect::<Vec<_>>());
+        let mut flat = Vec::<f32>::with_capacity(n * dim);
+        for i in 0..n {
+            for d in 0..dim {
+                flat.push(pseudo(i, d));
+            }
+        }
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)) as Arc<dyn Array>,
+            None,
+        )
+        .expect("fsl");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(fsl)]).expect("batch");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let q: Vec<f32> = (0..dim).map(|d| pseudo(0, d)).collect();
+
+        // Rank all rows, then delete the nearest `d` — far more than a small-k
+        // candidate pool, so the surviving rows fall outside the over-fetch and
+        // a post-truncation tombstone filter has nothing left to return.
+        let baseline = st
+            .reader()
+            .vector_hits("emb", &q, n, VectorSearchOptions::new(), None)
+            .expect("baseline");
+        assert_eq!(baseline.len(), n);
+        let d = 56usize;
+        let deleted_ids: std::collections::HashSet<u32> =
+            baseline[..d].iter().map(|h| h.local_doc_id).collect();
+        let deleted: Vec<Expr> = deleted_ids
+            .iter()
+            .map(|id| lit(format!("doc {id}")))
+            .collect();
+        let stats = st
+            .delete(col("title").in_list(deleted, false))
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), d);
+
+        // k=1 must return the nearest *live* row, not an empty result.
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, 1, VectorSearchOptions::new(), None)
+            .expect("search");
+        assert_eq!(hits.len(), 1, "k=1 returned no live row after deletes");
+        assert!(
+            !deleted_ids.contains(&hits[0].local_doc_id),
+            "returned a deleted row: local_doc_id={}",
+            hits[0].local_doc_id
+        );
     }
 
     #[test]
