@@ -109,6 +109,8 @@ env:
   VM: bench-vm-${{ github.run_id }}${{ inputs.name_suffix }}
   ADMIN: azureuser
   SCCACHE_VERSION: v0.8.2
+  # Paused while bench numbers are flaky. Flip to "true" to resume PR comments.
+  POST_PR_COMMENT: "false"
 
 jobs:
   benchmark:
@@ -503,7 +505,7 @@ jobs:
       # Pull this run's metric JSONs off the VM so the AI-summary step can diff
       # them against the staged main baseline. Best-effort per report.
       - name: Collect current metrics
-        if: ${{ !cancelled() && inputs.pr_number != '' }}
+        if: ${{ !cancelled() && inputs.pr_number != '' && env.POST_PR_COMMENT == 'true' }}
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
         run: |
@@ -521,7 +523,7 @@ jobs:
       # Foundry narrate them. Falls back to the deterministic delta table on any
       # model failure or missing creds — the comment is always correct.
       - name: AI summary
-        if: ${{ !cancelled() && inputs.pr_number != '' }}
+        if: ${{ !cancelled() && inputs.pr_number != '' && env.POST_PR_COMMENT == 'true' }}
         env:
           REPORTS: ${{ steps.resolve.outputs.reports }}
           BASELINE_DIR: baseline
@@ -541,7 +543,7 @@ jobs:
       # Sticky PR comment, one per matrix leg. The hidden marker lets a new
       # push edit in place instead of stacking comments.
       - name: Post results to PR
-        if: ${{ !cancelled() && inputs.pr_number != '' }}
+        if: ${{ !cancelled() && inputs.pr_number != '' && env.POST_PR_COMMENT == 'true' }}
         uses: actions/github-script@v7
         env:
           MARKER: <!-- infino-bench:${{ inputs.bench }}${{ inputs.name_suffix }} -->
