@@ -157,10 +157,19 @@ python-examples-test:
 	# Drop infino from the requirements; the from-source build above is what runs.
 	grep -v '^[[:space:]]*infino' infino-python/examples/requirements.txt \
 		| infino-python/.venv/bin/pip install -q -r /dev/stdin
+	# The langchain examples add the langchain-infino integration and its stack.
+	# Strip every infino line (incl. langchain-infino) so pip never pulls infino
+	# from PyPI over the from-source build; install langchain-infino with --no-deps
+	# so it links against the build above instead of dragging in its own infino.
+	grep -v 'infino' infino-python/examples/langchain/requirements.txt \
+		| infino-python/.venv/bin/pip install -q -r /dev/stdin
+	infino-python/.venv/bin/pip install -q --no-deps langchain-infino
 	infino-python/.venv/bin/pip install -q nbconvert ipykernel
 	# Warm the shared embedding model so parallel workers don't race the download.
 	PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
 		-c "from _shared.embedding import _get_model; _get_model()" >/dev/null
+	# Run every example notebook, including the langchain/ suite. Notebooks that
+	# need an LLM degrade to a printed note when no key is set (e.g. fork PRs).
 	@ls infino-python/examples/*/[0-9]*.ipynb | \
 	PY=infino-python/.venv/bin/python xargs -P $(CONCURRENT_EXAMPLE_TESTS) -I {} \
 		sh -c 'echo "executing {}"; "$$PY" -m nbconvert --to notebook --execute \
