@@ -17,6 +17,7 @@ needs an LLM key; each notebook says so up front and skips the crew without one.
 | Notebook | What it shows | LLM |
 | -------- | ------------- | --- |
 | [`01_support_triage_crew.ipynb`](01_support_triage_crew.ipynb) | A researcher → resolver crew over **one** Infino store: it answers an error code by exact keyword (BM25), a "how do I…" by meaning (vector), and prices/counts by SQL — then writes the customer reply. | required |
+| [`02_content_research_crew.ipynb`](02_content_research_crew.ipynb) | A researcher → writer crew that drafts a short, **cited** explainer: the researcher grounds every point in a real document via hybrid search, the writer cites sources by title — no hallucinated sources. | required |
 
 ## Setup
 
