@@ -166,10 +166,10 @@ python-examples-test:
 	infino-python/.venv/bin/pip install -q --no-deps langchain-infino
 	# The crewai examples add crewai-infino the same way: strip every infino line,
 	# install the rest, then add crewai-infino --no-deps so it links against the
-	# from-source build. The version pin lets pip accept the pre-release.
+	# from-source build instead of pulling its own infino.
 	grep -v 'infino' infino-python/examples/crewai/requirements.txt \
 		| infino-python/.venv/bin/pip install -q -r /dev/stdin
-	infino-python/.venv/bin/pip install -q --no-deps "crewai-infino>=0.1.0rc1"
+	infino-python/.venv/bin/pip install -q --no-deps "crewai-infino>=0.1.0"
 	infino-python/.venv/bin/pip install -q nbconvert ipykernel
 	# Warm the shared embedding model so parallel workers don't race the download.
 	PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
