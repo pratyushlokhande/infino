@@ -21,6 +21,7 @@ RowData: TypeAlias = RecordBatch | ArrowTable | Sequence[Mapping[str, Any]]
 def connect(
     uri: str,
     *,
+    storage_options: Mapping[str, str] | None = ...,
     endpoint: str | None = ...,
     region: str | None = ...,
     access_key: str | None = ...,

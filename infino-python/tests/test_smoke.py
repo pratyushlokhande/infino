@@ -94,6 +94,21 @@ def test_connect_rejects_partial_s3_credentials():
         infino.connect("s3://bucket/prefix", access_key="only-this")
 
 
+def test_connect_accepts_storage_options(tmp_path):
+    # storage_options is a no-op for local storage but must parse and apply.
+    db = infino.connect(str(tmp_path / "catalog"), storage_options={"aws_region": "us-east-1"})
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "the quick brown fox"}])
+    assert t.token_match("title", "fox").num_rows == 1
+
+
+def test_connect_rejects_unknown_storage_option():
+    # An unknown key surfaces at connect time (backend error), not a
+    # silent drop.
+    with pytest.raises(RuntimeError, match="not_a_real_key"):
+        infino.connect("s3://bucket/prefix", storage_options={"not_a_real_key": "x"})
+
+
 def test_query_sql_returns_pyarrow_table():
     db = infino.connect("memory://")
     table = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))

@@ -14,6 +14,7 @@
 //! maturin — it consumes the core crate's curated public API only (no
 //! `test-helpers`), so it is also a public-surface consumer test.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
@@ -77,18 +78,19 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 }
 
 /// Open (or create) a catalog rooted at `uri`. Storage config the URI
-/// can't carry is passed as keyword arguments: explicit S3 endpoint +
-/// static credentials, and the optional local disk cache (`cache_dir`,
-/// `cache_budget_bytes`, `cold_fetch_mode`). Omit all for local /
-/// `memory://` / ambient-credential S3.
+/// can't carry is passed as keyword arguments: `storage_options` (a map
+/// of `object_store` config keys — `aws_*` / `azure_*`), the S3-endpoint
+/// shorthand, and the optional local disk cache. Omit all for local /
+/// `memory://` / ambient-credential object storage.
 // Flat kwargs are the intended Python API; a config struct would change it.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (uri, *, endpoint=None, region=None, access_key=None, secret_key=None,
-                    cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None))]
+#[pyo3(signature = (uri, *, storage_options=None, endpoint=None, region=None, access_key=None,
+                    secret_key=None, cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
+    storage_options: Option<HashMap<String, String>>,
     endpoint: Option<String>,
     region: Option<String>,
     access_key: Option<String>,
@@ -115,6 +117,13 @@ fn connect(
             let secret_key = secret_key
                 .ok_or_else(|| PyValueError::new_err("secret_key is required for an S3 endpoint"))?;
             opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
+            has_options = true;
+        }
+        // Applied after the shorthand so an explicit key wins on overlap.
+        if let Some(options) = storage_options {
+            for (key, value) in options {
+                opts = opts.with_storage_option(key, value);
+            }
             has_options = true;
         }
         if let Some(dir) = cache_dir {
