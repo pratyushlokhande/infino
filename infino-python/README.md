@@ -255,7 +255,7 @@ query. Common keys:
 | Backend | Keys |
 | ------- | ---- |
 | S3      | `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, `aws_session_token`, `aws_endpoint` |
-| Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id` / `_client_secret` / `_tenant_id` |
+| Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
 
 The full set is whatever `object_store` accepts for the backend; an
 unknown key is rejected at `connect`.
