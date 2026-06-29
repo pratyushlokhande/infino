@@ -74,6 +74,24 @@ class Table:
         value: str,
         projection: Sequence[str] | None = ...,
     ) -> ArrowTable: ...
+    def bm25_search_prefix(
+        self,
+        column: str,
+        prefix: str,
+        k: int,
+        projection: Sequence[str] | None = ...,
+    ) -> ArrowTable: ...
+    def hybrid_search(
+        self,
+        text_column: str,
+        text_query: str,
+        vector_column: str,
+        vector_query: Sequence[float],
+        k: int,
+        mode: BoolMode | None = ...,
+        nprobe: int | None = ...,
+        projection: Sequence[str] | None = ...,
+    ) -> ArrowTable: ...
     def delete(self, predicate: str) -> MutationStats: ...
     def update(self, predicate: str, new_rows: RowData) -> MutationStats: ...
     def optimize(self, settings: OptimizeOptions | None = ...) -> None: ...

@@ -460,6 +460,72 @@ impl Table {
         batches_to_pyarrow_table(py, batches)
     }
 
+    /// Prefix-expanded BM25 search over one FTS column: `prefix` matches
+    /// every indexed term it begins, scored as one BM25 query. Returns a
+    /// pyarrow `Table` like `bm25_search`; `projection` follows the same
+    /// rules.
+    #[pyo3(signature = (column, prefix, k, projection=None))]
+    fn bm25_search_prefix<'py>(
+        &self,
+        py: Python<'py>,
+        column: &str,
+        prefix: &str,
+        k: usize,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let batches = py
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner.bm25_search_prefix(column, prefix, k, names.as_deref())
+            })
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
+    }
+
+    /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
+    /// `text_column` / `text_query` (under `mode`) drive BM25;
+    /// `vector_column` / `vector_query` (with optional `nprobe`) drive
+    /// vector kNN. `k` bounds each retriever and the fused result.
+    /// Returns a pyarrow `Table` like `bm25_search`, with `score` the
+    /// fused RRF score (higher is better); `projection` follows the same
+    /// rules.
+    #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn hybrid_search<'py>(
+        &self,
+        py: Python<'py>,
+        text_column: &str,
+        text_query: &str,
+        vector_column: &str,
+        vector_query: Vec<f32>,
+        k: usize,
+        mode: Option<&str>,
+        nprobe: Option<usize>,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mode = parse_mode(mode)?;
+        let mut opts = VectorSearchOptions::new();
+        if let Some(n) = nprobe {
+            opts = opts.with_nprobe(n);
+        }
+        let batches = py
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner.hybrid_search(
+                    text_column,
+                    text_query,
+                    mode,
+                    vector_column,
+                    &vector_query,
+                    opts,
+                    k,
+                    names.as_deref(),
+                )
+            })
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
+    }
+
     /// Delete rows matching a SQL predicate string, e.g. `"status = 'spam'"`.
     /// Needs durable storage — a `memory://` table raises.
     fn delete(&self, py: Python<'_>, predicate: &str) -> PyResult<MutationStats> {

@@ -375,3 +375,77 @@ def test_filtered_vector_search():
         t.vector_search(
             "emb", onehot(0), 10, filter_column="title", filter_query="billing", filter_mode="xor"
         )
+
+
+def test_bm25_search_prefix_matches_sql_tvf():
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox", "a lazy dog"]))
+
+    # "qui" expands to "quick" → the fox row only.
+    hits = t.bm25_search_prefix("title", "qui", 10)
+    assert hits.num_rows == 1
+    assert "_id" in hits.column_names and "score" in hits.column_names
+
+    # Direct call and the SQL table function agree on the `_id` set.
+    via_sql = db.query_sql("SELECT _id FROM bm25_search_prefix('docs', 'title', 'qui', 10)")
+    direct_ids = set(t.bm25_search_prefix("title", "qui", 10)["_id"].to_pylist())
+    assert direct_ids == set(via_sql["_id"].to_pylist())
+
+    # An unmatched prefix returns no rows.
+    assert t.bm25_search_prefix("title", "zzz", 10).num_rows == 0
+
+
+def test_hybrid_search_fuses_text_and_vector():
+    db = infino.connect("memory://")
+    dim = 16
+
+    def onehot(i: int) -> list[float]:
+        v = [0.0] * dim
+        v[i] = 1.0
+        return v
+
+    schema = pa.schema([
+        pa.field("title", pa.large_utf8(), nullable=False),
+        pa.field("emb", pa.list_(pa.float32(), dim), nullable=False),
+    ])
+    t = db.create_table(
+        "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, 1, "cosine")
+    )
+    t.append(
+        pa.record_batch(
+            [
+                pa.array(["rust async", "python data", "rust systems"], type=pa.large_utf8()),
+                pa.array([onehot(0), onehot(1), onehot(2)], type=pa.list_(pa.float32(), dim)),
+            ],
+            schema=schema,
+        )
+    )
+
+    hits = t.hybrid_search("title", "rust", "emb", onehot(0), 10)
+    assert hits.num_rows >= 1
+    assert "_id" in hits.column_names and "score" in hits.column_names
+    # RRF score is higher-is-better, so rows come back descending.
+    scores = hits["score"].to_pylist()
+    assert scores == sorted(scores, reverse=True)
+
+    # Direct call and the SQL table function agree on the `_id` set
+    # (the TVF fixes mode="or" and default nprobe, so match it).
+    csv = ",".join("1" if d == 0 else "0" for d in range(dim))
+    via_sql = db.query_sql(
+        f"SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '{csv}', 10)"
+    )
+    direct_ids = set(t.hybrid_search("title", "rust", "emb", onehot(0), 10)["_id"].to_pylist())
+    assert direct_ids == set(via_sql["_id"].to_pylist())
+
+    # Invalid mode is rejected.
+    with pytest.raises(ValueError):
+        t.hybrid_search("title", "rust", "emb", onehot(0), 10, mode="xor")
+
+    # A non-indexed text column raises a clear error.
+    with pytest.raises(Exception):
+        t.hybrid_search("missing", "rust", "emb", onehot(0), 10)
+
+    # A wrong-dimension query vector raises.
+    with pytest.raises(Exception):
+        t.hybrid_search("title", "rust", "emb", [1.0, 2.0, 3.0], 10)
