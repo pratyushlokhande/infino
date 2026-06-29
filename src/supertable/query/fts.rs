@@ -1609,6 +1609,31 @@ mod tests {
     }
 
     #[test]
+    fn supertable_bm25_search_prefix_rows_default_and_projected() {
+        let st = seeded_three_doc_supertable();
+
+        // "qui" expands to "quick" → docs 0 ("the quick brown fox") and
+        // 2 ("quick thinking"). Bare call → `_id` + `score` only.
+        let bare = st
+            .bm25_search_prefix("title", "qui", 10, None)
+            .expect("prefix rows");
+        assert_eq!(bare.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert_eq!(bare[0].num_columns(), 2, "_id + score");
+
+        // Named projection materializes the requested columns.
+        let rows = st
+            .bm25_search_prefix("title", "qui", 10, Some(&["_id", "title", "score"]))
+            .expect("prefix projected rows");
+        assert_eq!(rows[0].num_columns(), 3);
+
+        // An unmatched prefix returns no rows.
+        let empty = st
+            .bm25_search_prefix("title", "zzz", 10, None)
+            .expect("empty prefix");
+        assert_eq!(empty.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    }
+
+    #[test]
     fn supertable_token_match_and_exact_match_rows() {
         let st = seeded_three_doc_supertable();
 

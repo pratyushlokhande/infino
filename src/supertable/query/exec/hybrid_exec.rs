@@ -939,6 +939,22 @@ mod tests {
             .expect("hybrid_search rows");
         let direct = id_set(&rows);
         assert!(!direct.is_empty(), "direct call returns rows");
+        assert_eq!(rows[0].num_columns(), 2, "_id + score, no scalar decode");
+
+        // Named projection materializes the requested scalar column.
+        let projected = st
+            .hybrid_search(
+                "title",
+                "async",
+                BoolMode::Or,
+                "emb",
+                &qv,
+                VectorSearchOptions::new(),
+                8,
+                Some(&["_id", "title", "score"]),
+            )
+            .expect("hybrid_search projected");
+        assert_eq!(projected[0].num_columns(), 3);
 
         let via_sql = id_set(
             &st.reader()

@@ -387,6 +387,10 @@ def test_bm25_search_prefix_matches_sql_tvf():
     assert hits.num_rows == 1
     assert "_id" in hits.column_names and "score" in hits.column_names
 
+    # Projection materializes the named scalar column.
+    projected = t.bm25_search_prefix("title", "qui", 10, projection=["_id", "title", "score"])
+    assert projected.column_names == ["_id", "title", "score"]
+
     # Direct call and the SQL table function agree on the `_id` set.
     via_sql = db.query_sql("SELECT _id FROM bm25_search_prefix('docs', 'title', 'qui', 10)")
     direct_ids = set(t.bm25_search_prefix("title", "qui", 10)["_id"].to_pylist())
@@ -428,6 +432,12 @@ def test_hybrid_search_fuses_text_and_vector():
     # RRF score is higher-is-better, so rows come back descending.
     scores = hits["score"].to_pylist()
     assert scores == sorted(scores, reverse=True)
+
+    # Projection materializes the named scalar column.
+    projected = t.hybrid_search(
+        "title", "rust", "emb", onehot(0), 10, projection=["_id", "title", "score"]
+    )
+    assert projected.column_names == ["_id", "title", "score"]
 
     # Direct call and the SQL table function agree on the `_id` set
     # (the TVF fixes mode="or" and default nprobe, so match it).
