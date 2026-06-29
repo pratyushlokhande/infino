@@ -64,7 +64,9 @@ use datafusion::{
 use futures::{future, stream};
 
 use super::{
-    common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits, resolve_hits_named},
+    common::{
+        arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits, resolve_hits_named,
+    },
     vector_exec::arg_to_query_vector,
 };
 use crate::{
