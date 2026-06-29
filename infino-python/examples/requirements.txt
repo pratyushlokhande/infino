@@ -5,4 +5,5 @@ pyarrow>=14
 duckdb>=1                  # read superfiles as plain Parquet (parquet_interop.py)
 sentence-transformers>=3   # local embeddings, no API key needed
 datasets>=2               # pulls the real public corpora from HuggingFace
+tenacity>=8               # retry/backoff around transient HuggingFace Hub errors
 openai>=1.40              # optional: LLM answers (Azure AI Foundry or OpenAI)

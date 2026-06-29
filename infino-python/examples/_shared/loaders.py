@@ -10,7 +10,18 @@ import os
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 
-from datasets import load_dataset
+from datasets import load_dataset as _hf_load_dataset
+from huggingface_hub.utils import HfHubHTTPError
+from requests.exceptions import RequestException
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+# The Hub intermittently 5xxs or times out; retry transient failures with backoff.
+load_dataset = retry(
+    retry=retry_if_exception_type((HfHubHTTPError, RequestException)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, max=32),
+    reraise=True,
+)(_hf_load_dataset)
 
 
 def load_arxiv(n: int = 200) -> list[dict]:
