@@ -225,7 +225,7 @@ fn storage_options_from_env(env_to_key: &[(&str, &str)]) -> HashMap<String, Stri
 /// Standard S3 credential options from the AWS environment.
 /// `AWS_DEFAULT_REGION` is listed before `AWS_REGION` so the latter wins
 /// when both are set (matching AWS precedence; equal keys, last wins).
-pub fn real_s3_storage_options() -> HashMap<String, String> {
+pub fn s3_storage_options_from_env() -> HashMap<String, String> {
     storage_options_from_env(&[
         ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
         ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
@@ -237,7 +237,7 @@ pub fn real_s3_storage_options() -> HashMap<String, String> {
 }
 
 /// Standard Azure credential options from the environment.
-pub fn real_azure_storage_options() -> HashMap<String, String> {
+pub fn azure_storage_options_from_env() -> HashMap<String, String> {
     storage_options_from_env(&[
         ("AZURE_STORAGE_ACCOUNT_NAME", "azure_storage_account_name"),
         ("AZURE_STORAGE_ACCOUNT_KEY", "azure_storage_account_key"),
@@ -314,14 +314,14 @@ impl Backend {
         match self {
             Self::S3sFs => None,
             Self::S3 { bucket } => Some(Arc::new(
-                S3StorageProvider::new_with_prefix(bucket, prefix, &real_s3_storage_options())
+                S3StorageProvider::new_with_prefix(bucket, prefix, &s3_storage_options_from_env())
                     .expect("real S3 provider"),
             )),
             Self::Azure { container } => Some(Arc::new(
                 AzureStorageProvider::new_with_prefix(
                     container,
                     prefix,
-                    &real_azure_storage_options(),
+                    &azure_storage_options_from_env(),
                 )
                 .expect("real Azure provider"),
             )),

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 /// Real-Azure credential options from the `AZURE_STORAGE_*` environment,
 /// for the gated `INFINO_TEST_REAL_AZURE` tests. Infino's provider no
 /// longer reads the environment; the test passes these as config.
-pub fn real_azure_storage_options() -> HashMap<String, String> {
+pub fn azure_storage_options_from_env() -> HashMap<String, String> {
     [
         ("AZURE_STORAGE_ACCOUNT_NAME", "azure_storage_account_name"),
         ("AZURE_STORAGE_ACCOUNT_KEY", "azure_storage_account_key"),

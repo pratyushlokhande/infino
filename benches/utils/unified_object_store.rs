@@ -513,7 +513,7 @@ async fn setup_bench_fixture(superfile: &Bytes) -> BenchFixture {
             S3StorageProvider::new_with_prefix(
                 &bucket,
                 &prefix,
-                &crate::tiers::real_s3_storage_options(),
+                &crate::tiers::s3_storage_options_from_env(),
             )
             .expect("real S3 benchmark provider"),
         );
@@ -1548,7 +1548,7 @@ pub(crate) mod diag {
             S3StorageProvider::new_with_prefix(
                 &bucket,
                 &prefix,
-                &crate::tiers::real_s3_storage_options(),
+                &crate::tiers::s3_storage_options_from_env(),
             )
             .expect("real S3 provider"),
         );
@@ -1842,7 +1842,7 @@ pub(crate) mod diag {
         let cleanup_storage = S3StorageProvider::new_with_prefix(
             &bucket,
             &prefix,
-            &crate::tiers::real_s3_storage_options(),
+            &crate::tiers::s3_storage_options_from_env(),
         )
         .expect("real S3 cleanup provider");
         let keys = cleanup_keys.lock().unwrap().clone();
