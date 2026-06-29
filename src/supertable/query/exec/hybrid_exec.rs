@@ -163,9 +163,7 @@ impl Supertable {
     /// `text_col` / `q_text` (under `mode`) drive BM25; `vec_col` /
     /// `q_vec` (with `options`, e.g. `nprobe`) drive vector kNN. `k`
     /// bounds each retriever and the fused result. `projection` follows
-    /// the same rules as [`Supertable::bm25_search`]. Equivalent to the
-    /// `hybrid_search(text_col, q_text, vec_col, q_vec, k)` SQL table
-    /// function (which fixes `mode` to `Or` and uses default `options`).
+    /// the same rules as [`Supertable::bm25_search`].
     #[allow(clippy::too_many_arguments)]
     pub fn hybrid_search(
         &self,

@@ -996,9 +996,6 @@ impl Supertable {
     /// as a single BM25 query. Returns Arrow rows best-score-first, like
     /// [`Supertable::bm25_search`]. `projection` follows the same rules.
     ///
-    /// Equivalent to the `bm25_search_prefix(column, prefix, k)` SQL
-    /// table function.
-    ///
     /// ```
     /// # use std::sync::Arc;
     /// # use arrow_array::{LargeStringArray, RecordBatch};
