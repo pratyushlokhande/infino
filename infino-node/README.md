@@ -226,23 +226,42 @@ docs.optimize({ targetSuperfileSizeMb: 256, minFillPercent: 50 });
 
 `connect` selects the backend from the URI:
 
-| URI                   | Backend                                  |
-| --------------------- | ---------------------------------------- |
-| `./data`, `/abs/path` | Local filesystem                         |
-| `s3://bucket/prefix`  | Amazon S3 / S3-compatible object storage |
-| `memory://`           | In-process, ephemeral (testing)          |
+| URI                      | Backend                                  |
+| ------------------------ | ---------------------------------------- |
+| `./data`, `/abs/path`    | Local filesystem                         |
+| `s3://bucket/prefix`     | Amazon S3 / S3-compatible object storage |
+| `az://container/prefix`  | Azure Blob Storage                       |
+| `memory://`              | In-process, ephemeral (testing)          |
 
-For S3-compatible stores that need an explicit endpoint and static credentials,
-pass them in `options` (omit to use ambient AWS credentials):
+Credentials go in `storageOptions`, keyed by the standard `object_store` config
+strings (`aws_*` / `azure_*` — the same names the AWS and Azure SDKs use). Omit
+them to use ambient cloud identity (IAM instance role / managed identity);
+infino reads no credentials from the environment.
 
 ```javascript
+// S3
 const db = connect("s3://bucket/prefix", {
-  endpoint: "https://s3.example.com",
-  region: "us-east-1",
-  accessKey: "…",
-  secretKey: "…",
+  storageOptions: {
+    aws_access_key_id: "…",
+    aws_secret_access_key: "…",
+    aws_region: "us-east-1",
+  },
+});
+
+// Azure
+const db = connect("az://container/prefix", {
+  storageOptions: {
+    azure_storage_account_name: "…",
+    azure_storage_account_key: "…",
+  },
 });
 ```
+
+`connect` probes the backend before returning, so wrong credentials or an
+unreachable bucket throw immediately instead of failing on the first query. An
+unknown key is rejected at `connect`. For an S3-compatible endpoint (MinIO / R2
+/ Ceph), `endpoint` / `region` / `accessKey` / `secretKey` remain as a shorthand
+for the matching `aws_*` options.
 
 ### Local disk cache
 

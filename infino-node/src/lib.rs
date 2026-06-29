@@ -28,6 +28,7 @@
 //! plain JS objects `{ id, score }`; query-vector arrays cross as
 //! `Float32Array` (by reference, no copy).
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -188,6 +189,10 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
 /// disk cache.
 #[napi(object)]
 pub struct ConnectOptions {
+    /// Credentials/tuning for the URI-selected backend, keyed by
+    /// `object_store` config strings (`aws_*` / `azure_*`). The general
+    /// path for any cloud; an unknown key is rejected at `connect`.
+    pub storage_options: Option<HashMap<String, String>>,
     /// S3-compatible endpoint; requires `region`, `accessKey`, `secretKey`.
     pub endpoint: Option<String>,
     pub region: Option<String>,
@@ -304,8 +309,9 @@ impl IndexSpec {
 }
 
 /// Open (or create) a catalog rooted at `uri` (local dir, `memory://`, or
-/// object-store prefix). S3-compatible static credentials are passed via
-/// `options` (the JS-idiomatic form of the Rust `ConnectOptions`).
+/// object-store prefix). Credentials are passed via `options.storageOptions`
+/// (the JS-idiomatic form of the Rust `ConnectOptions`). Object-store backends
+/// are probed before returning, so bad credentials fail at `connect`.
 #[napi]
 pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connection> {
     let inner = match options {
@@ -324,6 +330,12 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
                     Error::new(Status::InvalidArg, "secretKey is required with endpoint")
                 })?;
                 opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
+            }
+            // Applied after the shorthand so an explicit key wins on overlap.
+            if let Some(map) = o.storage_options {
+                for (key, value) in map {
+                    opts = opts.with_storage_option(key, value);
+                }
             }
             if let Some(dir) = o.cache_dir {
                 opts = opts.with_cache_dir(dir);
