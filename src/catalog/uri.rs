@@ -151,6 +151,6 @@ mod tests {
 
     #[test]
     fn rejects_unknown_scheme() {
-        assert!(parse_uri("gs://bucket/x").is_err());
+        assert!(parse_uri("gdrive://bucket/x").is_err());
     }
 }

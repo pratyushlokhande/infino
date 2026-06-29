@@ -205,12 +205,14 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
 /// `INFINO_TEST_REAL_S3` test. Infino's provider no longer reads the
 /// environment; the test passes these as config.
 fn real_s3_storage_options() -> std::collections::HashMap<String, String> {
+    // AWS_DEFAULT_REGION before AWS_REGION so the latter wins when both
+    // are set (equal keys, last insert wins).
     [
         ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
         ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
         ("AWS_SESSION_TOKEN", "aws_session_token"),
-        ("AWS_REGION", "aws_region"),
         ("AWS_DEFAULT_REGION", "aws_region"),
+        ("AWS_REGION", "aws_region"),
     ]
     .iter()
     .filter_map(|(env, key)| std::env::var(env).ok().map(|v| (key.to_string(), v)))

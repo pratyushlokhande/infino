@@ -22,7 +22,7 @@
 //! from the environment. [`Self::new_with_prefix`] is the primary path;
 //! [`Self::new_with_endpoint`] is a convenience for s3s-fs / MinIO / Ceph.
 
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{ops::Range, str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -36,9 +36,23 @@ use object_store::{
 
 use super::{ObjectMeta, StorageError, StorageOptions, StorageProvider, options::apply, retry};
 
-/// Its presence in `opts` selects the S3-compatible-endpoint build
-/// profile (path-style, object_store client defaults) over the AWS one.
+/// Config key written by [`S3StorageProvider::new_with_endpoint`] to point
+/// at a custom endpoint. Detection accepts any object_store alias (see
+/// [`has_custom_endpoint`]); this is just the canonical name to set.
 const ENDPOINT_KEY: &str = "aws_endpoint";
+
+/// Whether `opts` names a custom S3 endpoint, under any object_store alias
+/// (`aws_endpoint`, `endpoint`, `aws_endpoint_url`, …). A custom endpoint
+/// selects the S3-compatible build profile (path-style, default client
+/// options) over the AWS one.
+fn has_custom_endpoint(opts: &StorageOptions) -> bool {
+    opts.keys().any(|k| {
+        matches!(
+            AmazonS3ConfigKey::from_str(k),
+            Ok(AmazonS3ConfigKey::Endpoint | AmazonS3ConfigKey::S3Endpoint)
+        )
+    })
+}
 
 /// S3-backed `StorageProvider`. Cheap to clone; the inner
 /// `AmazonS3` shares its HTTP client across clones.
@@ -70,13 +84,12 @@ impl S3StorageProvider {
     ) -> Result<Self, StorageError> {
         let bucket = bucket.into();
         let uri = format!("s3://{bucket}");
-        let has_endpoint = opts.keys().any(|k| k.eq_ignore_ascii_case(ENDPOINT_KEY));
 
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&bucket)
             .with_conditional_put(S3ConditionalPut::ETagMatch)
             .with_retry(retry::config());
-        builder = if has_endpoint {
+        builder = if has_custom_endpoint(opts) {
             builder.with_virtual_hosted_style_request(false)
         } else {
             builder.with_client_options(tuned_client_options())
@@ -641,6 +654,28 @@ mod tests {
         let opts =
             StorageOptions::from([("azure_storage_account_name".to_string(), "acct".to_string())]);
         assert!(S3StorageProvider::new_with_prefix("b", "", &opts).is_err());
+    }
+
+    #[test]
+    fn detects_custom_endpoint_under_any_alias() {
+        for key in [
+            "aws_endpoint",
+            "endpoint",
+            "aws_endpoint_url",
+            "aws_endpoint_url_s3",
+        ] {
+            let opts = StorageOptions::from([(key.to_string(), "http://localhost".to_string())]);
+            assert!(
+                has_custom_endpoint(&opts),
+                "{key} should select the endpoint profile"
+            );
+        }
+    }
+
+    #[test]
+    fn no_endpoint_for_credentials_only() {
+        let opts = StorageOptions::from([("aws_region".to_string(), "us-east-1".to_string())]);
+        assert!(!has_custom_endpoint(&opts));
     }
 
     #[test]
