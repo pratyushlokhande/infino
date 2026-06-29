@@ -82,6 +82,9 @@ docs.append([{"title": "the quick brown fox"}, {"title": "a lazy dog"}])
 docs.bm25_search("title", "quick fox", k=10)               # OR by default
 docs.bm25_search("title", "quick fox", k=10, mode="and")   # require all terms
 
+# Prefix-expanded BM25 — "qui" matches "quick", "quirk", …
+docs.bm25_search_prefix("title", "qui", k=10)
+
 # Unranked matching (score is 0.0): every row containing the term(s),
 # or an exact whole-value match.
 docs.token_match("title", "fox")
@@ -116,6 +119,23 @@ the global top-k. `filter_mode` is `"or"` (default) or `"and"`:
 ```python
 vecs.vector_search("emb", query_vector, k=10,
                    filter_column="body", filter_query="cancel subscription")
+```
+
+## Hybrid search
+
+`hybrid_search` runs BM25 and vector kNN over the same table and fuses the
+two rankings with reciprocal-rank fusion — a higher `score` is a better
+blended match. The table needs both an FTS column and a vector column:
+
+```python
+docs = db.create_table(
+    "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, n_cent=256, metric="cosine")
+)
+
+docs.hybrid_search("title", "quick fox", "emb", query_vector, k=10)
+# mode (BM25 boolean mode) and nprobe (vector probes) are optional:
+docs.hybrid_search("title", "quick fox", "emb", query_vector, k=10,
+                   mode="and", nprobe=32)
 ```
 
 ## SQL
@@ -164,9 +184,11 @@ db.query_sql("""
 """)
 ```
 
-`hybrid_search` and `bm25_search_prefix` are reachable only through SQL.
-The SQL `vector_search` takes no `nprobe` or filter arguments — use the
-`Table.vector_search` method when you need those.
+Every table function has a direct `Table` method equivalent
+(`bm25_search`, `bm25_search_prefix`, `vector_search`, `hybrid_search`,
+`token_match`, `exact_match`); the SQL forms drop the optional arguments
+the methods expose — SQL `vector_search` and `hybrid_search` take no
+`nprobe` (or filter), so use the `Table` methods when you need those.
 
 ## Projections
 
