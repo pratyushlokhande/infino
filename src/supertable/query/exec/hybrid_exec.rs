@@ -45,6 +45,7 @@
 
 use std::{any::Any, cmp::Ordering, collections::HashMap, fmt, sync::Arc};
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
@@ -63,14 +64,15 @@ use datafusion::{
 use futures::{future, stream};
 
 use super::{
-    common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits},
+    common::{arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits, resolve_hits_named},
     vector_exec::arg_to_query_vector,
 };
 use crate::{
+    InfinoError,
     superfile::{fts::reader::BoolMode, reader::VectorSearchOptions},
     supertable::{
         QueryError,
-        handle::{SupertableReader, WeakReader},
+        handle::{Supertable, SupertableReader, WeakReader},
         manifest::SuperfileUri,
         query::SuperfileHit,
     },
@@ -150,6 +152,45 @@ impl SupertableReader {
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         self.block_on(self.hybrid_search_async(text_col, q_text, mode, vec_col, q_vec, options, k))
+    }
+}
+
+impl Supertable {
+    /// Hybrid BM25 + vector search over the current snapshot, fusing the
+    /// two rankings with reciprocal-rank fusion and returning Arrow rows
+    /// best-score-first (RRF score, higher is better).
+    ///
+    /// `text_col` / `q_text` (under `mode`) drive BM25; `vec_col` /
+    /// `q_vec` (with `options`, e.g. `nprobe`) drive vector kNN. `k`
+    /// bounds each retriever and the fused result. `projection` follows
+    /// the same rules as [`Supertable::bm25_search`]. Equivalent to the
+    /// `hybrid_search(text_col, q_text, vec_col, q_vec, k)` SQL table
+    /// function (which fixes `mode` to `Or` and uses default `options`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search(
+        &self,
+        text_col: &str,
+        q_text: &str,
+        mode: BoolMode,
+        vec_col: &str,
+        q_vec: &[f32],
+        options: VectorSearchOptions,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        let reader = self.reader();
+        let hits = reader
+            .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)
+            .map_err(InfinoError::from)?;
+        let batch = self
+            .block_on_query(resolve_hits_named(
+                &reader,
+                &hits,
+                projection,
+                "hybrid_search",
+            ))
+            .map_err(|e| InfinoError::Query(e.to_string()))?;
+        Ok(vec![batch])
     }
 }
 
@@ -875,6 +916,41 @@ mod tests {
         for w in hits.windows(2) {
             assert!(w[0].score >= w[1].score, "fused scores descending");
         }
+    }
+
+    #[test]
+    fn hybrid_search_public_rows_match_sql_tvf() {
+        // The public row-returning `Supertable::hybrid_search` must yield
+        // the same `_id` set the `hybrid_search` SQL table function does
+        // (the SQL TVF fixes mode = Or and default options, so match it).
+        let dim = 16;
+        let st = demo(dim);
+        let mut qv = vec![0.0_f32; dim];
+        qv[0] = 1.0;
+        let rows = st
+            .hybrid_search(
+                "title",
+                "async",
+                BoolMode::Or,
+                "emb",
+                &qv,
+                VectorSearchOptions::new(),
+                8,
+                Some(&["_id", "score"]),
+            )
+            .expect("hybrid_search rows");
+        let direct = id_set(&rows);
+        assert!(!direct.is_empty(), "direct call returns rows");
+
+        let via_sql = id_set(
+            &st.reader()
+                .query_sql(&format!(
+                    "SELECT _id FROM hybrid_search('title', 'async', 'emb', '{}', 8)",
+                    csv_one_hot(dim, 0)
+                ))
+                .expect("sql tvf"),
+        );
+        assert_eq!(direct, via_sql, "direct call and SQL TVF agree on _id set");
     }
 
     /// Flatten an `EXPLAIN` result into one searchable string — exercises

@@ -991,6 +991,51 @@ impl Supertable {
             .map_err(InfinoError::from)
     }
 
+    /// Prefix-expanded BM25 search over one FTS column: `prefix` is
+    /// expanded to every indexed term it begins, and the union is scored
+    /// as a single BM25 query. Returns Arrow rows best-score-first, like
+    /// [`Supertable::bm25_search`]. `projection` follows the same rules.
+    ///
+    /// Equivalent to the `bm25_search_prefix(column, prefix, k)` SQL
+    /// table function.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::{LargeStringArray, RecordBatch};
+    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # posts.append(&RecordBatch::try_new(
+    /// #     schema, vec![Arc::new(LargeStringArray::from(vec!["the quick brown fox"]))])?)?;
+    /// // "qui" expands to "quick":
+    /// let hits = posts.bm25_search_prefix("body", "qui", 10, None)?;
+    /// assert_eq!(hits[0].num_rows(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn bm25_search_prefix(
+        &self,
+        column: &str,
+        prefix: &str,
+        k: usize,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        let reader = self.reader();
+        let hits = reader
+            .bm25_search_prefix(column, prefix, k)
+            .map_err(InfinoError::from)?;
+        let batch = self
+            .block_on_query(resolve_hits_named(
+                &reader,
+                &hits,
+                projection,
+                "bm25_search_prefix",
+            ))
+            .map_err(|e| InfinoError::Query(e.to_string()))?;
+        Ok(vec![batch])
+    }
+
     /// Unranked token match over one FTS column: every row whose
     /// `column` matches `query`'s tokens under `mode` (`Or` = any token,
     /// `And` = every token). Returns Arrow rows like
