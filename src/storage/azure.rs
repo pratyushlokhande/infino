@@ -239,15 +239,24 @@ impl StorageProvider for AzureStorageProvider {
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = self.path(uri)?;
-        let opts = PutOptions {
-            mode: PutMode::Create,
-            ..Default::default()
-        };
-        self.store
-            .put_opts(&path, PutPayload::from_bytes(bytes), opts)
-            .await
-            .map(|r| r.e_tag)
-            .map_err(|e| translate(uri, e))
+        // Re-issue transient failures like the read paths. Only
+        // `TransientExhausted` re-issues, so an OCC `PreconditionFailed` still
+        // surfaces immediately; a create-only PUT that never landed is safe to retry.
+        retry::with_reissue(|| {
+            let bytes = bytes.clone();
+            async {
+                let opts = PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                };
+                self.store
+                    .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+                    .await
+                    .map(|r| r.e_tag)
+                    .map_err(|e| translate(uri, e))
+            }
+        })
+        .await
     }
 
     async fn put_if_match(
