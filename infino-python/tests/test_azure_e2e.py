@@ -131,6 +131,19 @@ def test_vector_search(db: infino.Connection) -> None:
     assert "_id" in hits.column_names and "score" in hits.column_names
 
 
+def test_bad_credentials_fail_at_connect(azure_uri: str) -> None:
+    # The connect-time probe surfaces bad credentials immediately, not on
+    # the first table operation.
+    with pytest.raises(RuntimeError):
+        infino.connect(
+            azure_uri,
+            storage_options={
+                "azure_storage_account_name": os.environ["AZURE_STORAGE_ACCOUNT_NAME"],
+                "azure_storage_account_key": "d3Jvbmcta2V5",  # valid base64, wrong key
+            },
+        )
+
+
 def test_drop_purge_removes_table(db: infino.Connection) -> None:
     table = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
     table.append([{"title": "ephemeral"}])

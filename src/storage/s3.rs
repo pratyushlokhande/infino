@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn rejects_unknown_storage_option_key() {
         let opts = StorageOptions::from([("not_a_real_key".to_string(), "x".to_string())]);
-        let err = S3StorageProvider::new_with_prefix("b", "", &opts).unwrap_err();
+        let err = S3StorageProvider::new_with_prefix("b", "", &opts).expect_err("bad key");
         assert!(matches!(err, StorageError::Permanent { .. }));
     }
 

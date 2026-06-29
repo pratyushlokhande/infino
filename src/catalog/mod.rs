@@ -76,6 +76,9 @@ pub fn connect(uri: impl AsRef<str>) -> Result<Connection, InfinoError> {
 /// Open (or create) a catalog rooted at `uri` with explicit storage
 /// configuration (credentials / region / endpoint the URI can't carry).
 ///
+/// Object-store backends are probed before returning, so bad credentials
+/// fail at connect rather than on the first table operation.
+///
 /// ```
 /// use infino::{connect_with, ConnectOptions};
 /// let db = connect_with("memory://", ConnectOptions::new())?;
@@ -92,6 +95,8 @@ pub fn connect_with(
         _ => {
             let root = backend_to_provider(&backend, &options)?
                 .expect("non-memory backend yields a storage provider");
+            // Probe now so bad credentials fail at connect, not first use.
+            bridge_sync_to_async(read_catalog(root.as_ref()))?;
             CatalogStore::Storage(root)
         }
     };
