@@ -267,9 +267,9 @@ Common keys:
 The full set is whatever `object_store` accepts for the backend; an unknown key
 is rejected at `connect`. Pass `validate: true` to probe the backend at
 `connect`, so wrong credentials or an unreachable bucket throw there instead of
-on the first query. For an S3-compatible endpoint (MinIO / R2 / Ceph),
-`endpoint` / `region` / `accessKey` / `secretKey` remain as a shorthand for the
-matching `aws_*` options.
+on the first query. For an S3-compatible endpoint (MinIO / R2 / Ceph), set
+`aws_endpoint` (with `aws_allow_http: "true"` for plain HTTP) alongside the
+credentials.
 
 ### Local disk cache
 
@@ -300,9 +300,9 @@ const db = connect("s3://bucket/prefix", {
 ## API reference
 
 - `connect(uri, options?)` — backend from the URI scheme. `options`:
-  S3-compatible credentials (`endpoint`, `region`, `accessKey`, `secretKey` —
-  `endpoint` requires the other three) and, for remote-backed tables, a local
-  disk cache (`cacheDir`, `cacheBudgetBytes`, `coldFetchMode`).
+  `storageOptions` (credentials, keyed by `object_store`'s `aws_*` / `azure_*`
+  strings), `validate`, and a local disk cache (`cacheDir`, `cacheBudgetBytes`,
+  `coldFetchMode`).
 - `Connection`
   - `createTable(name, schema, IndexSpec)` / `openTable(name)` /
     `dropTable(name, purge?)` (`purge = true` also deletes the data) /

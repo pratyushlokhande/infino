@@ -190,14 +190,9 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
 #[napi(object)]
 pub struct ConnectOptions {
     /// Credentials/tuning for the URI-selected backend, keyed by
-    /// `object_store` config strings (`aws_*` / `azure_*`). The general
-    /// path for any cloud; an unknown key is rejected at `connect`.
+    /// `object_store` config strings (`aws_*` / `azure_*`). An unknown key
+    /// is rejected at `connect`.
     pub storage_options: Option<HashMap<String, String>>,
-    /// S3-compatible endpoint; requires `region`, `accessKey`, `secretKey`.
-    pub endpoint: Option<String>,
-    pub region: Option<String>,
-    pub access_key: Option<String>,
-    pub secret_key: Option<String>,
     /// Local disk-cache directory for remote-backed tables.
     pub cache_dir: Option<String>,
     /// Disk-cache budget in bytes (a JS number; up to 2^53).
@@ -322,20 +317,6 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
         None => infino::connect(&uri),
         Some(o) => {
             let mut opts = infino::ConnectOptions::new();
-            // S3 endpoint: all four fields are required together.
-            if let Some(endpoint) = o.endpoint {
-                let region = o.region.ok_or_else(|| {
-                    Error::new(Status::InvalidArg, "region is required with endpoint")
-                })?;
-                let access_key = o.access_key.ok_or_else(|| {
-                    Error::new(Status::InvalidArg, "accessKey is required with endpoint")
-                })?;
-                let secret_key = o.secret_key.ok_or_else(|| {
-                    Error::new(Status::InvalidArg, "secretKey is required with endpoint")
-                })?;
-                opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
-            }
-            // Applied after the shorthand so an explicit key wins on overlap.
             if let Some(map) = o.storage_options {
                 for (key, value) in map {
                     opts = opts.with_storage_option(key, value);
