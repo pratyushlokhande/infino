@@ -161,6 +161,7 @@ pub fn infino::ConnectOptions::with_cache_dir(self, impl core::convert::Into<std
 pub fn infino::ConnectOptions::with_cold_fetch_mode(self, infino::ColdFetchMode) -> Self
 pub fn infino::ConnectOptions::with_s3_endpoint(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::ConnectOptions::with_storage_option(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn infino::ConnectOptions::with_validate(self, bool) -> Self
 impl core::clone::Clone for infino::ConnectOptions
 pub fn infino::ConnectOptions::clone(&self) -> infino::ConnectOptions
 impl core::default::Default for infino::ConnectOptions
