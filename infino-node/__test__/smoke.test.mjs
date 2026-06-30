@@ -164,6 +164,12 @@ test("connect rejects an unknown storageOptions key", () => {
   assert.throws(() => connect("s3://bucket/prefix", { storageOptions: { not_a_real_key: "x" } }));
 });
 
+test("connect does not probe by default", () => {
+  // Default (validate off): a bogus bucket builds the handle without
+  // touching the backend.
+  connect("s3://no-such-bucket-xyzzy/prefix");
+});
+
 test("vector search end-to-end", () => {
   const db = connect("memory://");
   const dim = 16; // infino requires vector dim in [16, 4096]

@@ -205,6 +205,9 @@ pub struct ConnectOptions {
     /// Cold-miss strategy: `"hybrid_with_prefetch"` | `"range_only"` |
     /// `"lazy_foreground_with_background_fill"`.
     pub cold_fetch_mode: Option<String>,
+    /// Probe the object store at `connect` (default `true`) so bad
+    /// credentials fail there, not on first use. `false` constructs offline.
+    pub validate: Option<bool>,
 }
 
 /// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
@@ -346,6 +349,9 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
             if let Some(mode) = o.cold_fetch_mode {
                 opts = opts.with_cold_fetch_mode(cold_fetch_from_str(&mode)?);
             }
+            if let Some(v) = o.validate {
+                opts = opts.with_validate(v);
+            }
             infino::connect_with(&uri, opts)
         }
     }
@@ -372,12 +378,7 @@ impl Connection {
     /// an empty `apache-arrow` table built with the schema) and an
     /// `IndexSpec`.
     #[napi]
-    pub fn create_table(
-        &self,
-        name: String,
-        schema: Buffer,
-        indexes: &IndexSpec,
-    ) -> Result<Table> {
+    pub fn create_table(&self, name: String, schema: Buffer, indexes: &IndexSpec) -> Result<Table> {
         let schema = read_schema_ipc(&schema)?;
         let spec = indexes.to_rust()?;
         let inner = self
@@ -397,7 +398,9 @@ impl Connection {
     /// Drop (unregister) a table.
     #[napi]
     pub fn drop_table(&self, name: String, purge: Option<bool>) -> Result<()> {
-        self.inner.drop_table(&name, purge.unwrap_or(false)).map_err(map_err)
+        self.inner
+            .drop_table(&name, purge.unwrap_or(false))
+            .map_err(map_err)
     }
 
     /// List the catalog's table names.
@@ -435,7 +438,9 @@ impl Table {
         if batches.is_empty() {
             return Ok(());
         }
-        self.inner.append(&self.align_batches(batches)?).map_err(map_err)
+        self.inner
+            .append(&self.align_batches(batches)?)
+            .map_err(map_err)
     }
 
     /// BM25 search over one FTS column. Returns matching rows as an Arrow
@@ -452,8 +457,9 @@ impl Table {
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
         let mode = parse_mode(mode.as_deref())?;
-        let proj: Option<Vec<&str>> =
-            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
             .bm25_search(&column, &query, k as usize, mode, proj.as_deref())
@@ -494,11 +500,19 @@ impl Table {
             }),
             None => None,
         };
-        let proj: Option<Vec<&str>> =
-            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
-            .vector_search(&column, query.as_ref(), k as usize, opts, vfilter, proj.as_deref())
+            .vector_search(
+                &column,
+                query.as_ref(),
+                k as usize,
+                opts,
+                vfilter,
+                proj.as_deref(),
+            )
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }
@@ -516,8 +530,9 @@ impl Table {
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
         let mode = parse_mode(mode.as_deref())?;
-        let proj: Option<Vec<&str>> =
-            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
             .token_match(&column, &query, mode, proj.as_deref())
@@ -535,8 +550,9 @@ impl Table {
         value: String,
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
-        let proj: Option<Vec<&str>> =
-            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
             .exact_match(&column, &value, proj.as_deref())
@@ -623,7 +639,10 @@ impl Table {
         SessionContext::new()
             .parse_sql_expr(predicate, &df_schema)
             .map_err(|e| {
-                Error::new(Status::InvalidArg, format!("invalid predicate {predicate:?}: {e}"))
+                Error::new(
+                    Status::InvalidArg,
+                    format!("invalid predicate {predicate:?}: {e}"),
+                )
             })
     }
 }

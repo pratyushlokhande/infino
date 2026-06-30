@@ -47,6 +47,11 @@ export interface ConnectOptions {
   cacheBudgetBytes?: number;
   /** How cold misses are serviced. */
   coldFetchMode?: "hybrid_with_prefetch" | "range_only" | "lazy_foreground_with_background_fill";
+  /**
+   * Probe the object store at `connect` (default `true`) so bad credentials
+   * fail there, not on first use. `false` constructs the handle offline.
+   */
+  validate?: boolean;
 }
 
 /** Row counts returned by `update` / `delete`. */

@@ -109,10 +109,11 @@ test("vector search", { skip }, () => {
 });
 
 test("bad credentials fail at connect", { skip }, () => {
-  // The connect-time probe surfaces bad credentials immediately, not on
-  // the first table operation.
+  // validate: true opts into the connect-time probe, surfacing bad
+  // credentials immediately instead of on the first table operation.
   assert.throws(() =>
     connect(azureUri(), {
+      validate: true,
       storageOptions: {
         azure_storage_account_name: process.env.AZURE_STORAGE_ACCOUNT_NAME,
         azure_storage_account_key: "d3Jvbmcta2V5", // valid base64, wrong key
