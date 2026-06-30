@@ -132,11 +132,12 @@ def test_vector_search(db: infino.Connection) -> None:
 
 
 def test_bad_credentials_fail_at_connect(azure_uri: str) -> None:
-    # The connect-time probe surfaces bad credentials immediately, not on
-    # the first table operation.
+    # validate=True opts into the connect-time probe, surfacing bad
+    # credentials immediately instead of on the first table operation.
     with pytest.raises(RuntimeError):
         infino.connect(
             azure_uri,
+            validate=True,
             storage_options={
                 "azure_storage_account_name": os.environ["AZURE_STORAGE_ACCOUNT_NAME"],
                 "azure_storage_account_key": "d3Jvbmcta2V5",  # valid base64, wrong key
