@@ -282,6 +282,10 @@ there instead of on the first query. For an S3-compatible endpoint (MinIO /
 R2 / Ceph), set `aws_endpoint` (with `aws_allow_http: "true"` for plain
 HTTP) alongside the credentials.
 
+When a static key rotates, swap it in without reconnecting:
+`db.rotate_credentials(storage_options)` takes effect on the next request
+for the connection and its open tables.
+
 ### Local disk cache
 
 For object-storage-backed catalogs, a local disk cache keeps hot data on

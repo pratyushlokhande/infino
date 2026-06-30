@@ -303,6 +303,12 @@ rather than on the first query. The same options exist in the config file
 (`storage.storage_options`) and both bindings (`storage_options` +
 `validate`).
 
+When a static key rotates, swap it into a live connection without a
+reconnect — `Connection::rotate_credentials(opts)` (Python/Node:
+`rotate_credentials` / `rotateCredentials`) takes effect on the next request
+for that connection and all its open tables. Endpoint/region aren't
+rotatable; changing those needs a reconnect.
+
 ## Architecture
 
 Three docs cover the design, from the high-level tour down to the
