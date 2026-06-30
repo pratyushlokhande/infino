@@ -248,9 +248,7 @@ db = infino.connect("az://container/prefix", storage_options={
 })
 ```
 
-`connect` probes the backend before returning, so wrong credentials or an
-unreachable bucket raise immediately instead of failing on the first
-query. Common keys:
+Common keys:
 
 | Backend | Keys |
 | ------- | ---- |
@@ -258,8 +256,9 @@ query. Common keys:
 | Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
 
 The full set is whatever `object_store` accepts for the backend; an
-unknown key is rejected at `connect`. Pass `validate=False` to skip the
-probe and construct the connection without touching the backend.
+unknown key is rejected at `connect`. Pass `validate=True` to probe the
+backend at `connect`, so wrong credentials or an unreachable bucket fail
+there instead of on the first query.
 
 For an S3-compatible endpoint (MinIO / R2 / Ceph), `endpoint` / `region` /
 `access_key` / `secret_key` remain as a shorthand for the matching
