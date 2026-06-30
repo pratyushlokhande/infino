@@ -30,6 +30,8 @@ use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::{net::TcpListener, runtime::Runtime};
 
+use crate::storage_options::{azure_storage_options_from_env, s3_storage_options_from_env};
+
 const S3S_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const S3S_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 const S3S_REGION: &str = "us-east-1";
@@ -281,11 +283,16 @@ impl Backend {
         match self {
             Self::S3sFs => None,
             Self::S3 { bucket } => Some(Arc::new(
-                S3StorageProvider::new_with_prefix(bucket, prefix).expect("real S3 provider"),
+                S3StorageProvider::new_with_prefix(bucket, prefix, &s3_storage_options_from_env())
+                    .expect("real S3 provider"),
             )),
             Self::Azure { container } => Some(Arc::new(
-                AzureStorageProvider::new_with_prefix(container, prefix)
-                    .expect("real Azure provider"),
+                AzureStorageProvider::new_with_prefix(
+                    container,
+                    prefix,
+                    &azure_storage_options_from_env(),
+                )
+                .expect("real Azure provider"),
             )),
         }
     }

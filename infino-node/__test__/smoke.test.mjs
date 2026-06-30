@@ -150,6 +150,26 @@ test("localfs persists across reconnect", () => {
   assert.equal(db2.openTable("docs").tokenMatch("title", "fox").length, 1);
 });
 
+test("connect accepts storageOptions", () => {
+  // storageOptions is a no-op for local storage but must parse and apply.
+  const dir = mkdtempSync(join(tmpdir(), "infino-node-opts-"));
+  const db = connect(dir, { storageOptions: { aws_region: "us-east-1" } });
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec().fts("title"));
+  docs.append([{ title: "the quick brown fox" }]);
+  assert.equal(docs.tokenMatch("title", "fox").length, 1);
+});
+
+test("connect rejects an unknown storageOptions key", () => {
+  // An unknown key surfaces at connect time, not as a silent drop.
+  assert.throws(() => connect("s3://bucket/prefix", { storageOptions: { not_a_real_key: "x" } }));
+});
+
+test("connect does not probe by default", () => {
+  // Default (validate off): a bogus bucket builds the handle without
+  // touching the backend.
+  connect("s3://no-such-bucket-xyzzy/prefix");
+});
+
 test("vector search end-to-end", () => {
   const db = connect("memory://");
   const dim = 16; // infino requires vector dim in [16, 4096]

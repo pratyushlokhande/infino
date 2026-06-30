@@ -258,3 +258,85 @@ jobs:
       # Frozen fixture → no embedder, key, or network. Reports recall@k + every
       # hybrid miss in the log, and fails only below the tolerance floor.
       - run: cargo run --example locomo-recall -- --fail-under=0.68
+
+  # Gate for `object-store-e2e`: object-store secrets are absent on fork
+  # PRs, so probe for them once and let the e2e job key off the result (a
+  # job-level `if` can't read secrets directly).
+  object-store-e2e-guard:
+    name: Object store e2e (secret check)
+    runs-on: ubuntu-latest
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - id: check
+        run: |
+          if [ -n "${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}" ] && [ -n "${{ secrets.INFINO_REAL_AZURE_CONTAINER }}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Engine end-to-end against a real object store (Azure Blob is the backend
+  # CI has credentials for): the Python and Node bindings run the full
+  # storage_options + connect-probe path over the wire. Non-required, and
+  # skipped when secrets are absent (fork PRs) so a transient outage never
+  # blocks a merge; the bindings' smoke suites are the deterministic gate.
+  object-store-e2e:
+    name: Object store e2e (real Azure Blob)
+    needs: object-store-e2e-guard
+    if: needs.object-store-e2e-guard.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ""
+      INFINO_TEST_REAL_AZURE: "1"
+      AZURE_STORAGE_ACCOUNT_NAME: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+      AZURE_STORAGE_ACCOUNT_KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
+      AZURE_STORAGE_CONTAINER_NAME: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
+      # Run-scoped so cleanup can't touch a parallel run's blobs.
+      INFINO_E2E_PREFIX: e2e/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: Swatinem/rust-cache@v2
+      - name: Python bindings e2e
+        run: |
+          python3 -m pip install --upgrade uv
+          uv venv /tmp/uv-object-store-e2e
+          source /tmp/uv-object-store-e2e/bin/activate
+          uv pip install maturin pytest pyarrow
+          maturin develop --manifest-path infino-python/Cargo.toml
+          python -m pytest infino-python/tests/test_azure_e2e.py -v
+      - name: Node bindings e2e
+        run: |
+          cd infino-node
+          npm install
+          npm run build:debug
+          node --test __test__/azure.e2e.test.mjs
+      # Clears this run's blobs, incl. the catalog object drop_table leaves.
+      # Best-effort: a hiccup must not fail the job.
+      - name: Clean up e2e blobs
+        if: always()
+        continue-on-error: true
+        run: |
+          az storage blob delete-batch \
+            --account-name "$AZURE_STORAGE_ACCOUNT_NAME" \
+            --account-key "$AZURE_STORAGE_ACCOUNT_KEY" \
+            --source "$AZURE_STORAGE_CONTAINER_NAME" \
+            --pattern "$INFINO_E2E_PREFIX/*"

@@ -30,17 +30,23 @@ export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer 
 
 /** Storage and cache config the `connect` URI can't carry. All optional. */
 export interface ConnectOptions {
-  /** S3-compatible endpoint; requires `region`, `accessKey`, `secretKey`. */
-  endpoint?: string;
-  region?: string;
-  accessKey?: string;
-  secretKey?: string;
+  /**
+   * Credentials/tuning for the URI-selected backend, keyed by `object_store`
+   * config strings (`aws_*` / `azure_*`). An unknown key is rejected at
+   * `connect`.
+   */
+  storageOptions?: Record<string, string>;
   /** Local disk-cache directory for remote-backed tables. */
   cacheDir?: string;
   /** Disk-cache budget in bytes. */
   cacheBudgetBytes?: number;
   /** How cold misses are serviced. */
   coldFetchMode?: "hybrid_with_prefetch" | "range_only" | "lazy_foreground_with_background_fill";
+  /**
+   * Probe the object store at `connect` (default `false`). `true` fails fast
+   * on bad credentials instead of on the first table operation.
+   */
+  validate?: boolean;
 }
 
 /** Row counts returned by `update` / `delete`. */

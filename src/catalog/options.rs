@@ -6,20 +6,9 @@
 //! [`connect_with`](crate::connect_with); plain [`connect`](crate::connect)
 //! uses the default.
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use crate::supertable::reader_cache::ColdFetchMode as InternalColdFetchMode;
-
-/// Explicit S3-compatible endpoint + static credentials — for MinIO,
-/// Cloudflare R2, Ceph, or a test S3 server. When unset, S3 uses the
-/// ambient AWS default-credential chain and default region.
-#[derive(Debug, Clone)]
-pub(crate) struct S3Config {
-    pub(crate) endpoint: String,
-    pub(crate) region: String,
-    pub(crate) access_key: String,
-    pub(crate) secret_key: String,
-}
 
 /// How a disk-cache miss is serviced when reading cold superfiles from
 /// object storage. Only meaningful when a disk cache is configured
@@ -57,11 +46,13 @@ impl ColdFetchMode {
 /// `connect` (`s3://…`, `az://…`, `file://…`, `memory://`, or a bare
 /// path), not from these options — `ConnectOptions` carries only what
 /// the URI can't express. The common cases need no options:
-/// `connect("./data")` and `connect("s3://bucket/prefix")` (ambient AWS
-/// credentials) both work with the default.
+/// `connect("./data")` and `connect("s3://bucket/prefix")` (ambient
+/// cloud identity) both work with the default.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
-    pub(crate) s3: Option<S3Config>,
+    /// Credentials/tuning for the URI-selected backend, keyed by
+    /// `object_store` config strings. Empty → ambient cloud identity.
+    pub(crate) storage_options: HashMap<String, String>,
     /// Disk-cache root. `None` (default) → caching off; cold reads go
     /// straight to object storage. Set → a local NVMe tier under this
     /// directory, per table (`<cache_dir>/<table>`).
@@ -71,6 +62,9 @@ pub struct ConnectOptions {
     pub(crate) cache_budget_bytes: Option<u64>,
     /// Cold-fetch strategy when the disk cache is enabled.
     pub(crate) cold_fetch_mode: ColdFetchMode,
+    /// Probe the backend at `connect`. Default `false`; opt in for
+    /// fail-fast on bad credentials.
+    pub(crate) validate: bool,
 }
 
 impl ConnectOptions {
@@ -103,22 +97,32 @@ impl ConnectOptions {
         self
     }
 
-    /// Use an explicit S3-compatible endpoint with static credentials
-    /// (MinIO / R2 / Ceph / a test S3 server) instead of the ambient AWS
-    /// default-credential chain. Only affects `s3://` catalogs.
-    pub fn with_s3_endpoint(
-        mut self,
-        endpoint: impl Into<String>,
-        region: impl Into<String>,
-        access_key: impl Into<String>,
-        secret_key: impl Into<String>,
-    ) -> Self {
-        self.s3 = Some(S3Config {
-            endpoint: endpoint.into(),
-            region: region.into(),
-            access_key: access_key.into(),
-            secret_key: secret_key.into(),
-        });
+    /// Set one storage option (e.g. `aws_access_key_id`,
+    /// `azure_storage_account_key`). An unknown or cross-backend key
+    /// errors at connect time. Chainable.
+    pub fn with_storage_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.storage_options.insert(key.into(), value.into());
         self
+    }
+
+    /// Probe the object store at `connect` (default `false`). `true`
+    /// fails fast on bad credentials instead of on first use.
+    pub fn with_validate(mut self, validate: bool) -> Self {
+        self.validate = validate;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_storage_option_round_trips() {
+        let o = ConnectOptions::new().with_storage_option("aws_region", "us-east-1");
+        assert_eq!(
+            o.storage_options.get("aws_region").map(String::as_str),
+            Some("us-east-1")
+        );
     }
 }

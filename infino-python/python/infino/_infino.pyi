@@ -21,13 +21,11 @@ RowData: TypeAlias = RecordBatch | ArrowTable | Sequence[Mapping[str, Any]]
 def connect(
     uri: str,
     *,
-    endpoint: str | None = ...,
-    region: str | None = ...,
-    access_key: str | None = ...,
-    secret_key: str | None = ...,
+    storage_options: Mapping[str, str] | None = ...,
     cache_dir: str | None = ...,
     cache_budget_bytes: int | None = ...,
     cold_fetch_mode: ColdFetchMode | None = ...,
+    validate: bool | None = ...,
 ) -> Connection: ...
 
 class Connection:

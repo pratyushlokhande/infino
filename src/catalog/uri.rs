@@ -92,7 +92,7 @@ pub(crate) fn parse_uri(uri: &str) -> Result<Backend, InfinoError> {
         });
     }
     // A bare path is a local filesystem root. Any other `scheme://` is
-    // unsupported (don't silently treat `gs://…` as a directory name).
+    // unsupported (don't silently treat `gdrive://…` as a directory name).
     if uri.contains("://") {
         return Err(InfinoError::Backend(format!(
             "unsupported catalog URI scheme: {uri}"
@@ -151,6 +151,6 @@ mod tests {
 
     #[test]
     fn rejects_unknown_scheme() {
-        assert!(parse_uri("gs://bucket/x").is_err());
+        assert!(parse_uri("gdrive://bucket/x").is_err());
     }
 }

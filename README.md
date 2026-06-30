@@ -19,6 +19,7 @@
 
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Cloud storage](#cloud-storage)
 - [Architecture](#architecture)
 - [SQL joins across tables](#sql-joins-across-tables)
 - [Hybrid search](#hybrid-search)
@@ -262,6 +263,45 @@ The shortest end-to-end demo (write a corpus, run BM25 + vector +
 SQL/hybrid retrieval against it, then read the very same file back with
 DuckDB *and* pyarrow) is
 [`infino-python/examples/parquet_interop.py`](infino-python/examples/parquet_interop.py).
+
+## Cloud storage
+
+The backend is chosen by the URI scheme — `s3://bucket/prefix`,
+`az://container/prefix`, `file://path`, a bare path, or `memory://`.
+Credentials go through `ConnectOptions`, keyed by `object_store`'s config
+strings (`aws_*` / `azure_*` — the names the AWS/Azure SDKs use). Infino
+reads no credentials from the environment; omit them to use ambient cloud
+identity (IAM instance role / managed identity).
+
+```rust
+use infino::{connect_with, ConnectOptions};
+
+// S3
+let db = connect_with("s3://bucket/prefix", ConnectOptions::new()
+    .with_storage_option("aws_access_key_id", "…")
+    .with_storage_option("aws_secret_access_key", "…")
+    .with_storage_option("aws_region", "us-east-1"))?;
+
+// Azure
+let db = connect_with("az://container/prefix", ConnectOptions::new()
+    .with_storage_option("azure_storage_account_name", "…")
+    .with_storage_option("azure_storage_account_key", "…"))?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Common keys:
+
+| Backend | Keys |
+| ------- | ---- |
+| S3      | `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, `aws_session_token`, `aws_endpoint` |
+| Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
+
+The full set is whatever `object_store` accepts for the backend; an unknown
+or cross-backend key is rejected at connect. `with_validate(true)` opts into
+a connect-time reachability probe, so bad credentials fail at `connect`
+rather than on the first query. The same options exist in the config file
+(`storage.storage_options`) and both bindings (`storage_options` +
+`validate`).
 
 ## Architecture
 

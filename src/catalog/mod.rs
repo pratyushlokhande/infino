@@ -76,6 +76,10 @@ pub fn connect(uri: impl AsRef<str>) -> Result<Connection, InfinoError> {
 /// Open (or create) a catalog rooted at `uri` with explicit storage
 /// configuration (credentials / region / endpoint the URI can't carry).
 ///
+/// With `ConnectOptions::with_validate(true)`, object-store backends are
+/// probed before returning, so bad credentials fail at connect rather
+/// than on the first table operation.
+///
 /// ```
 /// use infino::{connect_with, ConnectOptions};
 /// let db = connect_with("memory://", ConnectOptions::new())?;
@@ -92,6 +96,10 @@ pub fn connect_with(
         _ => {
             let root = backend_to_provider(&backend, &options)?
                 .expect("non-memory backend yields a storage provider");
+            // Opt-in probe: fail at connect on bad credentials, not first use.
+            if options.validate {
+                bridge_sync_to_async(read_catalog(root.as_ref()))?;
+            }
             CatalogStore::Storage(root)
         }
     };
@@ -528,22 +536,13 @@ fn backend_to_provider(
     let provider: Option<Arc<dyn StorageProvider>> = match backend {
         Backend::Memory => None,
         Backend::LocalFs { root } => Some(Arc::new(LocalFsStorageProvider::new(root.clone())?)),
-        Backend::S3 { bucket, prefix } => {
-            let p = match options.s3.as_ref() {
-                Some(s3) => S3StorageProvider::new_with_endpoint_and_prefix(
-                    &s3.endpoint,
-                    bucket,
-                    &s3.access_key,
-                    &s3.secret_key,
-                    &s3.region,
-                    prefix,
-                )?,
-                None => S3StorageProvider::new_with_prefix(bucket, prefix)?,
-            };
-            Some(Arc::new(p))
-        }
+        Backend::S3 { bucket, prefix } => Some(Arc::new(S3StorageProvider::new_with_prefix(
+            bucket,
+            prefix,
+            &options.storage_options,
+        )?)),
         Backend::Azure { container, prefix } => Some(Arc::new(
-            AzureStorageProvider::new_with_prefix(container, prefix)?,
+            AzureStorageProvider::new_with_prefix(container, prefix, &options.storage_options)?,
         )),
     };
     Ok(provider)
@@ -1116,6 +1115,13 @@ mod tests {
     fn connect_with_default_options_yields_empty_memory_catalog() {
         let db = connect_with("memory://", ConnectOptions::new()).expect("connect_with");
         assert!(db.list_tables().expect("list").is_empty());
+    }
+
+    #[test]
+    fn connect_does_not_probe_by_default() {
+        // Default (validate off): a bogus bucket builds a provider but the
+        // backend is never touched, so connect succeeds without network.
+        connect("s3://no-such-bucket-xyzzy/prefix").expect("offline connect by default");
     }
 
     #[test]

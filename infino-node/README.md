@@ -226,23 +226,50 @@ docs.optimize({ targetSuperfileSizeMb: 256, minFillPercent: 50 });
 
 `connect` selects the backend from the URI:
 
-| URI                   | Backend                                  |
-| --------------------- | ---------------------------------------- |
-| `./data`, `/abs/path` | Local filesystem                         |
-| `s3://bucket/prefix`  | Amazon S3 / S3-compatible object storage |
-| `memory://`           | In-process, ephemeral (testing)          |
+| URI                      | Backend                                  |
+| ------------------------ | ---------------------------------------- |
+| `./data`, `/abs/path`    | Local filesystem                         |
+| `s3://bucket/prefix`     | Amazon S3 / S3-compatible object storage |
+| `az://container/prefix`  | Azure Blob Storage                       |
+| `memory://`              | In-process, ephemeral (testing)          |
 
-For S3-compatible stores that need an explicit endpoint and static credentials,
-pass them in `options` (omit to use ambient AWS credentials):
+Credentials go in `storageOptions`, keyed by the standard `object_store` config
+strings (`aws_*` / `azure_*` — the same names the AWS and Azure SDKs use). Omit
+them to use ambient cloud identity (IAM instance role / managed identity);
+infino reads no credentials from the environment.
 
 ```javascript
+// S3
 const db = connect("s3://bucket/prefix", {
-  endpoint: "https://s3.example.com",
-  region: "us-east-1",
-  accessKey: "…",
-  secretKey: "…",
+  storageOptions: {
+    aws_access_key_id: "…",
+    aws_secret_access_key: "…",
+    aws_region: "us-east-1",
+  },
+});
+
+// Azure
+const db = connect("az://container/prefix", {
+  storageOptions: {
+    azure_storage_account_name: "…",
+    azure_storage_account_key: "…",
+  },
 });
 ```
+
+Common keys:
+
+| Backend | Keys |
+| ------- | ---- |
+| S3      | `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, `aws_session_token`, `aws_endpoint` |
+| Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
+
+The full set is whatever `object_store` accepts for the backend; an unknown key
+is rejected at `connect`. Pass `validate: true` to probe the backend at
+`connect`, so wrong credentials or an unreachable bucket throw there instead of
+on the first query. For an S3-compatible endpoint (MinIO / R2 / Ceph), set
+`aws_endpoint` (with `aws_allow_http: "true"` for plain HTTP) alongside the
+credentials.
 
 ### Local disk cache
 
@@ -273,9 +300,9 @@ const db = connect("s3://bucket/prefix", {
 ## API reference
 
 - `connect(uri, options?)` — backend from the URI scheme. `options`:
-  S3-compatible credentials (`endpoint`, `region`, `accessKey`, `secretKey` —
-  `endpoint` requires the other three) and, for remote-backed tables, a local
-  disk cache (`cacheDir`, `cacheBudgetBytes`, `coldFetchMode`).
+  `storageOptions` (credentials, keyed by `object_store`'s `aws_*` / `azure_*`
+  strings), `validate`, and a local disk cache (`cacheDir`, `cacheBudgetBytes`,
+  `coldFetchMode`).
 - `Connection`
   - `createTable(name, schema, IndexSpec)` / `openTable(name)` /
     `dropTable(name, purge?)` (`purge = true` also deletes the data) /

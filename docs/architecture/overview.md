@@ -64,10 +64,12 @@ under the hood), executes in-process. There is no wire protocol yet, so
 external SQL clients can't attach — SQL is reached through the
 connection's `query_sql`. From that connection you work with tables:
 
-- `connect("s3://bucket/prefix")` (or a local path, or `memory://`)
-  returns a **`Connection`** — a *catalog of tables* persisted at that
-  root. (Distinct from a supertable's *manifest*, which lists the files
-  within one table.)
+- `connect("s3://bucket/prefix")` (or `az://container/prefix`, a local
+  path, or `memory://`) returns a **`Connection`** — a *catalog of tables*
+  persisted at that root. (Distinct from a supertable's *manifest*, which
+  lists the files within one table.) Credentials are passed as
+  `storage_options` keyed by `object_store`'s `aws_*` / `azure_*` config
+  strings — never read from the environment.
 - From the connection you **create**, **open**, **list**, and **drop**
   tables, and run **SQL across them** (`query_sql`) — joins and
   aggregations span tables in the catalog in one engine.

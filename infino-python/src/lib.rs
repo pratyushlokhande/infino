@@ -14,6 +14,7 @@
 //! maturin — it consumes the core crate's curated public API only (no
 //! `test-helpers`), so it is also a public-surface consumer test.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
@@ -68,7 +69,9 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
     match s.to_ascii_lowercase().as_str() {
         "hybrid_with_prefetch" => Ok(ColdFetchMode::HybridWithPrefetch),
         "range_only" => Ok(ColdFetchMode::RangeOnly),
-        "lazy_foreground_with_background_fill" => Ok(ColdFetchMode::LazyForegroundWithBackgroundFill),
+        "lazy_foreground_with_background_fill" => {
+            Ok(ColdFetchMode::LazyForegroundWithBackgroundFill)
+        }
         other => Err(PyValueError::new_err(format!(
             "unknown cold_fetch_mode {other:?}; use 'hybrid_with_prefetch', \
              'range_only', or 'lazy_foreground_with_background_fill'"
@@ -77,44 +80,32 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 }
 
 /// Open (or create) a catalog rooted at `uri`. Storage config the URI
-/// can't carry is passed as keyword arguments: explicit S3 endpoint +
-/// static credentials, and the optional local disk cache (`cache_dir`,
-/// `cache_budget_bytes`, `cold_fetch_mode`). Omit all for local /
-/// `memory://` / ambient-credential S3.
-// Flat kwargs are the intended Python API; a config struct would change it.
-#[allow(clippy::too_many_arguments)]
+/// can't carry is passed as keyword arguments: `storage_options` (a map
+/// of `object_store` config keys — `aws_*` / `azure_*`) and the optional
+/// local disk cache. Pass `validate=True` to probe the object store at
+/// connect (off by default) so bad credentials fail there. Omit all for
+/// local / `memory://` / ambient-credential object storage.
 #[pyfunction]
-#[pyo3(signature = (uri, *, endpoint=None, region=None, access_key=None, secret_key=None,
-                    cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None))]
+#[pyo3(signature = (uri, *, storage_options=None, cache_dir=None, cache_budget_bytes=None,
+                    cold_fetch_mode=None, validate=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
-    endpoint: Option<String>,
-    region: Option<String>,
-    access_key: Option<String>,
-    secret_key: Option<String>,
+    storage_options: Option<HashMap<String, String>>,
     cache_dir: Option<String>,
     cache_budget_bytes: Option<u64>,
     cold_fetch_mode: Option<String>,
+    validate: Option<bool>,
 ) -> PyResult<Connection> {
     // Opening a connection can touch object storage; release the GIL so
     // other Python threads run during the (blocking) I/O.
     let inner = py.detach(|| {
         let mut opts = ConnectOptions::new();
         let mut has_options = false;
-        // The S3 endpoint + credentials are all-or-nothing: any one of them
-        // means the caller wants an explicit endpoint, so require the rest
-        // rather than silently dropping a partial config back to ambient.
-        if endpoint.is_some() || region.is_some() || access_key.is_some() || secret_key.is_some() {
-            let endpoint = endpoint
-                .ok_or_else(|| PyValueError::new_err("endpoint is required with S3 credentials"))?;
-            let region = region
-                .ok_or_else(|| PyValueError::new_err("region is required for an S3 endpoint"))?;
-            let access_key = access_key
-                .ok_or_else(|| PyValueError::new_err("access_key is required for an S3 endpoint"))?;
-            let secret_key = secret_key
-                .ok_or_else(|| PyValueError::new_err("secret_key is required for an S3 endpoint"))?;
-            opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
+        if let Some(options) = storage_options {
+            for (key, value) in options {
+                opts = opts.with_storage_option(key, value);
+            }
             has_options = true;
         }
         if let Some(dir) = cache_dir {
@@ -127,6 +118,10 @@ fn connect(
         }
         if let Some(mode) = cold_fetch_mode {
             opts = opts.with_cold_fetch_mode(cold_fetch_from_str(&mode)?);
+            has_options = true;
+        }
+        if let Some(v) = validate {
+            opts = opts.with_validate(v);
             has_options = true;
         }
         // Preserve the plain `connect(uri)` path when no options are set.
@@ -216,9 +211,7 @@ impl Connection {
 
     /// Open an existing table by name.
     fn open_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
-        let inner = py
-            .detach(|| self.inner.open_table(name))
-            .map_err(py_err)?;
+        let inner = py.detach(|| self.inner.open_table(name)).map_err(py_err)?;
         Ok(Table { inner })
     }
 
@@ -241,9 +234,7 @@ impl Connection {
     /// Search is available in SQL via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
     fn query_sql<'py>(&self, py: Python<'py>, sql: &str) -> PyResult<Bound<'py, PyAny>> {
-        let batches = py
-            .detach(|| self.inner.query_sql(sql))
-            .map_err(py_err)?;
+        let batches = py.detach(|| self.inner.query_sql(sql)).map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
     }
 }
@@ -351,7 +342,8 @@ impl Table {
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner.bm25_search(column, query, k, mode, names.as_deref())
+                self.inner
+                    .bm25_search(column, query, k, mode, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -391,7 +383,11 @@ impl Table {
         // `filter_query` must be supplied together; `filter_mode` is only
         // meaningful alongside them (a lone `filter_mode` is rejected rather
         // than silently ignored, so an invalid value never passes unnoticed).
-        let filter = match (filter_column.as_deref(), filter_query.as_deref(), filter_mode) {
+        let filter = match (
+            filter_column.as_deref(),
+            filter_query.as_deref(),
+            filter_mode,
+        ) {
             (Some(col), Some(q), mode) => Some(VectorFilter {
                 column: col,
                 query: q,
@@ -436,7 +432,8 @@ impl Table {
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner.token_match(column, query, mode, names.as_deref())
+                self.inner
+                    .token_match(column, query, mode, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -516,7 +513,8 @@ impl Table {
             }
         }
         let opts = OptimizeOptions::compact(s);
-        py.detach(|| self.inner.optimize(&opts)).map_err(optimize_err)
+        py.detach(|| self.inner.optimize(&opts))
+            .map_err(optimize_err)
     }
 
     /// The user-facing Arrow schema, as a pyarrow `Schema`.

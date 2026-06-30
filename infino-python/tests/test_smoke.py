@@ -87,11 +87,25 @@ def test_connect_rejects_invalid_cold_fetch_mode():
         infino.connect("memory://", cold_fetch_mode="nonsense")
 
 
-def test_connect_rejects_partial_s3_credentials():
-    # A credential without the rest must error, not silently fall back to
-    # ambient credentials.
-    with pytest.raises(ValueError):
-        infino.connect("s3://bucket/prefix", access_key="only-this")
+def test_connect_accepts_storage_options(tmp_path):
+    # storage_options is a no-op for local storage but must parse and apply.
+    db = infino.connect(str(tmp_path / "catalog"), storage_options={"aws_region": "us-east-1"})
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "the quick brown fox"}])
+    assert t.token_match("title", "fox").num_rows == 1
+
+
+def test_connect_rejects_unknown_storage_option():
+    # An unknown key surfaces at connect time (backend error), not a
+    # silent drop.
+    with pytest.raises(RuntimeError, match="not_a_real_key"):
+        infino.connect("s3://bucket/prefix", storage_options={"not_a_real_key": "x"})
+
+
+def test_connect_does_not_probe_by_default():
+    # Default (validate off): connecting to a bogus bucket builds the
+    # handle without touching the backend.
+    infino.connect("s3://no-such-bucket-xyzzy/prefix")
 
 
 def test_query_sql_returns_pyarrow_table():
