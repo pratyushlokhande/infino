@@ -62,6 +62,9 @@ pub struct ConnectOptions {
     pub(crate) cache_budget_bytes: Option<u64>,
     /// Cold-fetch strategy when the disk cache is enabled.
     pub(crate) cold_fetch_mode: ColdFetchMode,
+    /// Probe the backend at `connect`. Default `false`; opt in for
+    /// fail-fast on bad credentials.
+    pub(crate) validate: bool,
 }
 
 impl ConnectOptions {
@@ -99,6 +102,13 @@ impl ConnectOptions {
     /// errors at connect time. Chainable.
     pub fn with_storage_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.storage_options.insert(key.into(), value.into());
+        self
+    }
+
+    /// Probe the object store at `connect` (default `false`). `true`
+    /// fails fast on bad credentials instead of on first use.
+    pub fn with_validate(mut self, validate: bool) -> Self {
+        self.validate = validate;
         self
     }
 

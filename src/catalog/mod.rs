@@ -76,8 +76,9 @@ pub fn connect(uri: impl AsRef<str>) -> Result<Connection, InfinoError> {
 /// Open (or create) a catalog rooted at `uri` with explicit storage
 /// configuration (credentials / region / endpoint the URI can't carry).
 ///
-/// Object-store backends are probed before returning, so bad credentials
-/// fail at connect rather than on the first table operation.
+/// With `ConnectOptions::with_validate(true)`, object-store backends are
+/// probed before returning, so bad credentials fail at connect rather
+/// than on the first table operation.
 ///
 /// ```
 /// use infino::{connect_with, ConnectOptions};
@@ -95,8 +96,10 @@ pub fn connect_with(
         _ => {
             let root = backend_to_provider(&backend, &options)?
                 .expect("non-memory backend yields a storage provider");
-            // Probe now so bad credentials fail at connect, not first use.
-            bridge_sync_to_async(read_catalog(root.as_ref()))?;
+            // Opt-in probe: fail at connect on bad credentials, not first use.
+            if options.validate {
+                bridge_sync_to_async(read_catalog(root.as_ref()))?;
+            }
             CatalogStore::Storage(root)
         }
     };
@@ -1112,6 +1115,13 @@ mod tests {
     fn connect_with_default_options_yields_empty_memory_catalog() {
         let db = connect_with("memory://", ConnectOptions::new()).expect("connect_with");
         assert!(db.list_tables().expect("list").is_empty());
+    }
+
+    #[test]
+    fn connect_does_not_probe_by_default() {
+        // Default (validate off): a bogus bucket builds a provider but the
+        // backend is never touched, so connect succeeds without network.
+        connect("s3://no-such-bucket-xyzzy/prefix").expect("offline connect by default");
     }
 
     #[test]
