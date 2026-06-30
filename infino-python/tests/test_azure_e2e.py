@@ -68,7 +68,9 @@ def _storage_options() -> dict[str, str]:
 @pytest.fixture
 def azure_uri() -> str:
     container = os.environ["AZURE_STORAGE_CONTAINER_NAME"]
-    return f"az://{container}/infino-py-e2e/{secrets.token_hex(8)}"
+    # Overridable so CI scopes blobs per run.
+    root = os.environ.get("INFINO_E2E_PREFIX", "infino-py-e2e")
+    return f"az://{container}/{root}/{secrets.token_hex(8)}"
 
 
 @pytest.fixture

@@ -33,7 +33,9 @@ const storageOptions = () => ({
   azure_storage_account_key: process.env.AZURE_STORAGE_ACCOUNT_KEY,
 });
 
-const azureUri = () => `az://${process.env.AZURE_STORAGE_CONTAINER_NAME}/infino-node-e2e/${randomUUID()}`;
+// Overridable so CI scopes blobs per run.
+const prefixRoot = process.env.INFINO_E2E_PREFIX ?? "infino-node-e2e";
+const azureUri = () => `az://${process.env.AZURE_STORAGE_CONTAINER_NAME}/${prefixRoot}/${randomUUID()}`;
 
 const onehot = (i) => {
   const v = new Array(DIM).fill(0);
