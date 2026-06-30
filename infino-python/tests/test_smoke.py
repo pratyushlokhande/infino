@@ -87,11 +87,6 @@ def test_connect_rejects_invalid_cold_fetch_mode():
         infino.connect("memory://", cold_fetch_mode="nonsense")
 
 
-def test_connect_rejects_partial_s3_credentials():
-    # A credential without the rest must error, not silently fall back to
-    # ambient credentials.
-    with pytest.raises(ValueError):
-        infino.connect("s3://bucket/prefix", access_key="only-this")
 
 
 def test_connect_accepts_storage_options(tmp_path):

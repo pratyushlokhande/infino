@@ -258,11 +258,9 @@ Common keys:
 The full set is whatever `object_store` accepts for the backend; an
 unknown key is rejected at `connect`. Pass `validate=True` to probe the
 backend at `connect`, so wrong credentials or an unreachable bucket fail
-there instead of on the first query.
-
-For an S3-compatible endpoint (MinIO / R2 / Ceph), `endpoint` / `region` /
-`access_key` / `secret_key` remain as a shorthand for the matching
-`aws_*` options.
+there instead of on the first query. For an S3-compatible endpoint (MinIO /
+R2 / Ceph), set `aws_endpoint` (with `aws_allow_http: "true"` for plain
+HTTP) alongside the credentials.
 
 ### Local disk cache
 
@@ -292,7 +290,7 @@ db = infino.connect(
 
 ## API reference
 
-- `infino.connect(uri, *, storage_options=None, endpoint=None, region=None, access_key=None, secret_key=None, cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None) -> Connection`
+- `infino.connect(uri, *, storage_options=None, cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None, validate=None) -> Connection`
 - `Connection`
   - `create_table(name, schema, index_spec) -> Table`
   - `open_table(name) -> Table`
