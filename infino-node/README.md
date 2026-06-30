@@ -257,8 +257,6 @@ const db = connect("az://container/prefix", {
 });
 ```
 
-`connect` probes the backend before returning, so wrong credentials or an
-unreachable bucket throw immediately instead of failing on the first query.
 Common keys:
 
 | Backend | Keys |
@@ -267,10 +265,11 @@ Common keys:
 | Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
 
 The full set is whatever `object_store` accepts for the backend; an unknown key
-is rejected at `connect`. Pass `validate: false` to skip the probe and construct
-the connection without touching the backend. For an S3-compatible endpoint
-(MinIO / R2 / Ceph), `endpoint` / `region` / `accessKey` / `secretKey` remain as
-a shorthand for the matching `aws_*` options.
+is rejected at `connect`. Pass `validate: true` to probe the backend at
+`connect`, so wrong credentials or an unreachable bucket throw there instead of
+on the first query. For an S3-compatible endpoint (MinIO / R2 / Ceph),
+`endpoint` / `region` / `accessKey` / `secretKey` remain as a shorthand for the
+matching `aws_*` options.
 
 ### Local disk cache
 

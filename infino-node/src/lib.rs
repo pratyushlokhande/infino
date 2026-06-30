@@ -205,8 +205,8 @@ pub struct ConnectOptions {
     /// Cold-miss strategy: `"hybrid_with_prefetch"` | `"range_only"` |
     /// `"lazy_foreground_with_background_fill"`.
     pub cold_fetch_mode: Option<String>,
-    /// Probe the object store at `connect` (default `true`) so bad
-    /// credentials fail there, not on first use. `false` constructs offline.
+    /// Probe the object store at `connect` (default `false`). `true` fails
+    /// fast on bad credentials instead of on first use.
     pub validate: Option<bool>,
 }
 
@@ -313,8 +313,9 @@ impl IndexSpec {
 
 /// Open (or create) a catalog rooted at `uri` (local dir, `memory://`, or
 /// object-store prefix). Credentials are passed via `options.storageOptions`
-/// (the JS-idiomatic form of the Rust `ConnectOptions`). Object-store backends
-/// are probed before returning, so bad credentials fail at `connect`.
+/// (the JS-idiomatic form of the Rust `ConnectOptions`). Pass `validate: true`
+/// to probe object stores at connect (off by default) so bad credentials fail
+/// there rather than on the first table operation.
 #[napi]
 pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connection> {
     let inner = match options {

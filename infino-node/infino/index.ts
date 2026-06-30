@@ -48,8 +48,8 @@ export interface ConnectOptions {
   /** How cold misses are serviced. */
   coldFetchMode?: "hybrid_with_prefetch" | "range_only" | "lazy_foreground_with_background_fill";
   /**
-   * Probe the object store at `connect` (default `true`) so bad credentials
-   * fail there, not on first use. `false` constructs the handle offline.
+   * Probe the object store at `connect` (default `false`). `true` fails fast
+   * on bad credentials instead of on the first table operation.
    */
   validate?: boolean;
 }
