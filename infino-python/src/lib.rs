@@ -237,6 +237,18 @@ impl Connection {
         let batches = py.detach(|| self.inner.query_sql(sql)).map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
     }
+
+    /// Swap rotated static credentials (`aws_*` / `azure_*` keys) into this
+    /// live connection and its open tables — no reconnect. Raises if there's
+    /// no rotatable credential (ambient identity / `memory://`).
+    fn rotate_credentials(
+        &self,
+        py: Python<'_>,
+        storage_options: HashMap<String, String>,
+    ) -> PyResult<()> {
+        py.detach(|| self.inner.rotate_credentials(storage_options))
+            .map_err(py_err)
+    }
 }
 
 /// Row counts returned by `update` / `delete`.

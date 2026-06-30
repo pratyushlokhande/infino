@@ -380,6 +380,15 @@ export class Connection {
   querySql(sql: string, opts: QueryOptions = {}): RowRecord[] | arrow.Table {
     return decode(this.inner.querySql(sql), opts.arrow);
   }
+
+  /**
+   * Swap rotated static credentials (`aws_*` / `azure_*` keys) into this live
+   * connection and its open tables — no reconnect. Throws if there's no
+   * rotatable credential (ambient identity / `memory://`).
+   */
+  rotateCredentials(storageOptions: Record<string, string>): void {
+    this.inner.rotateCredentials(storageOptions);
+  }
 }
 
 /** Open (or create) a catalog rooted at `uri`. */

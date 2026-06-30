@@ -400,6 +400,16 @@ impl Connection {
         let batches = self.inner.query_sql(&sql).map_err(map_err)?;
         batches_to_ipc(&batches)
     }
+
+    /// Swap rotated static credentials (`aws_*` / `azure_*` keys) into this
+    /// live connection and its open tables — no reconnect. Throws if there's
+    /// no rotatable credential (ambient identity / `memory://`).
+    #[napi]
+    pub fn rotate_credentials(&self, storage_options: HashMap<String, String>) -> Result<()> {
+        self.inner
+            .rotate_credentials(storage_options)
+            .map_err(map_err)
+    }
 }
 
 /// A single-table handle.

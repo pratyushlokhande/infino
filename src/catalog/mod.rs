@@ -424,11 +424,9 @@ impl Connection {
         }
     }
 
-    /// Swap rotated static credentials into this live connection and every
-    /// table opened from it — no reconnect, the connection pool stays warm.
-    /// `storage_options` carries the new credential (same `aws_*` / `azure_*`
-    /// keys as `connect`). Errors if the connection uses ambient identity or
-    /// a backend with nothing static to rotate (`memory://`, local fs).
+    /// Swap rotated static credentials (`aws_*` / `azure_*` keys) into this
+    /// live connection and its open tables — no reconnect. Errors when there's
+    /// no rotatable credential (ambient identity, `memory://`, local fs).
     pub fn rotate_credentials(
         &self,
         storage_options: HashMap<String, String>,

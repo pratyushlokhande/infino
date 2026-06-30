@@ -175,6 +175,23 @@ def test_bad_credentials_fail_at_connect(azure_uri: str) -> None:
         )
 
 
+def test_credential_rotation_takes_effect(db: infino.Connection) -> None:
+    # A wrong key rotated into a live connection makes the next write fail
+    # (the swap reached the open table's provider — no reconnect); rotating
+    # the good key back restores it.
+    table = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    table.append([{"title": "before"}])
+
+    bad = {**_storage_options(), "azure_storage_account_key": "d3Jvbmcta2V5"}  # valid base64, wrong
+    db.rotate_credentials(bad)
+    with pytest.raises(Exception):
+        table.append([{"title": "during bad key"}])
+
+    db.rotate_credentials(_storage_options())
+    table.append([{"title": "after"}])
+    assert _count(db, "docs") == 2
+
+
 def test_drop_purge_removes_table(db: infino.Connection) -> None:
     table = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
     table.append([{"title": "ephemeral"}])

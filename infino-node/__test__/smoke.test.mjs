@@ -197,6 +197,12 @@ test("connect does not probe by default", () => {
   connect("s3://no-such-bucket-xyzzy/prefix");
 });
 
+test("rotateCredentials without credentials throws", () => {
+  // memory:// has nothing static to rotate.
+  const db = connect("memory://");
+  assert.throws(() => db.rotateCredentials({ aws_access_key_id: "x" }));
+});
+
 test("vector search end-to-end", () => {
   const db = connect("memory://");
   const dim = 16; // infino requires vector dim in [16, 4096]
