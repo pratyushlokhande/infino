@@ -289,11 +289,19 @@ let db = connect_with("az://container/prefix", ConnectOptions::new()
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-An unknown or cross-backend key is rejected at connect. `with_validate(true)`
-opts into a connect-time reachability probe, so bad credentials fail at
-`connect` rather than on the first query. The same options exist in the
-config file (`storage.storage_options`) and both bindings (`storage_options`
-+ `validate`).
+Common keys:
+
+| Backend | Keys |
+| ------- | ---- |
+| S3      | `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, `aws_session_token`, `aws_endpoint` |
+| Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
+
+The full set is whatever `object_store` accepts for the backend; an unknown
+or cross-backend key is rejected at connect. `with_validate(true)` opts into
+a connect-time reachability probe, so bad credentials fail at `connect`
+rather than on the first query. The same options exist in the config file
+(`storage.storage_options`) and both bindings (`storage_options` +
+`validate`).
 
 ## Architecture
 
