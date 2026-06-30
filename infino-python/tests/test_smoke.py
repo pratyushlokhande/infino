@@ -87,8 +87,6 @@ def test_connect_rejects_invalid_cold_fetch_mode():
         infino.connect("memory://", cold_fetch_mode="nonsense")
 
 
-
-
 def test_connect_accepts_storage_options(tmp_path):
     # storage_options is a no-op for local storage but must parse and apply.
     db = infino.connect(str(tmp_path / "catalog"), storage_options={"aws_region": "us-east-1"})
