@@ -282,7 +282,7 @@ let db = connect_with("s3://bucket/prefix", ConnectOptions::new()
     .with_storage_option("aws_secret_access_key", "…")
     .with_storage_option("aws_region", "us-east-1"))?;
 
-// Azure (the URI's container is the bucket-equivalent)
+// Azure
 let db = connect_with("az://container/prefix", ConnectOptions::new()
     .with_storage_option("azure_storage_account_name", "…")
     .with_storage_option("azure_storage_account_key", "…"))?;
