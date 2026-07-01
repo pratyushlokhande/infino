@@ -321,12 +321,13 @@ db = infino.connect(
   - `query_sql(sql) -> pyarrow.Table` — also exposes the search
     table-valued functions `bm25_search`, `bm25_search_prefix`,
     `vector_search`, `hybrid_search`, `token_match`, and `exact_match`
-    (each takes the table name first; `hybrid_search` and
-    `bm25_search_prefix` are SQL-only)
+    (each takes the table name first)
 - `Table`
   - `append(data)`
   - `bm25_search(column, query, k, mode="or", projection=None) -> pyarrow.Table`
+  - `bm25_search_prefix(column, prefix, k, projection=None) -> pyarrow.Table`
   - `vector_search(column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None) -> pyarrow.Table`
+  - `hybrid_search(text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None) -> pyarrow.Table`
   - `token_match(column, query, mode="or", projection=None) -> pyarrow.Table`
   - `exact_match(column, value, projection=None) -> pyarrow.Table`
   - `delete(predicate) -> MutationStats`
