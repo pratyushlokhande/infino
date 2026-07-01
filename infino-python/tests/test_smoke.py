@@ -393,8 +393,7 @@ def test_bm25_search_prefix_matches_sql_tvf():
 
     # Direct call and the SQL table function agree on the `_id` set.
     via_sql = db.query_sql("SELECT _id FROM bm25_search_prefix('docs', 'title', 'qui', 10)")
-    direct_ids = set(t.bm25_search_prefix("title", "qui", 10)["_id"].to_pylist())
-    assert direct_ids == set(via_sql["_id"].to_pylist())
+    assert set(hits["_id"].to_pylist()) == set(via_sql["_id"].to_pylist())
 
     # An unmatched prefix returns no rows.
     assert t.bm25_search_prefix("title", "zzz", 10).num_rows == 0
@@ -445,17 +444,16 @@ def test_hybrid_search_fuses_text_and_vector():
     via_sql = db.query_sql(
         f"SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '{csv}', 10)"
     )
-    direct_ids = set(t.hybrid_search("title", "rust", "emb", onehot(0), 10)["_id"].to_pylist())
-    assert direct_ids == set(via_sql["_id"].to_pylist())
+    assert set(hits["_id"].to_pylist()) == set(via_sql["_id"].to_pylist())
 
     # Invalid mode is rejected.
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="mode"):
         t.hybrid_search("title", "rust", "emb", onehot(0), 10, mode="xor")
 
-    # A non-indexed text column raises a clear error.
-    with pytest.raises(Exception):
+    # A non-indexed text column names the offending column.
+    with pytest.raises(ValueError, match="missing"):
         t.hybrid_search("missing", "rust", "emb", onehot(0), 10)
 
-    # A wrong-dimension query vector raises.
-    with pytest.raises(Exception):
+    # A wrong-dimension query vector reports the dimension mismatch.
+    with pytest.raises(ValueError, match="dimension"):
         t.hybrid_search("title", "rust", "emb", [1.0, 2.0, 3.0], 10)
