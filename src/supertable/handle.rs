@@ -765,7 +765,7 @@ impl fmt::Debug for Supertable {
 /// and holds it through query lifetime — new commits to the parent
 /// `Supertable` don't affect this reader's view. The public read
 /// methods (`bm25_search`, `bm25_search_prefix`, `vector_search`,
-/// `query_sql`) live on this handle; each drives its async kernel to
+/// `hybrid_search`, `query_sql`) live on this handle; each drives its async kernel to
 /// completion via the sync→async bridge ([`SupertableReader::block_on`]),
 /// mirroring the way [`SupertableWriter`](crate::supertable::SupertableWriter)
 /// drives `commit`.

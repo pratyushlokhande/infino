@@ -74,8 +74,9 @@ connection's `query_sql`. From that connection you work with tables:
   tables, and run **SQL across them** (`query_sql`) — joins and
   aggregations span tables in the catalog in one engine.
 - Each table is a **`Supertable`** handle: `append` rows, `update` /
-  `delete`, and search it — `bm25_search` / `vector_search` (full-text
-  and vector kNN, returning Arrow rows), the unranked `token_match` /
+  `delete`, and search it — `bm25_search` / `bm25_search_prefix` /
+  `vector_search` / `hybrid_search` (full-text, prefix, vector kNN, and
+  RRF-fused, returning Arrow rows), the unranked `token_match` /
   `exact_match`, and `schema`. The same retrievers are also SQL
   table-valued functions, so search composes with the rest of a query.
 

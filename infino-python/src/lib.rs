@@ -602,7 +602,7 @@ impl Table {
 }
 
 /// Borrow an optional Python projection (`list[str]`) as the `&str`
-/// slices the Rust search APIs take. Shared by all four search methods.
+/// slices the Rust search APIs take. Shared by every search method.
 fn projection_refs(projection: &Option<Vec<String>>) -> Option<Vec<&str>> {
     projection
         .as_ref()
