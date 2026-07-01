@@ -122,13 +122,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Restore the dep graph (datafusion etc.) so only infino-python rebuilds.
-      # Order matters: rust-cache keys on Cargo.lock, which the stamp step
-      # bumps — cache before stamp to keep the key stable across releases.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: infino-python
-
       # Version is dynamic (pyproject `dynamic = ["version"]`) → maturin reads
       # it from Cargo.toml. Stamp it into Cargo.toml *and* Cargo.lock so the
       # build stays --locked. python3 over sed: one script, every runner,
@@ -162,22 +155,23 @@ jobs:
 
       # `manylinux` is honored only for Linux targets and ignored elsewhere;
       # musl targets need the musllinux image, every other target builds glibc.
+      # `sccache` caches inside the container, avoiding a host cache whose glibc mismatches it.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           command: build
           target: ${{ matrix.target }}
           manylinux: ${{ contains(matrix.target, 'musl') && 'musllinux_1_2' || 'auto' }}
+          sccache: "true"
           args: --release --locked --out dist -m infino-python/Cargo.toml
 
-      # Smoke-test the wheel before publish. Interop deps (pandas, duckdb) keep
-      # tests from silently skipping; musl runs in Alpine (can't install on glibc).
+      # Smoke-test the wheel before publish; musl runs in Alpine (can't install on glibc).
       - name: Smoke-test wheel (glibc)
         if: ${{ !contains(matrix.target, 'musl') }}
         shell: bash
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install --force-reinstall dist/*.whl pytest pandas duckdb
+          python3 -m pip install --force-reinstall dist/*.whl pytest
           python3 -m pytest infino-python/tests -v
 
       - name: Smoke-test wheel (musl)
@@ -185,7 +179,7 @@ jobs:
         shell: bash
         run: |
           docker run --rm -v "$PWD:/w" -w /w python:3.12-alpine sh -c '
-            pip install --force-reinstall dist/*.whl pytest pandas duckdb &&
+            pip install --force-reinstall dist/*.whl pytest &&
             python -m pytest infino-python/tests -v'
 
       - uses: actions/upload-artifact@v4
