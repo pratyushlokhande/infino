@@ -21,13 +21,12 @@ use object_store::{
 
 use super::{StorageError, StorageOptions};
 
-/// A `CredentialProvider` that re-extracts its credential from a shared
-/// options cell on every request, so a swap of the cell takes effect without
-/// rebuilding the store. `extract` pulls the backend's credential out of the
-/// current map (`None` if the keys are absent, `Err` if malformed).
+/// Re-extracts its credential from the shared cell on every request, so a
+/// swap of the cell takes effect without rebuilding the store.
 #[derive(Debug)]
 struct OptionsCredentialProvider<T> {
     options: Arc<ArcSwap<StorageOptions>>,
+    /// Pulls the backend's credential out of the current map (`None` if absent).
     extract: fn(&StorageOptions) -> Result<Option<T>, StorageError>,
 }
 
