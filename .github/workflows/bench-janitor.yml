@@ -31,6 +31,8 @@ env:
 jobs:
   sweep:
     runs-on: ubuntu-latest
+    # Never run in a fork: the schedule/dispatch would sweep the shared RG.
+    if: github.repository == 'infino-ai/infino'
     # OIDC subject and Azure secrets are scoped to `ci`.
     environment: ci
     steps:
