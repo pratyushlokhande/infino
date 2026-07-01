@@ -30,8 +30,9 @@ from a **`Connection`** — the catalog of tables opened with
 `connect(uri)`, which creates / opens / lists / drops tables and runs
 SQL across them. The handle's public operations are **synchronous
 methods on the supertable itself**: `append`, `update`, `delete`, the
-search methods (`bm25_search` / `vector_search`, returning Arrow rows;
-the unranked `token_match` / `exact_match`), and `schema`.
+search methods (`bm25_search` / `vector_search` / `hybrid_search`,
+returning Arrow rows; the unranked `token_match` / `exact_match`), and
+`schema`.
 
 Internally those methods drive a **reader** (a pinned, consistent
 snapshot) for queries and a single **writer** (staged changes published
@@ -57,12 +58,13 @@ unset.
 
 Those superfile-local hits are the reader's internal representation. The
 public `Supertable` search methods resolve each hit to the table's
-stable `_id` and return Arrow `RecordBatch` rows. All four (`bm25_search`,
-`vector_search`, and the unranked `token_match` / `exact_match`) take a
-column `projection`: `None` returns the whole row, and only the
-projected scalar columns are decoded — projecting just `_id` + `score`
-skips scalar decode entirely (the cheap shape for a retrieval step
-feeding a follow-up fetch).
+stable `_id` and return Arrow `RecordBatch` rows. All five (`bm25_search`,
+`vector_search`, `hybrid_search`, and the unranked `token_match` /
+`exact_match`) take a
+column `projection`: `None` returns the engine-native `_id` + `score`
+(no scalar decode), and naming columns decodes only those — so
+materializing row data is an explicit opt-in (the cheap default is the
+right shape for a retrieval step feeding a follow-up fetch).
 
 - **Vector search.** k-nearest-neighbor over a vector column for a
 query vector, returning the `k` closest rows ordered by ascending

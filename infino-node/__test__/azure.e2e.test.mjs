@@ -110,6 +110,30 @@ test("vector search", { skip }, () => {
   });
 });
 
+test("hybridSearch", { skip }, () => {
+  withDb((db) => {
+    const docs = db.createTable(
+      "docs",
+      { title: "large_utf8", emb: { vector: DIM } },
+      new IndexSpec().fts("title").vector("emb", DIM, 1, "cosine"),
+    );
+    docs.append([
+      { title: "rust async", emb: onehot(0) },
+      { title: "python data", emb: onehot(1) },
+      { title: "rust systems", emb: onehot(2) },
+    ]);
+
+    const hits = docs.hybridSearch("title", "rust", "emb", onehot(0), 10);
+    assert.ok(hits.length >= 1);
+    assert.equal(typeof hits[0]._id, "bigint");
+
+    // The SQL TVF fixes mode="or" and default nprobe, so the direct call matches.
+    const qvec = onehot(0).join(",");
+    const tvf = db.querySql(`SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '${qvec}', 10)`);
+    assert.ok(tvf.length >= 1);
+  });
+});
+
 test("bad credentials fail at connect", { skip }, () => {
   // validate: true opts into the connect-time probe, surfacing bad
   // credentials immediately instead of on the first table operation.

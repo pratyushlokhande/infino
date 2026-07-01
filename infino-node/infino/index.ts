@@ -96,6 +96,16 @@ export interface VectorSearchOptions {
   /** Restrict the kNN to rows matching a text predicate (pushdown pre-filter). */
   filter?: VectorFilter;
 }
+/** Options for `hybridSearch`. `mode` applies to the BM25 side; `nprobe` to
+ * the vector side. */
+export interface HybridSearchOptions {
+  /** BM25 boolean mode: `"or"` (default) or `"and"`. */
+  mode?: BoolMode;
+  /** IVF partitions to probe on the vector side (higher = better recall). */
+  nprobe?: number;
+  projection?: string[];
+  arrow?: boolean;
+}
 export interface TokenMatchOptions {
   mode?: BoolMode;
   projection?: string[];
@@ -291,6 +301,17 @@ export class Table {
   vectorSearch(column: string, query: number[] | Float32Array, k: number, opts: VectorSearchOptions = {}): RowRecord[] | arrow.Table {
     const q = query instanceof Float32Array ? query : Float32Array.from(query);
     const buf = this.inner.vectorSearch(column, q, k, opts.nprobe, opts.rerankMult, opts.projection, opts.filter);
+    return decode(buf, opts.arrow);
+  }
+
+  /** Hybrid BM25 + vector search, fused with reciprocal-rank fusion; rows as
+   * records (or an Arrow `Table`). `score` is the fused RRF score (higher is
+   * better). */
+  hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts: HybridSearchOptions & { arrow: true }): arrow.Table;
+  hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts?: HybridSearchOptions): RowRecord[];
+  hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts: HybridSearchOptions = {}): RowRecord[] | arrow.Table {
+    const q = vectorQuery instanceof Float32Array ? vectorQuery : Float32Array.from(vectorQuery);
+    const buf = this.inner.hybridSearch(textColumn, textQuery, vectorColumn, q, k, opts.mode, opts.nprobe, opts.projection);
     return decode(buf, opts.arrow);
   }
 

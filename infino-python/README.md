@@ -118,6 +118,23 @@ vecs.vector_search("emb", query_vector, k=10,
                    filter_column="body", filter_query="cancel subscription")
 ```
 
+## Hybrid search
+
+`hybrid_search` runs BM25 and vector kNN over the same table and fuses the
+two rankings with reciprocal-rank fusion — a higher `score` is a better
+blended match. The table needs both an FTS column and a vector column:
+
+```python
+docs = db.create_table(
+    "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, n_cent=256, metric="cosine")
+)
+
+docs.hybrid_search("title", "quick fox", "emb", query_vector, k=10)
+# mode (BM25 boolean mode) and nprobe (vector probes) are optional:
+docs.hybrid_search("title", "quick fox", "emb", query_vector, k=10,
+                   mode="and", nprobe=32)
+```
+
 ## SQL
 
 Run SQL across the catalog's tables for analytics and filtering. Results
@@ -164,9 +181,12 @@ db.query_sql("""
 """)
 ```
 
-`hybrid_search` and `bm25_search_prefix` are reachable only through SQL.
-The SQL `vector_search` takes no `nprobe` or filter arguments — use the
-`Table.vector_search` method when you need those.
+Most table functions have a direct `Table` method equivalent
+(`bm25_search`, `vector_search`, `hybrid_search`, `token_match`,
+`exact_match`); `bm25_search_prefix` is available only in SQL. The direct
+methods also expose optional arguments the SQL forms omit — SQL
+`vector_search` and `hybrid_search` take no `nprobe` (or filter), so use
+the `Table` methods when you need those.
 
 ## Projections
 
@@ -299,12 +319,12 @@ db = infino.connect(
   - `query_sql(sql) -> pyarrow.Table` — also exposes the search
     table-valued functions `bm25_search`, `bm25_search_prefix`,
     `vector_search`, `hybrid_search`, `token_match`, and `exact_match`
-    (each takes the table name first; `hybrid_search` and
-    `bm25_search_prefix` are SQL-only)
+    (each takes the table name first)
 - `Table`
   - `append(data)`
   - `bm25_search(column, query, k, mode="or", projection=None) -> pyarrow.Table`
   - `vector_search(column, query, k, nprobe=None, filter_column=None, filter_query=None, filter_mode=None, projection=None) -> pyarrow.Table`
+  - `hybrid_search(text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None) -> pyarrow.Table`
   - `token_match(column, query, mode="or", projection=None) -> pyarrow.Table`
   - `exact_match(column, value, projection=None) -> pyarrow.Table`
   - `delete(predicate) -> MutationStats`

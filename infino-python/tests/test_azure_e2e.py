@@ -133,6 +133,34 @@ def test_vector_search(db: infino.Connection) -> None:
     assert "_id" in hits.column_names and "score" in hits.column_names
 
 
+def test_hybrid_search(db: infino.Connection) -> None:
+    schema = pa.schema([
+        pa.field("title", pa.large_utf8(), nullable=False),
+        pa.field("emb", pa.list_(pa.float32(), DIM), nullable=False),
+    ])
+    table = db.create_table(
+        "docs", schema, infino.IndexSpec().fts("title").vector("emb", DIM, 1, "cosine")
+    )
+    table.append(
+        pa.record_batch(
+            [
+                pa.array(["rust async", "python data", "rust systems"], type=pa.large_utf8()),
+                pa.array([_onehot(0), _onehot(1), _onehot(2)], type=pa.list_(pa.float32(), DIM)),
+            ],
+            schema=schema,
+        )
+    )
+
+    hits = table.hybrid_search("title", "rust", "emb", _onehot(0), 10)
+    assert hits.num_rows >= 1
+    assert "_id" in hits.column_names and "score" in hits.column_names
+
+    # The SQL TVF fixes mode="or" and default nprobe, so the direct call matches.
+    csv = ",".join("1" if d == 0 else "0" for d in range(DIM))
+    tvf = db.query_sql(f"SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '{csv}', 10)")
+    assert tvf.num_rows >= 1
+
+
 def test_bad_credentials_fail_at_connect(azure_uri: str) -> None:
     # validate=True opts into the connect-time probe, surfacing bad
     # credentials immediately instead of on the first table operation.

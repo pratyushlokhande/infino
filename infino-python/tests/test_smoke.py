@@ -375,3 +375,63 @@ def test_filtered_vector_search():
         t.vector_search(
             "emb", onehot(0), 10, filter_column="title", filter_query="billing", filter_mode="xor"
         )
+
+
+def test_hybrid_search_fuses_text_and_vector():
+    db = infino.connect("memory://")
+    dim = 16
+
+    def onehot(i: int) -> list[float]:
+        v = [0.0] * dim
+        v[i] = 1.0
+        return v
+
+    schema = pa.schema([
+        pa.field("title", pa.large_utf8(), nullable=False),
+        pa.field("emb", pa.list_(pa.float32(), dim), nullable=False),
+    ])
+    t = db.create_table(
+        "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, 1, "cosine")
+    )
+    t.append(
+        pa.record_batch(
+            [
+                pa.array(["rust async", "python data", "rust systems"], type=pa.large_utf8()),
+                pa.array([onehot(0), onehot(1), onehot(2)], type=pa.list_(pa.float32(), dim)),
+            ],
+            schema=schema,
+        )
+    )
+
+    hits = t.hybrid_search("title", "rust", "emb", onehot(0), 10)
+    assert hits.num_rows >= 1
+    assert "_id" in hits.column_names and "score" in hits.column_names
+    # RRF score is higher-is-better, so rows come back descending.
+    scores = hits["score"].to_pylist()
+    assert scores == sorted(scores, reverse=True)
+
+    # Projection materializes the named scalar column.
+    projected = t.hybrid_search(
+        "title", "rust", "emb", onehot(0), 10, projection=["_id", "title", "score"]
+    )
+    assert projected.column_names == ["_id", "title", "score"]
+
+    # Direct call and the SQL table function agree on the `_id` set
+    # (the TVF fixes mode="or" and default nprobe, so match it).
+    csv = ",".join("1" if d == 0 else "0" for d in range(dim))
+    via_sql = db.query_sql(
+        f"SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '{csv}', 10)"
+    )
+    assert set(hits["_id"].to_pylist()) == set(via_sql["_id"].to_pylist())
+
+    # Invalid mode is rejected.
+    with pytest.raises(ValueError, match="mode"):
+        t.hybrid_search("title", "rust", "emb", onehot(0), 10, mode="xor")
+
+    # A non-indexed text column names the offending column.
+    with pytest.raises(ValueError, match="missing"):
+        t.hybrid_search("missing", "rust", "emb", onehot(0), 10)
+
+    # A wrong-dimension query vector reports the dimension mismatch.
+    with pytest.raises(ValueError, match="dimension"):
+        t.hybrid_search("title", "rust", "emb", [1.0, 2.0, 3.0], 10)

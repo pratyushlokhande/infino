@@ -144,18 +144,22 @@ vecs.vectorSearch("emb", queryVector, 10, {
 
 ## Hybrid search
 
-Combine BM25 and vector search in **one query** with the `hybrid_search` table
-function — a single pass over both indexes, fused inside the engine (no separate
+Combine BM25 and vector search in **one call** — a single pass over both
+indexes, fused inside the engine with reciprocal-rank fusion (no separate
 reranker service, no two round-trips). Keyword-only search misses paraphrases;
 vector-only search misses exact terms — hybrid gets both. Results come back
-best-first with a fused `score`.
+best-first with a fused `score` (higher is better).
 
 ```javascript
 const spec = new IndexSpec().fts("body").vector("emb", 384, 256, "cosine");
 const docs = db.createTable("docs", { body: "large_utf8", emb: { vector: 384 } }, spec);
 docs.append([{ body: "To cancel a subscription, open Settings then Billing.", emb: embed(/* … */) }]);
 
-// hybrid_search(table, text_col, query_text, vec_col, query_vec, k)
+// hybridSearch(textColumn, textQuery, vectorColumn, vectorQuery, k, opts?)
+docs.hybridSearch("body", "cancel subscription", "emb", embed("how do I stop my plan?"), 10);
+// opts: { mode } tunes the BM25 side, { nprobe } the vector side.
+
+// The same fusion is also a SQL table function, so it composes in a query:
 const qvec = embed("how do I stop my plan?").join(",");
 db.querySql(
   `SELECT _id, score FROM hybrid_search('docs', 'body', 'cancel subscription', 'emb', '${qvec}', 10)`,
