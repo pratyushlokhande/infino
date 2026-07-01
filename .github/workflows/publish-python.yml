@@ -178,7 +178,8 @@ jobs:
         shell: bash
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install --force-reinstall dist/*.whl pytest
+          # Include optional interop deps so no test is silently skipped.
+          python3 -m pip install --force-reinstall dist/*.whl pytest pandas duckdb
           python3 -m pytest infino-python/tests -v
 
       - uses: actions/upload-artifact@v4
