@@ -63,8 +63,8 @@ use crate::{
 ///
 /// The storage backend is derived from the URI scheme: a bare path or
 /// `file://` → local filesystem, `s3://bucket/prefix` → S3,
-/// `az://container/prefix` → Azure, `memory://` → in-process
-/// (non-persistent). Equivalent to
+/// `az://container/prefix` → Azure, `gs://bucket/prefix` → GCS,
+/// `memory://` → in-process (non-persistent). Equivalent to
 /// [`connect_with`]`(uri, ConnectOptions::default())`.
 ///
 /// ```
@@ -577,7 +577,9 @@ fn backend_to_provider(
     backend: &Backend,
     options: &ConnectOptions,
 ) -> Result<Option<Arc<dyn StorageProvider>>, InfinoError> {
-    use crate::storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider};
+    use crate::storage::{
+        AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
+    };
 
     let provider: Option<Arc<dyn StorageProvider>> = match backend {
         Backend::Memory => None,
@@ -590,6 +592,11 @@ fn backend_to_provider(
         Backend::Azure { container, prefix } => Some(Arc::new(
             AzureStorageProvider::new_with_prefix(container, prefix, &options.storage_options)?,
         )),
+        Backend::Gcs { bucket, prefix } => Some(Arc::new(GcsStorageProvider::new_with_prefix(
+            bucket,
+            prefix,
+            &options.storage_options,
+        )?)),
     };
     Ok(provider)
 }
@@ -1275,6 +1282,13 @@ mod tests {
         // Default (validate off): a bogus bucket builds a provider but the
         // backend is never touched, so connect succeeds without network.
         connect("s3://no-such-bucket-xyzzy/prefix").expect("offline connect by default");
+    }
+
+    #[test]
+    fn connect_gcs_uri_builds_offline() {
+        // Provider construction must not dial GCS — connect is offline until
+        // the first table op, exactly like the S3 case.
+        connect("gs://no-such-bucket-xyzzy/prefix").expect("offline gcs connect by default");
     }
 
     #[test]
