@@ -2,6 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/infino.svg)](https://pypi.org/project/infino/)
 [![Python](https://img.shields.io/pypi/pyversions/infino.svg)](https://pypi.org/project/infino/)
+[![Downloads](https://img.shields.io/pypi/dm/infino.svg)](https://pypi.org/project/infino/)
 [![License](https://img.shields.io/pypi/l/infino.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
 **SQL, full-text, and vector search over your data on object storage — one engine, no server to run.**

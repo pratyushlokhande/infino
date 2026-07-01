@@ -1,5 +1,10 @@
 # infino
 
+[![npm](https://img.shields.io/npm/v/@infino-ai/infino.svg)](https://www.npmjs.com/package/@infino-ai/infino)
+[![Node](https://img.shields.io/node/v/@infino-ai/infino.svg)](https://www.npmjs.com/package/@infino-ai/infino)
+[![Downloads](https://img.shields.io/npm/dm/@infino-ai/infino.svg)](https://www.npmjs.com/package/@infino-ai/infino)
+[![License](https://img.shields.io/npm/l/@infino-ai/infino.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+
 **SQL, full-text, and vector search over your data on object storage — one engine, no server to run.**
 
 Infino keeps your data in Apache Parquet on object storage (local disk, Amazon
