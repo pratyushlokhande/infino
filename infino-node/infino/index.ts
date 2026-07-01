@@ -382,12 +382,13 @@ export class Connection {
   }
 
   /**
-   * Swap rotated static credentials (`aws_*` / `azure_*` keys) into this live
-   * connection and its open tables — no reconnect. Throws if there's no
-   * rotatable credential (ambient identity / `memory://`).
+   * Merge `storageOptions` (object_store `aws_*` / `azure_*` keys) into this
+   * live connection — no reconnect. Credential keys take effect on open tables
+   * immediately; other keys apply to tables opened afterwards. Throws for
+   * non-object-store backends (`memory://`, local fs).
    */
-  rotateCredentials(storageOptions: Record<string, string>): void {
-    this.inner.rotateCredentials(storageOptions);
+  updateStorageOptions(storageOptions: Record<string, string>): void {
+    this.inner.updateStorageOptions(storageOptions);
   }
 }
 

@@ -197,10 +197,10 @@ test("connect does not probe by default", () => {
   connect("s3://no-such-bucket-xyzzy/prefix");
 });
 
-test("rotateCredentials without credentials throws", () => {
-  // memory:// has nothing static to rotate.
+test("updateStorageOptions on non-object-store throws", () => {
+  // memory:// has no storage options to update.
   const db = connect("memory://");
-  assert.throws(() => db.rotateCredentials({ aws_access_key_id: "x" }));
+  assert.throws(() => db.updateStorageOptions({ aws_access_key_id: "x" }));
 });
 
 test("vector search end-to-end", () => {

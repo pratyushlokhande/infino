@@ -238,15 +238,16 @@ impl Connection {
         batches_to_pyarrow_table(py, batches)
     }
 
-    /// Swap rotated static credentials (`aws_*` / `azure_*` keys) into this
-    /// live connection and its open tables — no reconnect. Raises if there's
-    /// no rotatable credential (ambient identity / `memory://`).
-    fn rotate_credentials(
+    /// Merge `storage_options` (object_store `aws_*` / `azure_*` keys) into
+    /// this live connection — no reconnect. Credential keys take effect on
+    /// open tables immediately; other keys apply to tables opened afterwards.
+    /// Raises for non-object-store backends (`memory://`, local fs).
+    fn update_storage_options(
         &self,
         py: Python<'_>,
         storage_options: HashMap<String, String>,
     ) -> PyResult<()> {
-        py.detach(|| self.inner.rotate_credentials(storage_options))
+        py.detach(|| self.inner.update_storage_options(storage_options))
             .map_err(py_err)
     }
 }
