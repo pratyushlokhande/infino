@@ -171,16 +171,26 @@ jobs:
           args: --release --locked --out dist -m infino-python/Cargo.toml
 
       # Install the freshly built wheel into a clean interpreter and run the
-      # smoke suite, proving it imports and round-trips before publish. Skipped
-      # for musl wheels, which can't install on the glibc-based runner.
-      - name: Smoke-test wheel
+      # smoke suite, proving it imports and round-trips before publish. glibc
+      # wheels install directly; musl wheels run in an Alpine container matching
+      # the runner arch, since they can't install on the glibc-based runner.
+      # Optional interop deps (pandas, duckdb) are installed so no test is
+      # silently skipped.
+      - name: Smoke-test wheel (glibc)
         if: ${{ !contains(matrix.target, 'musl') }}
         shell: bash
         run: |
           python3 -m pip install --upgrade pip
-          # Include optional interop deps so no test is silently skipped.
           python3 -m pip install --force-reinstall dist/*.whl pytest pandas duckdb
           python3 -m pytest infino-python/tests -v
+
+      - name: Smoke-test wheel (musl)
+        if: ${{ contains(matrix.target, 'musl') }}
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w python:3.12-alpine sh -c '
+            pip install --force-reinstall dist/*.whl pytest pandas duckdb &&
+            python -m pytest infino-python/tests -v'
 
       - uses: actions/upload-artifact@v4
         with:
