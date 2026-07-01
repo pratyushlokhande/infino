@@ -6,13 +6,13 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Data stays in Parquet on S3 (or Azure, or local disk) and you can query it at scale.
+**infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Data stays in Parquet on S3 (or Azure, GCS, or local disk) and you can query it at scale.
 
 **Why infino**
 
 - **Speed per dollar** — infino optimizes for speed per dollar, making tradeoffs to achieve object-storage economics at search engine speeds. On a 1-million-document index, warm BM25 queries return in the microsecond range — see [benchmarks](benches/README.md).
 - **Multi-modal queries** — keyword (BM25), vector, and SQL queries over the same rows, offering flexible query paths for agents.
-- **Object-storage-native** — data lives on S3, Azure, or local disk, with snapshot-isolated reads and atomic commits.
+- **Object-storage-native** — data lives on S3, Azure, GCS, or local disk, with snapshot-isolated reads and atomic commits.
 - **Open format, no lock in** — text and numeric data is stored as spec-compliant Parquet, so anything that reads Parquet can read your data.
 
 ## Contents
@@ -267,11 +267,12 @@ DuckDB *and* pyarrow) is
 ## Cloud storage
 
 The backend is chosen by the URI scheme — `s3://bucket/prefix`,
-`az://container/prefix`, `file://path`, a bare path, or `memory://`.
-Credentials go through `ConnectOptions`, keyed by `object_store`'s config
-strings (`aws_*` / `azure_*` — the names the AWS/Azure SDKs use). Infino
-reads no credentials from the environment; omit them to use ambient cloud
-identity (IAM instance role / managed identity).
+`az://container/prefix`, `gs://bucket/prefix`, `file://path`, a bare path,
+or `memory://`. Credentials go through `ConnectOptions`, keyed by
+`object_store`'s config strings (`aws_*` / `azure_*` / `google_*` — the
+names the AWS/Azure/GCS SDKs use). Infino reads no credentials from the
+environment; omit them to use ambient cloud identity (IAM instance role /
+managed identity / workload-identity ADC).
 
 ```rust
 use infino::{connect_with, ConnectOptions};
@@ -286,6 +287,10 @@ let db = connect_with("s3://bucket/prefix", ConnectOptions::new()
 let db = connect_with("az://container/prefix", ConnectOptions::new()
     .with_storage_option("azure_storage_account_name", "…")
     .with_storage_option("azure_storage_account_key", "…"))?;
+
+// GCS
+let db = connect_with("gs://bucket/prefix", ConnectOptions::new()
+    .with_storage_option("google_service_account_key", "…"))?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -295,6 +300,7 @@ Common keys:
 | ------- | ---- |
 | S3      | `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, `aws_session_token`, `aws_endpoint` |
 | Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
+| GCS     | `google_service_account` (path), `google_service_account_key` (inline JSON), `google_application_credentials`, `google_skip_signature` |
 
 The full set is whatever `object_store` accepts for the backend; an unknown
 or cross-backend key is rejected at connect. `with_validate(true)` opts into
