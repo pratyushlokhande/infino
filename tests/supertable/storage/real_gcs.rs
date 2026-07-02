@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Supertable smoke through the GCS wire protocol (fake-gcs-server).
+//! End-to-end supertable round-trip against a real GCS bucket.
 //!
-//! Gated on `INFINO_TEST_GCS=1`. Every storage call (head / get /
-//! get_range / put_atomic / put_if_match / delete / list) rides the GCS
-//! HTTP wire; nothing short-circuits to the local filesystem. The
-//! `cas_conformance` step verifies the generation-keyed conditional-write
-//! path end to end — the commit pointer CAS depends on it.
+//! Gated on `INFINO_TEST_REAL_GCS=1` plus `INFINO_GCS_BUCKET` and
+//! `GOOGLE_APPLICATION_CREDENTIALS` (a service-account key path). Every
+//! storage call rides the real GCS HTTP wire; nothing short-circuits to the
+//! local filesystem. Exercises the generation-keyed conditional-write path
+//! (`cas_conformance`) and a full commit → reopen → query cycle through a
+//! lazy disk cache, then deletes every object it wrote under its unique
+//! prefix.
+//!
+//! No emulator variant: the common GCS emulators don't faithfully implement
+//! the XML write API `object_store` uses (fake-gcs-server has no XML PUT;
+//! storage-testbench's XML PUT omits the `ETag`/`x-goog-generation` response
+//! headers `object_store` requires), so real GCS is the write-path gate.
 //!
 //! Invocation:
-//!   docker run -d --rm -p 4443:4443 fsouza/fake-gcs-server \
-//!     -scheme http -public-host 127.0.0.1:4443
-//!   INFINO_TEST_GCS=1 cargo test -p infino --test supertable storage::smoke_gcs
+//!   INFINO_TEST_REAL_GCS=1 INFINO_GCS_BUCKET=<bucket> \
+//!   GOOGLE_APPLICATION_CREDENTIALS=<sa-key.json> \
+//!   cargo test -p infino --test supertable storage::real_gcs -- --nocapture
 
 #![deny(clippy::unwrap_used)]
 
@@ -33,11 +40,9 @@ use infino::{
 };
 use tempfile::TempDir;
 
-use super::gcs_helpers::{EMULATOR_ENDPOINT, delete_emulator_bucket, ensure_emulator_bucket};
-
 /// Disk-cache byte budget for the consumer (1 GiB; the fixture is tiny).
 const CACHE_BUDGET_BYTES: u64 = 1 << 30;
-/// Cold-fetch stream fan-out and chunk size for the smoke consumer.
+/// Cold-fetch stream fan-out and chunk size for the consumer.
 const COLD_FETCH_STREAMS: usize = 4;
 const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
 
@@ -61,107 +66,6 @@ fn make_cache(
     DiskCacheStore::new(storage, cfg, pinned).expect("cache")
 }
 
-fn gcs_enabled() -> bool {
-    std::env::var("INFINO_TEST_GCS").is_ok_and(|v| v == "1")
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn supertable_smoke_via_gcs_wire_protocol() {
-    if !gcs_enabled() {
-        eprintln!("supertable_smoke_via_gcs_wire_protocol: skipped (set INFINO_TEST_GCS=1)");
-        return;
-    }
-
-    // Fresh bucket per run so the create-only pointer PUT doesn't collide
-    // with a prior run against a long-lived emulator.
-    let bucket = format!("infino-gcs-smoke-{}", uuid::Uuid::new_v4());
-    ensure_emulator_bucket(&bucket).await;
-    eprintln!("[gcs] bucket {bucket} ready on {EMULATOR_ENDPOINT}");
-
-    // Provider-level smoke: probe round-trip + full CAS conformance
-    // (generation-keyed; fake-gcs-server enforces if-generation-match).
-    {
-        let storage: Arc<dyn StorageProvider> = Arc::new(
-            GcsStorageProvider::new_with_emulator(EMULATOR_ENDPOINT, &bucket)
-                .expect("gcs provider for probe"),
-        );
-        let probe = bytes::Bytes::from_static(b"hello-gcs");
-        storage
-            .put_atomic("probe/hello.txt", probe.clone())
-            .await
-            .expect("probe put_atomic");
-        let (got, _) = storage.get("probe/hello.txt").await.expect("probe get");
-        assert_eq!(got, probe, "probe round-trip mismatch");
-
-        cas_conformance(storage.as_ref(), "cas/conf", true).await;
-        eprintln!("[gcs] probe round-trip + CAS conformance OK");
-    }
-
-    // Producer: writes + commits through the GCS wire.
-    {
-        let storage: Arc<dyn StorageProvider> = Arc::new(
-            GcsStorageProvider::new_with_emulator(EMULATOR_ENDPOINT, &bucket)
-                .expect("gcs provider for producer"),
-        );
-        let producer =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
-                .expect("create");
-        let mut w = producer.writer().expect("producer writer");
-        w.append(&build_title_batch(&["alpha bravo", "charlie delta"]))
-            .expect("append");
-        w.commit().expect("producer commit via GCS");
-        assert_eq!(producer.manifest_id(), 1);
-        eprintln!(
-            "[gcs] producer commit OK; manifest_id={}",
-            producer.manifest_id()
-        );
-    }
-
-    // Consumer: opens via the same endpoint + a disk cache; reads route
-    // through the cache → GCS get_range.
-    let consumer_storage: Arc<dyn StorageProvider> = Arc::new(
-        GcsStorageProvider::new_with_emulator(EMULATOR_ENDPOINT, &bucket)
-            .expect("gcs provider for consumer"),
-    );
-    let cache_dir = TempDir::new().expect("cache tempdir");
-    let cache = make_cache(Arc::clone(&consumer_storage), cache_dir.path());
-
-    let consumer = Supertable::open(
-        default_supertable_options()
-            .with_storage(Arc::clone(&consumer_storage))
-            .with_disk_cache(Arc::clone(&cache)),
-    )
-    .expect("Supertable::open via GCS");
-
-    assert_eq!(consumer.manifest_id(), 1, "recovered manifest_id mismatch");
-    assert_eq!(
-        consumer.reader().n_docs_total(),
-        2,
-        "recovered n_docs_total mismatch"
-    );
-
-    let pre = cache.stats();
-    assert_eq!(pre.n_cold_fetches, 0);
-    let batches = consumer
-        .reader()
-        .query_sql("SELECT COUNT(*) AS n FROM supertable")
-        .expect("query_sql via GCS");
-    assert_eq!(batches.len(), 1);
-    let post = cache.stats();
-    assert!(
-        post.n_cold_fetches >= 1,
-        "first query must cold-fetch through GCS; got n_cold_fetches={}",
-        post.n_cold_fetches
-    );
-    eprintln!(
-        "[gcs] cold-fetch via GCS OK; n_cold_fetches={} cache_bytes={}",
-        post.n_cold_fetches, post.current_bytes
-    );
-
-    delete_emulator_bucket(&bucket).await;
-    eprintln!("[gcs] smoke done; bucket {bucket} deleted");
-}
-
 /// Real-GCS config from env: `(bucket, unique_prefix, sa_key_path)`. `None`
 /// unless both `INFINO_GCS_BUCKET` and `GOOGLE_APPLICATION_CREDENTIALS` (a
 /// service-account key path) are set. The prefix carries a per-run UUID so
@@ -175,11 +79,6 @@ fn real_gcs_env() -> Option<(String, String, String)> {
     Some((bucket, prefix, key_path))
 }
 
-/// End-to-end against a real GCS bucket. Gated on `INFINO_TEST_REAL_GCS=1`
-/// plus `INFINO_GCS_BUCKET` and `GOOGLE_APPLICATION_CREDENTIALS`. Exercises
-/// the generation-keyed CAS over the real wire, then a full commit → reopen
-/// → query cycle through a lazy disk cache, and deletes every object it
-/// wrote under its unique prefix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supertable_real_gcs_round_trip() {
     if std::env::var("INFINO_TEST_REAL_GCS").ok().as_deref() != Some("1") {

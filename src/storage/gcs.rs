@@ -84,31 +84,6 @@ impl GcsStorageProvider {
         })
     }
 
-    /// Construct against a fake-gcs-server emulator at `base_url`. Signing is
-    /// skipped (the emulator accepts unsigned requests) and no credentials
-    /// are read; used by the gated GCS smoke test.
-    pub fn new_with_emulator(
-        base_url: impl Into<String>,
-        bucket: impl Into<String>,
-    ) -> Result<Self, StorageError> {
-        let bucket = bucket.into();
-        let base_url = base_url.into();
-        let store = GoogleCloudStorageBuilder::new()
-            .with_bucket_name(&bucket)
-            .with_base_url(&base_url)
-            .with_config(GoogleConfigKey::SkipSignature, "true")
-            .build()
-            .map_err(|e| StorageError::Permanent {
-                uri: format!("gs://{bucket} @ {base_url}"),
-                source: Box::new(e),
-            })?;
-        Ok(Self {
-            bucket,
-            prefix: String::new(),
-            store: Arc::new(store),
-        })
-    }
-
     /// Wrap an already-constructed `GoogleCloudStorage` — for callers that
     /// want full control over the `GoogleCloudStorageBuilder`.
     pub fn from_object_store(bucket: impl Into<String>, store: GoogleCloudStorage) -> Self {
@@ -360,15 +335,19 @@ mod tests {
     //! (head/get/get_range/put_*/delete/list/tail) are exercised end-to-end
     //! against fake-gcs-server in the gated `smoke_gcs` integration test.
     use chrono::DateTime;
-    use object_store::gcp::GoogleCloudStorageBuilder;
 
     use super::*;
 
     fn test_provider() -> GcsStorageProvider {
-        // Pure construction, no I/O: emulator constructor points at a dead
-        // port but never dials it, so path()/key()/bucket() are testable.
-        GcsStorageProvider::new_with_emulator("http://127.0.0.1:1", "test-bucket")
-            .expect("construct emulator provider")
+        // Hermetic construction, no I/O: build points at a dead port but never
+        // dials it, so path()/key()/bucket() are testable without network.
+        let store = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("test-bucket")
+            .with_base_url("http://127.0.0.1:1")
+            .with_config(GoogleConfigKey::SkipSignature, "true")
+            .build()
+            .expect("build test store");
+        GcsStorageProvider::from_object_store("test-bucket", store)
     }
 
     #[test]
@@ -488,11 +467,6 @@ mod tests {
                 .to_string(),
             "manifest-lists/list-000042.json"
         );
-    }
-
-    #[test]
-    fn new_with_emulator_exposes_bucket() {
-        assert_eq!(test_provider().bucket(), "test-bucket");
     }
 
     #[test]

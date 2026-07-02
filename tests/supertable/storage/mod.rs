@@ -3,7 +3,6 @@
 
 pub mod azure_helpers;
 pub mod compact_azure;
-pub mod gcs_helpers;
+pub mod real_gcs;
 pub mod smoke_azure;
-pub mod smoke_gcs;
 pub mod smoke_s3;
