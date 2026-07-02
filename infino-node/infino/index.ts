@@ -32,8 +32,8 @@ export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer 
 export interface ConnectOptions {
   /**
    * Credentials/tuning for the URI-selected backend, keyed by `object_store`
-   * config strings (`aws_*` / `azure_*`). An unknown key is rejected at
-   * `connect`.
+   * config strings (`aws_*` / `azure_*` / `google_*`). An unknown key is
+   * rejected at `connect`.
    */
   storageOptions?: Record<string, string>;
   /** Local disk-cache directory for remote-backed tables. */

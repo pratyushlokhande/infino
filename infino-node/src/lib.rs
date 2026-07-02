@@ -201,8 +201,8 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
 #[napi(object)]
 pub struct ConnectOptions {
     /// Credentials/tuning for the URI-selected backend, keyed by
-    /// `object_store` config strings (`aws_*` / `azure_*`). An unknown key
-    /// is rejected at `connect`.
+    /// `object_store` config strings (`aws_*` / `azure_*` / `google_*`). An
+    /// unknown key is rejected at `connect`.
     pub storage_options: Option<HashMap<String, String>>,
     /// Local disk-cache directory for remote-backed tables.
     pub cache_dir: Option<String>,

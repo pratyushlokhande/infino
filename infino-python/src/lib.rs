@@ -86,7 +86,7 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 
 /// Open (or create) a catalog rooted at `uri`. Storage config the URI
 /// can't carry is passed as keyword arguments: `storage_options` (a map
-/// of `object_store` config keys — `aws_*` / `azure_*`) and the optional
+/// of `object_store` config keys — `aws_*` / `azure_*` / `google_*`) and the optional
 /// local disk cache. Pass `validate=True` to probe the object store at
 /// connect (off by default) so bad credentials fail there. Omit all for
 /// local / `memory://` / ambient-credential object storage.
