@@ -9,11 +9,43 @@ description = "Fast search on object storage — SQL, full-text, and vector sear
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
+authors = [{ name = "Infino", email = "tech@infino.ai" }]
+keywords = [
+    "search", "vector-search", "vector-database", "full-text-search", "bm25",
+    "semantic-search", "hybrid-search", "rag", "embeddings", "retrieval",
+    "information-retrieval", "agent-memory", "sql", "parquet", "object-storage",
+    "s3", "azure-blob-storage", "gcs",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Text Processing :: Indexing",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = ["pyarrow>=14"]
 dynamic = ["version"]
 
 [project.optional-dependencies]
 test = ["pytest", "pyarrow>=14"]
+
+[project.urls]
+Homepage = "https://infino.ai"
+Documentation = "https://docs.infino.ai"
+Repository = "https://github.com/infino-ai/infino"
+Issues = "https://github.com/infino-ai/infino/issues"
+Changelog = "https://github.com/infino-ai/infino/releases"
 
 [tool.mypy]
 strict = true
