@@ -31,7 +31,6 @@
 #![deny(clippy::unwrap_used)]
 
 use std::{
-    collections::HashSet,
     ops::Range,
     sync::{
         Arc,
@@ -52,10 +51,9 @@ use infino::{
         Supertable,
         manifest::disk_cache::ManifestDiskCache,
         query::VectorSearchOptions,
-        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{AzureStorageProvider, ObjectMeta, StorageError, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_supertable_options},
+    test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
 };
 use tempfile::TempDir;
 
@@ -84,26 +82,6 @@ const VECTOR_NPROBE: usize = 4;
 /// Object / tail sizes for the `tail()` suffix-range regression test.
 const TAIL_OBJECT_LEN: usize = 256;
 const TAIL_FETCH_LEN: usize = 64;
-
-fn make_cache(
-    storage: Arc<dyn StorageProvider>,
-    cache_root: &std::path::Path,
-) -> Arc<DiskCacheStore> {
-    let cfg = DiskCacheConfig {
-        cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: 1 << 30,
-        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20,
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
-        ..Default::default()
-    };
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    DiskCacheStore::new(storage, cfg, pinned).expect("cache")
-}
 
 fn fixed_list_f32(dim: usize) -> DataType {
     DataType::FixedSizeList(
@@ -255,7 +233,7 @@ async fn supertable_smoke_via_azure_wire_protocol() {
         AzureStorageProvider::new_with_emulator(&container).expect("azure provider for consumer"),
     );
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let cache = make_cache(Arc::clone(&consumer_storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&consumer_storage), cache_dir.path());
 
     let consumer = Supertable::open(
         default_supertable_options()
@@ -713,7 +691,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
         {
             let manifest_cache = ManifestDiskCache::new(manifest_cache_root.clone(), 1 << 30)
                 .map_err(|e| format!("cold manifest cache: {e}"))?;
-            let disk_cache = make_cache(Arc::clone(&counting_dyn), &cold_cache_dir);
+            let disk_cache = default_disk_cache(Arc::clone(&counting_dyn), &cold_cache_dir);
             counting.reset();
             let consumer = Supertable::open(
                 real_azure_options(dim)
@@ -762,7 +740,7 @@ async fn manifest_disk_cache_serves_parts_without_azure_refetch() {
                 ));
             }
 
-            let disk_cache = make_cache(Arc::clone(&counting_dyn), &warm_cache_dir);
+            let disk_cache = default_disk_cache(Arc::clone(&counting_dyn), &warm_cache_dir);
             counting.reset();
             let consumer = Supertable::open(
                 real_azure_options(dim)

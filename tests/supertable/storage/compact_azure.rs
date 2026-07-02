@@ -57,7 +57,7 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray,
@@ -77,10 +77,9 @@ use infino::{
     },
     supertable::{
         Supertable, SupertableOptions,
-        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{AzureStorageProvider, StorageProvider},
     },
-    test_helpers::default_tokenizer,
+    test_helpers::{default_disk_cache, default_tokenizer},
 };
 use infino_bench_utils::corpus::generate_text_corpus;
 use rand::{SeedableRng, rngs::StdRng};
@@ -156,29 +155,6 @@ const QUERIES: &[&str] = &[
     "doc0029999", // singleton in third quarter
     "doc0039999", // singleton near the end of the corpus
 ];
-
-/// Build a `DiskCacheStore` backed by `storage` with cache files rooted at
-/// `cache_root`.  Used by both the Azurite and real-Azure tests to avoid
-/// re-fetching superfile bytes on every query.
-fn make_cache(
-    storage: Arc<dyn StorageProvider>,
-    cache_root: &std::path::Path,
-) -> Arc<DiskCacheStore> {
-    let cfg = DiskCacheConfig {
-        cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: 1 << 30,
-        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20,
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
-        ..Default::default()
-    };
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    DiskCacheStore::new(storage, cfg, pinned).expect("DiskCacheStore::new")
-}
 
 /// `Config` for the real-Azure compaction tests.  Drives `apply_config` so
 /// the storage provider, disk cache, and thread pools are all wired from one
@@ -428,7 +404,7 @@ async fn compact_azure_two_jobs_results_preserved() {
     let writer_storage: Arc<dyn StorageProvider> = Arc::new(
         AzureStorageProvider::new_with_emulator(&container).expect("azure provider for writer"),
     );
-    let cache = make_cache(Arc::clone(&writer_storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&writer_storage), cache_dir.path());
     let st = Supertable::create(
         options_title_emb()
             .with_storage(Arc::clone(&writer_storage))
@@ -556,7 +532,7 @@ async fn compact_azure_two_jobs_results_preserved() {
         AzureStorageProvider::new_with_emulator(&container)
             .expect("azure provider for fresh reader"),
     );
-    let reader_cache = make_cache(Arc::clone(&reader_storage), cache_dir.path());
+    let reader_cache = default_disk_cache(Arc::clone(&reader_storage), cache_dir.path());
     let st2 = Supertable::open(
         options_title_emb()
             .with_storage(Arc::clone(&reader_storage))

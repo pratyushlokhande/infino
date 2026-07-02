@@ -23,10 +23,7 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -39,18 +36,11 @@ use infino::{
     supertable::{
         Supertable, SupertableOptions,
         query::VectorSearchOptions,
-        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{GcsStorageProvider, StorageProvider},
     },
-    test_helpers::{cas_conformance::cas_conformance, default_tokenizer},
+    test_helpers::{cas_conformance::cas_conformance, default_disk_cache, default_tokenizer},
 };
 use tempfile::TempDir;
-
-/// Disk-cache byte budget for the consumer (1 GiB; the fixture is tiny).
-const CACHE_BUDGET_BYTES: u64 = 1 << 30;
-/// Cold-fetch stream fan-out and chunk size for the consumer.
-const COLD_FETCH_STREAMS: usize = 4;
-const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
 
 /// Vector-index shape for the unified fixture.
 const EMB_DIM: usize = 16;
@@ -61,26 +51,6 @@ const EXPECTED_N_DOCS: u64 = 8;
 /// Vector-search top-k and nprobe for the ANN query.
 const VECTOR_SEARCH_K: usize = 3;
 const VECTOR_NPROBE: usize = 4;
-
-fn make_cache(
-    storage: Arc<dyn StorageProvider>,
-    cache_root: &std::path::Path,
-) -> Arc<DiskCacheStore> {
-    let cfg = DiskCacheConfig {
-        cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: CACHE_BUDGET_BYTES,
-        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: COLD_FETCH_STREAMS,
-        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES,
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
-        ..Default::default()
-    };
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    DiskCacheStore::new(storage, cfg, pinned).expect("cache")
-}
 
 fn fixed_list_f32(dim: usize) -> DataType {
     DataType::FixedSizeList(
@@ -209,7 +179,7 @@ async fn supertable_real_gcs_round_trip() {
 
     // 3. Reopen with a lazy disk cache; BM25 + vector + SQL all read through GCS.
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
         gcs_options(EMB_DIM)
             .with_storage(Arc::clone(&storage))

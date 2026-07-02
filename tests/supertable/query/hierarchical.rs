@@ -31,7 +31,7 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -39,19 +39,14 @@ use infino::{
     superfile::{builder::FtsConfig, fts::reader::BoolMode},
     supertable::{
         Supertable, SupertableOptions,
-        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{LocalFsStorageProvider, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_supertable_options, default_tokenizer},
+    test_helpers::{
+        build_title_batch, default_disk_cache, default_supertable_options, default_tokenizer,
+    },
 };
 use rayon::ThreadPoolBuilder;
 
-/// Disk-cache byte budget (1 GiB) for the hierarchical-manifest tests.
-const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
-/// Parallel cold-fetch streams.
-const COLD_FETCH_STREAMS: usize = 4;
-/// Cold-fetch range chunk size (1 MiB).
-const COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
 /// One superfile per manifest part (forces a multi-part list).
 const TARGET_SUPERFILES_PER_PART: u64 = 1;
 /// Eager-load threshold of 0 forces lazy part loading.
@@ -63,26 +58,6 @@ const ROWS_PER_PART: i64 = 2;
 /// BM25 / prefix top-k for the hierarchical queries.
 const BM25_TOP_K: usize = 10;
 use tempfile::TempDir;
-
-fn make_cache(
-    storage: Arc<dyn StorageProvider>,
-    cache_root: &std::path::Path,
-) -> Arc<DiskCacheStore> {
-    let cfg = DiskCacheConfig {
-        cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: DISK_CACHE_BUDGET_BYTES,
-        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: COLD_FETCH_STREAMS,
-        cold_fetch_chunk_bytes: COLD_FETCH_CHUNK_BYTES,
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
-        ..Default::default()
-    };
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    DiskCacheStore::new(storage, cfg, pinned).expect("cache")
-}
 
 /// Build a producer that creates one part per commit (via
 /// target_superfiles_per_partition=1, the partition-split path),
@@ -125,7 +100,7 @@ fn bm25_exact_term_loads_only_the_matching_part() {
     // produces lazy mode but eager_load_threshold=0 is
     // explicit + test-readable.)
     let cache_dir = TempDir::new().expect("cache");
-    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
@@ -182,7 +157,7 @@ fn bm25_term_in_no_part_loads_nothing() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let cache_dir = TempDir::new().expect("cache");
-    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
@@ -231,7 +206,7 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let cache_dir = TempDir::new().expect("cache");
-    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
@@ -283,7 +258,7 @@ fn sql_loads_all_parts_returns_correct_count() {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let cache_dir = TempDir::new().expect("cache");
-    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
@@ -342,7 +317,7 @@ fn build_3_parts_two_superfiles_each(storage_dir: &std::path::Path, commits: &[[
 fn open_lazy_consumer(storage_dir: &std::path::Path, cache_dir: &std::path::Path) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
-    let cache = make_cache(Arc::clone(&storage), cache_dir);
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir);
     Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))
@@ -636,7 +611,7 @@ fn build_tag_parts(storage_dir: &std::path::Path) {
 fn open_tag_consumer(storage_dir: &std::path::Path, cache_dir: &std::path::Path) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(storage_dir).expect("provider"));
-    let cache = make_cache(Arc::clone(&storage), cache_dir);
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir);
     Supertable::open(
         tag_options()
             .with_storage(Arc::clone(&storage))
@@ -845,7 +820,7 @@ fn eager_mode_query_paths_observationally_unchanged() {
     }
 
     let cache_dir = TempDir::new().expect("cache");
-    let cache = make_cache(Arc::clone(&storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
     let consumer = Supertable::open(
         default_supertable_options()
             .with_storage(Arc::clone(&storage))

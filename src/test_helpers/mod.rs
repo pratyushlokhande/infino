@@ -27,20 +27,56 @@
 pub mod brute_force_bm25;
 pub mod cas_conformance;
 
-use std::sync::Arc;
+use std::{collections::HashSet, path::Path, sync::Arc};
 
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use rayon::ThreadPoolBuilder;
 
 use crate::{
+    storage::StorageProvider,
     superfile::{
         builder::{FtsConfig, VectorConfig},
         fts::tokenize::{AsciiLowerTokenizer, Tokenizer},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
-    supertable::SupertableOptions,
+    supertable::{
+        SupertableOptions,
+        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+    },
 };
+
+/// 1 GiB disk-cache budget for tests.
+const TEST_DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+/// Parallel cold-fetch streams for the test disk cache.
+const TEST_COLD_FETCH_STREAMS: usize = 4;
+/// Cold-fetch range chunk (1 MiB) for the test disk cache.
+const TEST_COLD_FETCH_CHUNK_BYTES: u64 = 1 << 20;
+
+/// Build a `DiskCacheStore` with the standard test config: 1 GiB budget,
+/// hybrid-with-prefetch cold fetch, mmap sweep timers disabled, LRU eviction,
+/// CRC-on-open, and a no-op pin set (pinning is a perf optimization, not a
+/// correctness requirement — an `Arc<SuperfileReader>` keeps the mmap alive
+/// past eviction). Shared by the storage / query / disk-cache tests.
+pub fn default_disk_cache(
+    storage: Arc<dyn StorageProvider>,
+    cache_root: &Path,
+) -> Arc<DiskCacheStore> {
+    let cfg = DiskCacheConfig {
+        cache_root: cache_root.to_path_buf(),
+        disk_budget_bytes: TEST_DISK_CACHE_BUDGET_BYTES,
+        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+        cold_fetch_streams: TEST_COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: TEST_COLD_FETCH_CHUNK_BYTES,
+        mmap_cold_threshold_secs: 0,
+        mmap_sweep_interval_secs: 0,
+        eviction: Box::new(LruPolicy::new()),
+        verify_crc_on_open: true,
+        ..Default::default()
+    };
+    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+    DiskCacheStore::new(storage, cfg, pinned).expect("test disk cache")
+}
 
 /// Build a `Decimal128Array(38, 0)` from `u64` ids.
 ///

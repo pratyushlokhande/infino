@@ -53,7 +53,7 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -66,10 +66,9 @@ use infino::{
     supertable::{
         Supertable,
         query::VectorSearchOptions,
-        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{S3StorageProvider, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_supertable_options},
+    test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
 };
 
 /// Single-thread rayon pool for deterministic S3 smoke runs.
@@ -142,26 +141,6 @@ async fn spawn_s3s_fs() -> (SocketAddr, TempDir) {
     });
 
     (addr, fs_root)
-}
-
-fn make_cache(
-    storage: Arc<dyn StorageProvider>,
-    cache_root: &std::path::Path,
-) -> Arc<DiskCacheStore> {
-    let cfg = DiskCacheConfig {
-        cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: 1 << 30,
-        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20,
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
-        ..Default::default()
-    };
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    DiskCacheStore::new(storage, cfg, pinned).expect("cache")
 }
 
 fn fixed_list_f32(dim: usize) -> DataType {
@@ -351,7 +330,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
         .expect("s3 provider for consumer"),
     );
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let cache = make_cache(Arc::clone(&consumer_storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&consumer_storage), cache_dir.path());
 
     let consumer = Supertable::open(
         default_supertable_options()
@@ -618,7 +597,7 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
         .expect("s3 provider for tvf consumer"),
     );
     let cache_dir = TempDir::new().expect("tvf cache tempdir");
-    let cache = make_cache(Arc::clone(&consumer_storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&consumer_storage), cache_dir.path());
 
     let consumer = Supertable::open(
         real_s3_options(dim)
