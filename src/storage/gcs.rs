@@ -333,7 +333,7 @@ mod tests {
     //! Server-free unit tests: error translation, path/key building,
     //! constructors, and the generation-as-etag mapping. The trait impls
     //! (head/get/get_range/put_*/delete/list/tail) are exercised end-to-end
-    //! against fake-gcs-server in the gated `smoke_gcs` integration test.
+    //! against a real bucket in the gated `real_gcs` integration test.
     use chrono::DateTime;
 
     use super::*;

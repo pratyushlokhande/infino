@@ -7,14 +7,14 @@
 
 **infino is a fast retrieval engine that runs SQL, full-text (BM25), and vector
 search over a single copy of your data on object storage.** Data stays in Parquet
-on S3 (or Azure, or local disk) and you query it at scale — embedded in your
+on S3 (or Azure, GCS, or local disk) and you query it at scale — embedded in your
 process, with no separate search server or vector database to run.
 
 - **Speed per dollar** — object-storage economics at search-engine speeds; on a
   1-million-document index, warm BM25 queries return in the microsecond range.
 - **Multi-modal queries** — keyword (BM25), vector, and SQL over the same rows.
 - **Object-storage-native** — snapshot-isolated reads and atomic commits over S3,
-  Azure, or local disk.
+  Azure, GCS, or local disk.
 - **Open format, no lock-in** — spec-compliant Parquet, so anything that reads
   Parquet can read your data.
 
@@ -99,9 +99,10 @@ assert_eq!(billing.iter().map(|b| b.num_rows()).sum::<usize>(), 2);   // SQL fil
 The public surface is a small connection-and-table API:
 
 - `connect` / `connect_with` open a `Connection`. The backend follows the URI
-  scheme (`s3://`, `az://`, `file://`, bare path, `memory://`); credentials are
-  passed via `ConnectOptions::with_storage_option` (object_store's `aws_*` /
-  `azure_*` keys), never read from the environment.
+  scheme (`s3://`, `az://`, `gs://`, `file://`, bare path, `memory://`);
+  credentials are passed via `ConnectOptions::with_storage_option`
+  (object_store's `aws_*` / `azure_*` / `google_*` keys), never read from the
+  environment.
 - `Connection` — `create_table`, `open_table`, `drop_table`, `list_tables`, `query_sql`.
 - `Supertable` (the table handle) — `append`, `update`, `delete`, `schema`, and the
   search methods `bm25_search`, `vector_search`, `hybrid_search`, `token_match`,

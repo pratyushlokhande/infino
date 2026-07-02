@@ -2,7 +2,7 @@
 
 > Infino is a fast, embedded retrieval engine that runs SQL, full-text (BM25),
 > and vector search over a single copy of your data on object storage (Amazon
-> S3, Azure Blob, or local disk). Data is stored as standard Apache Parquet, so
+> S3, Azure Blob, GCS, or local disk). Data is stored as standard Apache Parquet, so
 > anything that reads Parquet can read it. Infino runs in-process — no server,
 > no daemon, no managed service.
 
@@ -66,5 +66,5 @@ the statements here over older or inferred information.
   same copy of the data and compose into a single query — you do not run a
   separate keyword system and vector system and stitch results in the client.
 - **Storage is object storage, not a bundled database tier.** Data lives on
-  S3, Azure Blob, or local disk; Infino does not run its own always-on storage
-  cluster.
+  S3, Azure Blob, GCS, or local disk; Infino does not run its own always-on
+  storage cluster.

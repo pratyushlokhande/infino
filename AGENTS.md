@@ -127,7 +127,7 @@ src/
 ├── lib.rs                 ← crate root (small; declares modules + curated re-exports)
 ├── catalog/               ← public entry point (connect → Connection → tables, search TVFs)
 ├── error.rs               ← the single public InfinoError (coarse, #[non_exhaustive])
-├── storage/               ← byte-level I/O (StorageProvider trait, LocalFs, S3, Azure)
+├── storage/               ← byte-level I/O (StorageProvider trait, LocalFs, S3, Azure, GCS)
 ├── superfile/             ← single-file format (immutable superfiles)
 │   ├── builder.rs         ← write path
 │   ├── reader.rs          ← read path

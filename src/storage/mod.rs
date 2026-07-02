@@ -246,7 +246,7 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     ///
     /// Default returns an empty list — test/mock providers that don't
     /// need listing can leave the default in place; production providers
-    /// (LocalFs, S3, Azure) override.
+    /// (LocalFs, S3, Azure, GCS) override.
     async fn list_with_prefix_metadata(
         &self,
         _prefix: &str,
