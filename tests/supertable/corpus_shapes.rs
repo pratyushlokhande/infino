@@ -163,7 +163,6 @@ fn assert_shape(shape: &str, expected_version: u32) {
             );
         }
     }
-
 }
 
 /// The table opens under the current engine and ranks: the shape is not
