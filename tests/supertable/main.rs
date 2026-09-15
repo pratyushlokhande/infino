@@ -30,6 +30,7 @@
 
 mod bioasq_admit_diag;
 mod commit;
+mod corpus_shapes;
 mod compact_gc;
 mod disk_cache;
 mod drain_tombstones;
