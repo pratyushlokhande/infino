@@ -229,7 +229,7 @@ pub(crate) const TERM_BLOCK_SIZE: usize = 32;
 /// Trailing footer of a term-block region: `n_terms`, `n_blocks`,
 /// `block_size` (`u32` each) and the offset of the key area (`u64`),
 /// which is also where the blocks end.
-const TERM_BLOCKS_FOOTER_BYTES: usize = 3 * 4 + 8;
+pub(crate) const TERM_BLOCKS_FOOTER_BYTES: usize = 3 * 4 + 8;
 /// One index-table entry: the block's byte offset (`u64`) and the start
 /// of its first key within the key area (`u32`).
 const INDEX_ENTRY_BYTES: usize = 8 + 4;
@@ -386,12 +386,17 @@ impl<W: Write> TermBlockWriter<W> {
     }
 }
 
-/// A term-block dictionary over borrowed bytes. Opening reads the
-/// footer only; the index table is consulted in place per lookup, and a
-/// malformed entry answers as an absent key rather than a panic (the
-/// region is CRC-checked at open, so this is defensive).
-pub(crate) struct TermBlocks<'a> {
+/// The index half of a term-block dictionary — the block first keys, the
+/// offset table and the footer, which sit together at the region's end —
+/// over borrowed bytes that need not include the blocks themselves. It
+/// says which block can hold a key and where that block's bytes are, so a
+/// reader that fetched only this tail can fetch one block for a lookup.
+/// A malformed entry answers as an absent key rather than a panic.
+pub(crate) struct TermBlockIndex<'a> {
+    /// The tail held: from `base` to the end of the dictionary region.
     bytes: &'a [u8],
+    /// Offset of `bytes[0]` within the dictionary region.
+    base: usize,
     n_blocks: usize,
     /// End of the block area (start of the key area).
     blocks_end: usize,
@@ -399,50 +404,52 @@ pub(crate) struct TermBlocks<'a> {
     keys_end: usize,
 }
 
-impl<'a> TermBlocks<'a> {
-    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, String> {
-        if bytes.len() < TERM_BLOCKS_FOOTER_BYTES {
+impl<'a> TermBlockIndex<'a> {
+    /// Parse the footer of a dictionary region `dict_len` bytes long from
+    /// `tail`, its last `tail.len()` bytes. Refused unless the tail reaches
+    /// back at least to the key area.
+    pub(crate) fn open(tail: &'a [u8], dict_len: usize) -> Result<Self, String> {
+        if tail.len() < TERM_BLOCKS_FOOTER_BYTES || tail.len() > dict_len {
             return Err("term-block dictionary shorter than its footer".into());
         }
-        let f = bytes.len() - TERM_BLOCKS_FOOTER_BYTES;
         let footer = "term-block dictionary footer is malformed";
-        let n_terms = u32_le_at(bytes, f).ok_or(footer)? as usize;
-        let n_blocks = u32_le_at(bytes, f + 4).ok_or(footer)? as usize;
-        let block_size = u32_le_at(bytes, f + 8).ok_or(footer)? as usize;
-        let keys_offset = u64_le_at(bytes, f + 12).ok_or(footer)? as usize;
-        let table_bytes = n_blocks
-            .checked_mul(INDEX_ENTRY_BYTES)
-            .ok_or("term-block dictionary footer is malformed")?;
-        let keys_end = f
+        let base = dict_len - tail.len();
+        let f = tail.len() - TERM_BLOCKS_FOOTER_BYTES;
+        let n_terms = u32_le_at(tail, f).ok_or(footer)? as usize;
+        let n_blocks = u32_le_at(tail, f + 4).ok_or(footer)? as usize;
+        let block_size = u32_le_at(tail, f + 8).ok_or(footer)? as usize;
+        let keys_offset = u64_le_at(tail, f + 12).ok_or(footer)? as usize;
+        let table_bytes = n_blocks.checked_mul(INDEX_ENTRY_BYTES).ok_or(footer)?;
+        let keys_end = (base + f)
             .checked_sub(table_bytes)
             .ok_or("term-block index does not fit before the footer")?;
         if block_size != TERM_BLOCK_SIZE || keys_offset > keys_end || n_terms < n_blocks {
-            return Err("term-block dictionary footer is malformed".into());
+            return Err(footer.into());
         }
-        let dict = Self {
-            bytes,
+        if keys_offset < base {
+            return Err("term-block index tail does not reach the key area".into());
+        }
+        Ok(Self {
+            bytes: tail,
+            base,
             n_blocks,
             blocks_end: keys_offset,
             keys_end,
-        };
-        // The first block starts the region and its first entry is the
-        // first indexed key; the table and footer sit at the end, so a
-        // region whose bytes shifted still parses them yet misreads the
-        // blocks — this one decode catches that.
-        let anchored = match n_blocks {
-            0 => keys_offset == keys_end,
-            _ => {
-                dict.entry(0) == Some((0, 0))
-                    && dict.block_range(0).is_some_and(|range| {
-                        let mut cur = BlockCursor::new(&bytes[range]);
-                        cur.next().is_some() && Some(cur.key.as_slice()) == dict.first_key(0)
-                    })
-            }
-        };
-        if !anchored {
-            return Err("term-block index is misaligned".into());
-        }
-        Ok(dict)
+        })
+    }
+
+    /// Where the index tail starts within a dictionary region, read from
+    /// the region's last [`TERM_BLOCKS_FOOTER_BYTES`] bytes — what a reader
+    /// fetches to learn how much tail it needs.
+    pub(crate) fn tail_start(footer: &[u8]) -> Option<usize> {
+        let f = footer.len().checked_sub(TERM_BLOCKS_FOOTER_BYTES)?;
+        Some(u64_le_at(footer, f + 12)? as usize)
+    }
+
+    /// The bytes of the tail at region offset `at`, `len` long.
+    fn tail(&self, at: usize, len: usize) -> Option<&'a [u8]> {
+        let from = at.checked_sub(self.base)?;
+        self.bytes.get(from..from.checked_add(len)?)
     }
 
     /// Block `b`'s byte offset and the start of its first key within the
@@ -451,9 +458,9 @@ impl<'a> TermBlocks<'a> {
         if b >= self.n_blocks {
             return None;
         }
-        let at = self.keys_end + b * INDEX_ENTRY_BYTES;
-        let block_start = u64_le_at(self.bytes, at)? as usize;
-        let key_start = u32_le_at(self.bytes, at + 8)? as usize;
+        let entry = self.tail(self.keys_end + b * INDEX_ENTRY_BYTES, INDEX_ENTRY_BYTES)?;
+        let block_start = u64_le_at(entry, 0)? as usize;
+        let key_start = u32_le_at(entry, 8)? as usize;
         Some((block_start, key_start))
     }
 
@@ -464,13 +471,23 @@ impl<'a> TermBlocks<'a> {
             Some((_, next)) => next,
             None => self.keys_end - self.blocks_end,
         };
-        self.bytes
-            .get(self.blocks_end + start..self.blocks_end + end)
+        self.tail(self.blocks_end + start, end.checked_sub(start)?)
+    }
+
+    /// Number of blocks the dictionary holds.
+    pub(crate) fn n_blocks(&self) -> usize {
+        self.n_blocks
+    }
+
+    /// Where the index tail starts within the dictionary region: the start
+    /// of the key area, which the table and footer follow.
+    pub(crate) fn tail_offset(&self) -> usize {
+        self.blocks_end
     }
 
     /// Index of the last block whose first key is `<= key`, if any. A
     /// malformed entry sorts as greater, so it is never chosen.
-    fn block_for(&self, key: &[u8]) -> Option<usize> {
+    pub(crate) fn block_for(&self, key: &[u8]) -> Option<usize> {
         let (mut lo, mut hi) = (0usize, self.n_blocks);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
@@ -482,7 +499,8 @@ impl<'a> TermBlocks<'a> {
         lo.checked_sub(1)
     }
 
-    fn block_range(&self, b: usize) -> Option<Range<usize>> {
+    /// Block `b`'s byte range within the dictionary region.
+    pub(crate) fn block_range(&self, b: usize) -> Option<Range<usize>> {
         let (start, _) = self.entry(b)?;
         let end = match self.entry(b + 1) {
             Some((next, _)) => next,
@@ -490,19 +508,58 @@ impl<'a> TermBlocks<'a> {
         };
         (start <= end && end <= self.blocks_end).then_some(start..end)
     }
+}
+
+/// Exact lookup of `key` in one block's bytes — the block
+/// [`TermBlockIndex::block_for`] names for it.
+pub(crate) fn lookup_in_block(block: &[u8], key: &[u8]) -> Option<FstValue> {
+    let mut cur = BlockCursor::new(block);
+    while let Some(entry) = cur.next() {
+        match cur.key.as_slice().cmp(key) {
+            Ordering::Less => continue,
+            Ordering::Equal => return Some(entry),
+            Ordering::Greater => return None,
+        }
+    }
+    None
+}
+
+/// A term-block dictionary over borrowed bytes. Opening reads the
+/// footer only; the index table is consulted in place per lookup, and a
+/// malformed entry answers as an absent key rather than a panic (the
+/// region is CRC-checked at open, so this is defensive).
+pub(crate) struct TermBlocks<'a> {
+    bytes: &'a [u8],
+    index: TermBlockIndex<'a>,
+}
+
+impl<'a> TermBlocks<'a> {
+    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, String> {
+        let index = TermBlockIndex::open(bytes, bytes.len())?;
+        // The first block starts the region and its first entry is the
+        // first indexed key; the table and footer sit at the end, so a
+        // region whose bytes shifted still parses them yet misreads the
+        // blocks — this one decode catches that.
+        let anchored = match index.n_blocks {
+            0 => index.blocks_end == index.keys_end,
+            _ => {
+                index.entry(0) == Some((0, 0))
+                    && index.block_range(0).is_some_and(|range| {
+                        let mut cur = BlockCursor::new(&bytes[range]);
+                        cur.next().is_some() && Some(cur.key.as_slice()) == index.first_key(0)
+                    })
+            }
+        };
+        if !anchored {
+            return Err("term-block index is misaligned".into());
+        }
+        Ok(Self { bytes, index })
+    }
 
     /// Exact lookup.
     pub(crate) fn lookup(&self, key: &[u8]) -> Option<FstValue> {
-        let b = self.block_for(key)?;
-        let mut cur = BlockCursor::new(&self.bytes[self.block_range(b)?]);
-        while let Some(entry) = cur.next() {
-            match cur.key.as_slice().cmp(key) {
-                Ordering::Less => continue,
-                Ordering::Equal => return Some(entry),
-                Ordering::Greater => return None,
-            }
-        }
-        None
+        let range = self.index.block_range(self.index.block_for(key)?)?;
+        lookup_in_block(&self.bytes[range], key)
     }
 
     /// Visit every `(key, entry)` whose key starts with `prefix` and is
@@ -514,9 +571,9 @@ impl<'a> TermBlocks<'a> {
         from: &[u8],
         mut visit: impl FnMut(&[u8], FstValue) -> bool,
     ) {
-        let mut b = self.block_for(from).unwrap_or(0);
-        while b < self.n_blocks {
-            let Some(range) = self.block_range(b) else {
+        let mut b = self.index.block_for(from).unwrap_or(0);
+        while b < self.index.n_blocks {
+            let Some(range) = self.index.block_range(b) else {
                 return;
             };
             let mut cur = BlockCursor::new(&self.bytes[range]);

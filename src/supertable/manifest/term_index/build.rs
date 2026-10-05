@@ -29,14 +29,15 @@ use uuid::Uuid;
 use super::{
     TermIndexError,
     format::{
-        Location, Posting, Root, Segment, SliceRef, encode_run, encode_slice, push_posting,
-        read_posting,
+        Location, Posting, Root, Segment, SliceRef, encode_run, encode_slice, push_checked_run,
+        push_posting, read_posting,
     },
 };
 use crate::{
+    superfile::format::CRC_BYTES,
     supertable::manifest::part::ContentHash,
     utils::{
-        terms::{FstValue, TermBlockWriter},
+        terms::{FstValue, TERM_BLOCK_SIZE, TermBlockWriter},
         varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
     },
 };
@@ -328,7 +329,7 @@ impl SliceBuilder {
                 },
             )
             .expect("Vec sink cannot fail");
-        self.postings.extend_from_slice(run);
+        push_checked_run(&mut self.postings, run);
         if self.first_key.is_none() {
             self.first_key = Some(key.to_vec());
         }
@@ -341,8 +342,10 @@ impl SliceBuilder {
     /// estimated: how much of a key front-coding keeps depends on the
     /// column, and a column of random keys shares almost no prefix, so a
     /// fixed guess undercounted those slices to about twice the target.
+    /// The block table is one CRC per dictionary block plus the head CRC.
     fn encoded_bytes(&self) -> usize {
-        self.postings.len() + self.dict.encoded_len()
+        let table = (self.n_terms.div_ceil(TERM_BLOCK_SIZE) + 1) * CRC_BYTES;
+        self.postings.len() + self.dict.encoded_len() + table
     }
 
     fn finish(self) -> Option<(SliceRef, Vec<u8>)> {
