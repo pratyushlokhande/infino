@@ -152,6 +152,11 @@ impl ManifestDiskCache {
         }
     }
 
+    /// Whether an object is cached, without reading it.
+    pub(crate) fn contains(&self, hash: &ContentHash) -> bool {
+        self.entries.contains_key(hash)
+    }
+
     /// Look up a part's compressed bytes by content hash.
     ///
     /// Returns `Some(bytes)` on a verified hit and `None` on a miss.
