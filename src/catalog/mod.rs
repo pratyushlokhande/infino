@@ -58,7 +58,7 @@ use manifest::{
 pub use options::{ColdFetchMode, ConnectOptions};
 pub use table::Supertable;
 use tokio::runtime::{Handle, Runtime};
-use tracing::{Instrument, debug, info};
+use tracing::{Instrument, debug, info, warn};
 use uri::{Backend, parse_uri};
 
 /// Most `AND` / `OR` connectives allowed in one SQL statement or mutation predicate: past a few
@@ -96,6 +96,7 @@ use crate::{
         fts::{
             analysis::{Stemmer, Stopwords},
             bm25,
+            tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
         },
         vector::{builder::VectorConfig, distance::Metric},
     },
@@ -580,121 +581,18 @@ impl Connection {
                     InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
                 })?;
 
-                let schema = schema_from_ipc(&entry.schema_ipc)
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
-                // Rebuild the index spec from the recorded declarations and
-                // lower it through the *same* path `create_table` used, so
-                // the defaults it applies (rotation seed, rerank codec) are
-                // identical and the table's options-hash check passes.
-                let mut spec = IndexSpec::new();
-                // The analyzer decides how query text is tokenized, so it
-                // cannot be inferred: a record that does not name one per
-                // full-text column is unusable, and guessing would return
-                // wrong results rather than an error.
-                if entry.fts_analyzers.len() != entry.fts.len() {
-                    return Err(InfinoError::Backend(format!(
-                        "table '{name}' has {} full-text columns but {} analyzer names recorded; \
-                         the table record is incomplete",
-                        entry.fts.len(),
-                        entry.fts_analyzers.len()
-                    ))
-                    .with_context("open_table", Some(name)));
-                }
-                for (i, column) in entry.fts.iter().enumerate() {
-                    let analyzer = entry.fts_analyzers[i].as_str();
-                    // `fts_stored` keeps its back-compat rule: a catalog
-                    // written before index-only columns existed can only
-                    // mean the text is stored.
-                    let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
-                    // Same rule for positions: a catalog written before
-                    // they were declarable describes a table built
-                    // without them, because nothing could have asked
-                    // for them.
-                    let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
-                    // Same rule for the analysis filters: a catalog
-                    // written before they existed, or one whose entry
-                    // is empty, describes a column with no filter. A
-                    // name that does not resolve is different — the
-                    // recorded analysis cannot be reproduced, so the
-                    // table is unusable rather than usable-with-a-guess.
-                    let stopwords = match entry.fts_stopwords.get(i).map(String::as_str) {
-                        None | Some("") => Stopwords::None,
-                        Some(set) => Stopwords::from_name(set).ok_or_else(|| {
-                            InfinoError::Backend(format!(
-                                "table '{name}' column {column:?} records unknown stopwords \
-                                 {set:?}"
-                            ))
-                            .with_context("open_table", Some(name))
+                let handle = match SupertableHandle::open(self.recorded_table_options(
+                    name,
+                    entry,
+                    &entry.fts_analyzers,
+                )?) {
+                    Ok(handle) => handle,
+                    Err(e) => self
+                        .open_after_analyzer_change(root, name, entry)
+                        .ok_or_else(|| {
+                            InfinoError::from(e).with_context("open_table", Some(name))
                         })?,
-                    };
-                    let stemmer = match entry.fts_stemmers.get(i).map(String::as_str) {
-                        None | Some("") => Stemmer::None,
-                        Some(stem) => Stemmer::from_name(stem).ok_or_else(|| {
-                            InfinoError::Backend(format!(
-                                "table '{name}' column {column:?} records unknown stemmer \
-                                 {stem:?}"
-                            ))
-                            .with_context("open_table", Some(name))
-                        })?,
-                    };
-                    // And again for the BM25 pair: a catalog written before
-                    // it was declarable can only describe a table built with
-                    // the standard values, so the fallback is frozen there
-                    // rather than tracking the crate default.
-                    let k1 = entry.fts_k1.get(i).copied().unwrap_or(bm25::K1);
-                    let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
-                    spec = spec.fts(
-                        FtsField::new(column.clone())
-                            .analyzer(analyzer)
-                            .stopwords(stopwords)
-                            .stemmer(stemmer)
-                            .positions(positions)
-                            .stored(stored)
-                            .bm25(k1, b),
-                    );
-                }
-                for v in &entry.vectors {
-                    spec = spec.vector(
-                        v.column.clone(),
-                        v.dim,
-                        metric_from_str(&v.metric)
-                            .map_err(|e| e.with_context("open_table", Some(name)))?,
-                    );
-                }
-                let (fts_cfg, vec_cfg) = spec.to_configs();
-
-                let table_storage = backend_to_provider(
-                    &self.inner.backend.join(&entry.location),
-                    &self.inner.options,
-                    Arc::clone(&self.inner.usage_meter),
-                    self.inner.gcs_credential.as_ref(),
-                )
-                .map_err(|e| e.with_context("open_table", Some(name)))?
-                .expect("non-memory backend yields a storage provider");
-
-                // Cache directory is keyed on the stable name, matching
-                // `create_table` (the on-storage subtree is `entry.location`).
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
-                let mut opts = build_options(
-                    schema,
-                    fts_cfg,
-                    vec_cfg,
-                    Some(table_storage),
-                    Arc::clone(&self.inner.connection_memory_budget),
-                )
-                .map_err(|e| e.with_context("open_table", Some(name)))?;
-                if let Some((cache, manifest_cache)) = disk_cache {
-                    opts = opts
-                        .with_disk_cache(cache)
-                        .with_manifest_disk_cache(manifest_cache);
-                }
-                // Honor the connection's read-consistency policy. Default is
-                // BoundedStaleness(1s): the per-query pointer re-check is
-                // amortized across the window rather than paid on every query.
-                opts = opts.with_read_consistency(self.inner.options.read_consistency);
-                let handle = SupertableHandle::open(opts)
-                    .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
+                };
                 handles.insert(name.to_string(), handle.clone());
 
                 Ok(handle)
@@ -708,6 +606,191 @@ impl Connection {
             )
             .with_context("open_table", Some(name))),
         }
+    }
+
+    /// The options a table's catalog record describes, with `analyzers` as
+    /// its full-text columns' base tokenizers.
+    ///
+    /// Lowered through the *same* path `create_table` used, so the defaults
+    /// it applies (rotation seed, rerank codec) are identical and the
+    /// table's options-hash check passes.
+    fn recorded_table_options(
+        &self,
+        name: &str,
+        entry: &TableEntry,
+        analyzers: &[String],
+    ) -> Result<SupertableOptions, InfinoError> {
+        let schema = schema_from_ipc(&entry.schema_ipc)
+            .map_err(|e| e.with_context("open_table", Some(name)))?;
+        // Rebuild the index spec from the recorded declarations and
+        // lower it through the *same* path `create_table` used, so
+        // the defaults it applies (rotation seed, rerank codec) are
+        // identical and the table's options-hash check passes.
+        let mut spec = IndexSpec::new();
+        // The analyzer decides how query text is tokenized, so it
+        // cannot be inferred: a record that does not name one per
+        // full-text column is unusable, and guessing would return
+        // wrong results rather than an error.
+        if analyzers.len() != entry.fts.len() {
+            return Err(InfinoError::Backend(format!(
+                "table '{name}' has {} full-text columns but {} analyzer names recorded; \
+                 the table record is incomplete",
+                entry.fts.len(),
+                analyzers.len()
+            ))
+            .with_context("open_table", Some(name)));
+        }
+        for (i, column) in entry.fts.iter().enumerate() {
+            let analyzer = analyzers[i].as_str();
+            // `fts_stored` keeps its back-compat rule: a catalog
+            // written before index-only columns existed can only
+            // mean the text is stored.
+            let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
+            // Same rule for positions: a catalog written before
+            // they were declarable describes a table built
+            // without them, because nothing could have asked
+            // for them.
+            let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
+            // Same rule for the analysis filters: a catalog
+            // written before they existed, or one whose entry
+            // is empty, describes a column with no filter. A
+            // name that does not resolve is different — the
+            // recorded analysis cannot be reproduced, so the
+            // table is unusable rather than usable-with-a-guess.
+            let stopwords = match entry.fts_stopwords.get(i).map(String::as_str) {
+                None | Some("") => Stopwords::None,
+                Some(set) => Stopwords::from_name(set).ok_or_else(|| {
+                    InfinoError::Backend(format!(
+                        "table '{name}' column {column:?} records unknown stopwords \
+                         {set:?}"
+                    ))
+                    .with_context("open_table", Some(name))
+                })?,
+            };
+            let stemmer = match entry.fts_stemmers.get(i).map(String::as_str) {
+                None | Some("") => Stemmer::None,
+                Some(stem) => Stemmer::from_name(stem).ok_or_else(|| {
+                    InfinoError::Backend(format!(
+                        "table '{name}' column {column:?} records unknown stemmer \
+                         {stem:?}"
+                    ))
+                    .with_context("open_table", Some(name))
+                })?,
+            };
+            // And again for the BM25 pair: a catalog written before
+            // it was declarable can only describe a table built with
+            // the standard values, so the fallback is frozen there
+            // rather than tracking the crate default.
+            let k1 = entry.fts_k1.get(i).copied().unwrap_or(bm25::K1);
+            let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
+            spec = spec.fts(
+                FtsField::new(column.clone())
+                    .analyzer(analyzer)
+                    .stopwords(stopwords)
+                    .stemmer(stemmer)
+                    .positions(positions)
+                    .stored(stored)
+                    .bm25(k1, b),
+            );
+        }
+        for v in &entry.vectors {
+            spec = spec.vector(
+                v.column.clone(),
+                v.dim,
+                metric_from_str(&v.metric).map_err(|e| e.with_context("open_table", Some(name)))?,
+            );
+        }
+        let (fts_cfg, vec_cfg) = spec.to_configs();
+
+        let table_storage = backend_to_provider(
+            &self.inner.backend.join(&entry.location),
+            &self.inner.options,
+            Arc::clone(&self.inner.usage_meter),
+            self.inner.gcs_credential.as_ref(),
+        )
+        .map_err(|e| e.with_context("open_table", Some(name)))?
+        .expect("non-memory backend yields a storage provider");
+
+        // Cache directory is keyed on the stable name, matching
+        // `create_table` (the on-storage subtree is `entry.location`).
+        let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
+            .map_err(|e| e.with_context("open_table", Some(name)))?;
+        let mut opts = build_options(
+            schema,
+            fts_cfg,
+            vec_cfg,
+            Some(table_storage),
+            Arc::clone(&self.inner.connection_memory_budget),
+        )
+        .map_err(|e| e.with_context("open_table", Some(name)))?;
+        if let Some((cache, manifest_cache)) = disk_cache {
+            opts = opts
+                .with_disk_cache(cache)
+                .with_manifest_disk_cache(manifest_cache);
+        }
+        // Honor the connection's read-consistency policy. Default is
+        // BoundedStaleness(1s): the per-query pointer re-check is
+        // amortized across the window rather than paid on every query.
+        opts = opts.with_read_consistency(self.inner.options.read_consistency);
+        Ok(opts)
+    }
+
+    /// Open a table an analyzer change moved to `standard` while its catalog
+    /// record still names `ascii_lower`, and correct the record.
+    ///
+    /// The change publishes the table's new options in its own manifest
+    /// and leaves the record to whoever opens the table next, so a table
+    /// that has been migrated always looks like this once. Opening it under
+    /// the recorded analyzer fails the options-hash check; opening it with
+    /// every `ascii_lower` column as `standard` passes only if that is
+    /// exactly what the table is, because the check compares exact hashes.
+    fn open_after_analyzer_change(
+        &self,
+        root: &Arc<dyn StorageProvider>,
+        name: &str,
+        entry: &TableEntry,
+    ) -> Option<SupertableHandle> {
+        if !entry
+            .fts_analyzers
+            .iter()
+            .any(|a| a == ASCII_LOWER_TOKENIZER)
+        {
+            return None;
+        }
+        let analyzers: Vec<String> = entry
+            .fts_analyzers
+            .iter()
+            .map(|a| match a.as_str() {
+                ASCII_LOWER_TOKENIZER => STANDARD_TOKENIZER.to_string(),
+                _ => a.clone(),
+            })
+            .collect();
+        let handle =
+            SupertableHandle::open(self.recorded_table_options(name, entry, &analyzers).ok()?)
+                .ok()?;
+
+        // Best effort: until the record is corrected every open of this
+        // table takes this path, which costs a failed open and nothing else.
+        let (table, location) = (name.to_string(), entry.location.clone());
+        let corrected = bridge_on_runtime(
+            commit_catalog(root.as_ref(), move |body| {
+                if let Some(record) = body.tables.get_mut(&table)
+                    && record.location == location
+                {
+                    record.fts_analyzers = analyzers.clone();
+                }
+                Ok(())
+            }),
+            &shared_io_runtime(),
+        );
+        match corrected {
+            Ok(()) => info!(
+                table = name,
+                "recorded the standard analyzer after an analyzer change"
+            ),
+            Err(e) => warn!(table = name, error = %e, "could not record the standard analyzer"),
+        }
+        Some(handle)
     }
 
     /// Open an existing table by name. Fails with

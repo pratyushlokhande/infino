@@ -23,6 +23,7 @@ use futures::future::join_all;
 use tracing::warn;
 use uuid::Uuid;
 
+mod analyzer;
 mod build;
 
 use crate::{
@@ -248,6 +249,13 @@ pub struct StalenessReport {
     /// that only looks consistent. Non-empty means a superfile needs a
     /// person, not a migration; these are counted nowhere else.
     pub inconsistent_footers: Vec<Uuid>,
+    /// Full-text columns still on the `ascii_lower` analyzer, which only
+    /// [`crate::ReindexMode::ToStandardAnalyzer`] moves.
+    ///
+    /// Not counted by [`Self::is_current`]: the analyzer is a choice the
+    /// table was created with, not something behind, and changing it
+    /// changes what the table matches.
+    pub ascii_lower_columns: Vec<String>,
 }
 
 impl StalenessReport {
@@ -368,7 +376,7 @@ pub(crate) fn plan_jobs(
             ReindexMode::Rewrite => s.needs_rewrite(),
             // Re-analysis produces new terms and a current container, so
             // it repairs either axis.
-            ReindexMode::Auto | ReindexMode::Reanalyze => {
+            ReindexMode::Auto | ReindexMode::Reanalyze | ReindexMode::ToStandardAnalyzer => {
                 s.needs_rewrite() || s.fts.needs_reanalysis()
             }
         })
@@ -380,6 +388,7 @@ pub(crate) fn plan_jobs(
             let repair = match mode {
                 ReindexMode::Rewrite => Repair::Layout,
                 ReindexMode::Reanalyze => Repair::Terms,
+                ReindexMode::ToStandardAnalyzer => Repair::Standard,
                 // The cheapest repair that makes *this* file current:
                 // copying postings cannot clear a stale revision, so only
                 // a file whose terms are current can take the cheap one.
@@ -422,6 +431,9 @@ pub(crate) enum Repair {
     Layout,
     /// Re-analyze the stored text, which brings the layout current too.
     Terms,
+    /// Re-analyze the stored text with every `ascii_lower` column moved to
+    /// `standard`.
+    Standard,
 }
 
 impl Supertable {
@@ -541,6 +553,9 @@ impl Supertable {
         if self.inner().manifest.load_full().options.storage.is_none() {
             return Err(ReindexError::NoStorage);
         }
+        if opts.mode == ReindexMode::ToStandardAnalyzer {
+            return Ok(self.plan_standard_analyzer());
+        }
         let assessment = self
             .stale_superfiles(opts.trust_writer_analysis)
             .await
@@ -553,6 +568,7 @@ impl Supertable {
                 mode: match repair {
                     Repair::Layout => ReindexMode::Rewrite,
                     Repair::Terms => ReindexMode::Reanalyze,
+                    Repair::Standard => ReindexMode::ToStandardAnalyzer,
                 },
                 live_bytes: job.estimated_output_bytes,
             })
@@ -606,6 +622,14 @@ impl Supertable {
             }
         }
         report.unrepairable_columns = unrepairable_column_names(&stale);
+        report.ascii_lower_columns = self
+            .inner()
+            .manifest
+            .load()
+            .options
+            .ascii_lower_columns()
+            .map(|c| c.column.clone())
+            .collect();
         Ok(report)
     }
 
@@ -659,6 +683,11 @@ impl Supertable {
             opts.stale_seal_timeout_ms
                 .unwrap_or_else(|| config::global().compaction.stale_seal_timeout_ms),
         );
+        // A change of analyzer is one table-wide publish, not a repair per
+        // superfile; see `analyzer`.
+        if opts.mode == ReindexMode::ToStandardAnalyzer {
+            return self.change_to_standard_analyzer(stale_seal_timeout).await;
+        }
 
         // Share compaction's slot rather than adding a second one: both
         // rewrite superfiles and commit manifest swaps, so letting them
@@ -698,7 +727,7 @@ impl Supertable {
                 // it could not repair, which are named separately. `Auto`
                 // re-analyzes exactly the files on this axis, so it clears
                 // it too.
-                ReindexMode::Auto | ReindexMode::Reanalyze => 0,
+                ReindexMode::Auto | ReindexMode::Reanalyze | ReindexMode::ToStandardAnalyzer => 0,
                 ReindexMode::Rewrite => all.iter().filter(|s| s.fts.needs_reanalysis()).count(),
             },
             inconsistent_footers,
@@ -714,19 +743,14 @@ impl Supertable {
             );
         }
 
-        // `Layout` is compaction's build with deletions off; `Terms` is
-        // this tool's own. Both carry the row set. Built once and shared,
-        // because the plan picks between them per superfile.
-        let layout: Arc<dyn SuperfileMerge> = Arc::new(build::RepairMerge(Repair::Layout));
-        let terms: Arc<dyn SuperfileMerge> = Arc::new(build::RepairMerge(Repair::Terms));
+        // `Layout` is compaction's build with deletions off; the others are
+        // this tool's own. All carry the row set; the plan picks one per
+        // superfile.
         for (done, (job, repair)) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
-            let merge = match repair {
-                Repair::Layout => &layout,
-                Repair::Terms => &terms,
-            };
+            let merge: Arc<dyn SuperfileMerge> = Arc::new(build::RepairMerge(repair));
             let superfile_id = job.inputs[0];
             let outcome = match self
-                .run_compaction_job_with(job, stale_seal_timeout, Arc::clone(merge))
+                .run_compaction_job_with(job, stale_seal_timeout, merge)
                 .await
             {
                 Ok(outcome) => outcome,

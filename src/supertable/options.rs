@@ -68,7 +68,7 @@ use crate::{
         builder::{BuilderOptions, FtsConfig, VectorConfig},
         fts::{
             analysis::{Base, chain_tokenizer},
-            tokenize::{Tokenizer, tokenizer_for_name},
+            tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER, Tokenizer, tokenizer_for_name},
         },
         vector::layout::VectorLayout,
     },
@@ -301,6 +301,7 @@ impl Default for Consistency {
 /// commit-flush threshold). Held by `SupertableInner` as
 /// `Arc<SupertableOptions>` so readers, the writer, and rayon
 /// shard workers all see the same instances without copying.
+#[derive(Clone)]
 pub struct SupertableOptions {
     /// User-declared Arrow schema. Contains every
     /// `fts_columns[i].column` (LargeUtf8) and every
@@ -936,6 +937,25 @@ impl SupertableOptions {
         // under.
         let base = Base::from_name(&cfg.analyzer)?;
         Some(chain_tokenizer(base, cfg.stopwords, cfg.stemmer))
+    }
+
+    /// The full-text columns whose base tokenizer is `ascii_lower`.
+    pub(crate) fn ascii_lower_columns(&self) -> impl Iterator<Item = &FtsConfig> {
+        self.fts_columns
+            .iter()
+            .filter(|c| c.analyzer == ASCII_LOWER_TOKENIZER)
+    }
+
+    /// These options with every `ascii_lower` column moved to `standard`,
+    /// filters kept.
+    pub(crate) fn with_standard_analyzer(&self) -> SupertableOptions {
+        let mut options = self.clone();
+        for column in &mut options.fts_columns {
+            if column.analyzer == ASCII_LOWER_TOKENIZER {
+                column.analyzer = STANDARD_TOKENIZER.to_string();
+            }
+        }
+        options
     }
 
     /// Attach a disk cache for storage-backed reads.

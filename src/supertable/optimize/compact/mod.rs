@@ -51,7 +51,7 @@ use crate::{
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
     },
     supertable::{
-        BuildError, CommitError, ManifestSnapshot, SuperfileEntry, Supertable,
+        BuildError, CommitError, ManifestSnapshot, SuperfileEntry, Supertable, SupertableOptions,
         error::CompactionError,
         handle::hidden_vector_index_compaction_settings,
         manifest::{
@@ -801,8 +801,7 @@ impl Supertable {
             })
             .collect::<Result<_, _>>()?;
 
-        let opts = Arc::clone(&inner.options);
-        let max_retries = opts.max_commit_retries.max(1);
+        let max_retries = inner.options.max_commit_retries.max(1);
 
         // Seal every input sidecar so no writer can land a tombstone
         // on a file that's about to disappear, and so another
@@ -810,36 +809,12 @@ impl Supertable {
         // before unsealing (crash, not a caught error), `seal`
         // itself lets a later compactor take over once the seal
         // goes stale.
-        let compaction_id = Uuid::new_v4();
-        let sealed_at = Utc::now();
-        let mut sealed: Vec<SealedInput> = Vec::with_capacity(inputs.len());
-        for entry in &inputs {
-            let (sidecar, etag) = match seal_with_bounded_retry(
-                &wal_store,
-                entry.superfile_id,
-                compaction_id,
-                sealed_at,
-                stale_seal_timeout,
-                max_retries,
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    unseal_all(&wal_store, sealed).await;
-                    return Err(e);
-                }
-            };
-            sealed.push(SealedInput {
-                superfile_id: entry.superfile_id,
-                bitmap: sidecar.bitmap,
-                etag,
-            });
-        }
+        let seals = seal_inputs(&wal_store, &inputs, stale_seal_timeout, max_retries).await?;
 
         // The bitmaps `seal` GETs are the authoritative ones: read from
         // storage, under the seal, so nothing can land behind them.
-        let sealed_tombstones: HashMap<Uuid, Arc<RoaringBitmap>> = sealed
+        let sealed_tombstones: HashMap<Uuid, Arc<RoaringBitmap>> = seals
+            .inputs
             .iter()
             .map(|s| (s.superfile_id, Arc::new(s.bitmap.clone())))
             .collect();
@@ -854,7 +829,7 @@ impl Supertable {
             // a pure reclaim of the dead superfiles.
             Err(BuildError::NoDocsToBuild) => None,
             Err(e) => {
-                unseal_all(&wal_store, sealed).await;
+                unseal_all(&wal_store, seals.inputs).await;
                 return Err(CompactionError::Build(e.to_string()));
             }
         };
@@ -874,27 +849,12 @@ impl Supertable {
                 bytes_for_cache,
                 term_contribution,
             }) => {
-                let merged_entry = Arc::new(SuperfileEntry {
-                    // Carry the OLDEST input's birth_version so a merge of
-                    // already-drained inputs stays <= the drain watermark
-                    // (skipped, not re-drained). See the hidden-index
-                    // `drained_ranges` design.
-                    birth_version: inputs.iter().map(|e| e.birth_version).min().unwrap_or(0),
-                    // Left empty: the manifest's `update()` stamps the
-                    // partition key at commit time from `partition_hint`.
-                    partition_key: Vec::new(),
-                    partition_hint: inputs.first().and_then(|e| e.partition_hint),
-                    vector_layout: inputs
-                        .first()
-                        .map(|e| e.vector_layout)
-                        .unwrap_or(VectorLayout::Ivf),
-                    ..(*merged_prepared).clone()
-                });
+                let merged_entry = output_entry(&inputs, &merged_prepared);
                 let id = merged_entry.superfile_id;
                 let storage_write = match bytes_for_storage {
                     Some(w) => w,
                     None => {
-                        unseal_all(&wal_store, sealed).await;
+                        unseal_all(&wal_store, seals.inputs).await;
                         return Err(CompactionError::EmptyMergedSuperfile);
                     }
                 };
@@ -912,30 +872,29 @@ impl Supertable {
         };
 
         // Before the manifest swap: an orphan sidecar is recoverable, a live
-        // output with no tombstones is not. One-in-one-out builds only, so a
-        // batch never carries more than one.
+        // output with no tombstones is not.
         let carried_sidecar = match carry_tombstones_to_output(
             merge.as_ref(),
             &wal_store,
             &inputs,
             &new_entries,
-            &sealed,
+            &seals.inputs,
         )
         .await
         {
             Ok(id) => id,
             Err(e) => {
-                unseal_all(&wal_store, sealed).await;
+                unseal_all(&wal_store, seals.inputs).await;
                 return Err(e);
             }
         };
 
         Ok(PreparedJob {
             input_ids: job.inputs,
-            compaction_id,
-            sealed_at,
+            compaction_id: seals.compaction_id,
+            sealed_at: seals.sealed_at,
             carried_sidecar,
-            sealed,
+            sealed: seals.inputs,
             new_entries,
             pending_storage_writes,
             bytes_for_store,
@@ -943,6 +902,63 @@ impl Supertable {
             merged_superfile_id,
             term_contributions,
         })
+    }
+
+    /// Seal each input and stage its rebuilt output for one batch commit.
+    ///
+    /// Each pair is a one-in-one-out rebuild that was built and uploaded
+    /// without a seal. Sound for a build that keeps every row in place,
+    /// which is what `merge` has to promise through
+    /// [`SuperfileMerge::preserves_tombstones`]: an input's tombstones then
+    /// describe its output exactly, so the ones landed while it was being
+    /// built are read here, under the seal, and carried across. That is
+    /// what lets a long rebuild run without holding deletes off its inputs.
+    ///
+    /// The jobs carry no term-index contribution, so the commit leaves the
+    /// index incomplete for the caller to rebuild. If any input cannot be
+    /// sealed, the seals already placed are cleared and nothing is staged.
+    pub(crate) async fn prepare_uploaded_batch(
+        &self,
+        rebuilt: &[(Arc<SuperfileEntry>, Arc<SuperfileEntry>)],
+        merge: &dyn SuperfileMerge,
+        stale_seal_timeout: Duration,
+    ) -> Result<Vec<PreparedJob>, CompactionError> {
+        if !merge.preserves_tombstones() {
+            return Err(CompactionError::Build(
+                "a build staged after its upload has to keep every row in place".to_string(),
+            ));
+        }
+        let inner = self.inner();
+        let storage = inner
+            .manifest
+            .load()
+            .options
+            .storage
+            .clone()
+            .ok_or(CompactionError::NoStorage)?;
+        let wal_store = WalStore::new(storage);
+        let max_retries = inner.options.max_commit_retries.max(1);
+
+        let mut batch = Vec::with_capacity(rebuilt.len());
+        for (input, output) in rebuilt {
+            match prepare_uploaded_job(
+                &wal_store,
+                input,
+                output,
+                merge,
+                stale_seal_timeout,
+                max_retries,
+            )
+            .await
+            {
+                Ok(job) => batch.push(job),
+                Err(e) => {
+                    unseal_batch(&wal_store, batch).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(batch)
     }
 
     /// Commit a batch of prepared merges in ONE manifest CAS: every new entry
@@ -974,6 +990,7 @@ impl Supertable {
     pub(crate) async fn commit_compaction_batch(
         &self,
         mut batch: Vec<PreparedJob>,
+        policy: &BatchCommit,
     ) -> Result<(), CompactionError> {
         if batch.is_empty() {
             return Ok(());
@@ -995,18 +1012,6 @@ impl Supertable {
         // surfaced once the batch has settled.
         let mut deferred_error: Option<CompactionError> = None;
 
-        // At most one job can have pre-written its output's sidecar: only a
-        // one-in-one-out build carries tombstones, and those run one at a
-        // time. `try_commit_attempt` registers a single one.
-        let carried: Vec<Uuid> = batch.iter().filter_map(|p| p.carried_sidecar).collect();
-        if carried.len() > 1 {
-            return Err(CompactionError::Build(format!(
-                "{} jobs in one batch carried a tombstone sidecar; a commit can register one",
-                carried.len()
-            )));
-        }
-        let carried_sidecar = carried.first().copied();
-
         for attempt in 0..max_retries {
             let current = inner.manifest.load_full();
 
@@ -1026,6 +1031,26 @@ impl Supertable {
                         }
                         vanished.push(i);
                     }
+                }
+            }
+            if let BatchCommit::WholeTable(_) = policy {
+                if let Some(&i) = vanished.first() {
+                    let missing = batch[i].input_ids.first().copied().unwrap_or_default();
+                    unseal_batch(&wal_store, batch).await;
+                    return Err(CompactionError::SuperfileNotFound(missing));
+                }
+                let replaced: HashSet<Uuid> = batch
+                    .iter()
+                    .flat_map(|p| p.input_ids.iter().copied())
+                    .collect();
+                if let Some(extra) = current
+                    .get_all_superfiles()
+                    .iter()
+                    .find(|e| !replaced.contains(&e.superfile_id))
+                {
+                    let extra = extra.superfile_id;
+                    unseal_batch(&wal_store, batch).await;
+                    return Err(CompactionError::UnplannedSuperfile(extra));
                 }
             }
             // Drop the vanished jobs back-to-front so the surviving indices
@@ -1056,6 +1081,11 @@ impl Supertable {
             // order; the index stored in `resolved` predates the vanished
             // removal and must not address either.
             debug_assert_eq!(resolved.len(), batch.len());
+            if let (BatchCommit::WholeTable(_), Some(&i)) = (policy, stale.first()) {
+                let superfile_id = batch[i].input_ids.first().copied().unwrap_or_default();
+                unseal_batch(&wal_store, batch).await;
+                return Err(CompactionError::SidecarChangedUnderSeal { superfile_id });
+            }
             let mut dropped: Vec<PreparedJob> = Vec::with_capacity(stale.len());
             for i in stale.into_iter().rev() {
                 dropped.push(batch.remove(i));
@@ -1083,6 +1113,15 @@ impl Supertable {
                 .iter()
                 .flat_map(|p| p.new_entries.iter().cloned())
                 .collect();
+            // Only the surviving jobs' sidecars: a dropped job's output is not
+            // in this commit, so naming its sidecar would point at nothing.
+            let carried: Vec<Uuid> = batch.iter().filter_map(|p| p.carried_sidecar).collect();
+            let base = match policy {
+                BatchCommit::EachJob => Arc::clone(&current),
+                BatchCommit::WholeTable(options) => {
+                    Arc::new(current.with_options(Arc::clone(options)))
+                }
+            };
             // A term contribution owns a spilled file and is not cloneable, so
             // the batch's are borrowed out for the attempt and handed back if
             // it has to be retried. `owners` records which job each came from.
@@ -1117,11 +1156,11 @@ impl Supertable {
             let attempt_outcome = try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
-                Arc::clone(&current),
+                base,
                 &new_entries,
                 &entries_to_remove,
                 NewEntryBirthVersions::Preserve,
-                carried_sidecar,
+                &carried,
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
                 &term_contributions,
@@ -1265,7 +1304,10 @@ impl Supertable {
         let prepared = self
             .prepare_compaction_job_with(job, stale_seal_timeout, merge)
             .await?;
-        match self.commit_compaction_batch(vec![prepared]).await {
+        match self
+            .commit_compaction_batch(vec![prepared], &BatchCommit::EachJob)
+            .await
+        {
             Ok(()) => Ok(JobOutcome::Committed),
             Err(CompactionError::SuperfileNotFound(_)) => Ok(JobOutcome::InputsAlreadyReplaced),
             Err(e) => Err(e),
@@ -1368,7 +1410,9 @@ impl Supertable {
             ready.sort_by_key(|(plan_index, _)| *plan_index);
             let batch: Vec<PreparedJob> = ready.into_iter().map(|(_, prepared)| prepared).collect();
 
-            let commit = self.commit_compaction_batch(batch).await;
+            let commit = self
+                .commit_compaction_batch(batch, &BatchCommit::EachJob)
+                .await;
             // Both failures leave by the same door: merges are still running,
             // and returning here would drop their tasks with their seals
             // placed and nothing to clear them until they went stale.
@@ -1604,6 +1648,23 @@ fn collect_merge(
     let stops_the_pass = !matches!(failure, CompactionError::SuperfileNotFound(_));
     first_error.get_or_insert(failure);
     stops_the_pass
+}
+
+/// What a batch commit does with a job it can no longer commit, and which
+/// options the successor publishes.
+pub(crate) enum BatchCommit {
+    /// Drop the job and commit the rest under the table's own options.
+    /// Jobs are independent merges, so any subset is a valid table.
+    EachJob,
+    /// Commit only a batch that replaces every superfile in the table, all
+    /// of its jobs or none, and publish these options as the table's in the
+    /// same manifest.
+    ///
+    /// For a batch that changes what the table *is* rather than how it is
+    /// laid out: a dropped job, or a superfile another writer committed
+    /// meanwhile, would leave a superfile built under the old options in a
+    /// table stamped with the new ones.
+    WholeTable(Arc<SupertableOptions>),
 }
 
 /// One merge that has run and is waiting for its manifest commit.
@@ -1872,6 +1933,114 @@ struct SealedInput {
     superfile_id: Uuid,
     bitmap: RoaringBitmap,
     etag: Etag,
+}
+
+/// Seal `input` and stage `output`, its uploaded one-in-one-out rebuild;
+/// see [`Supertable::prepare_uploaded_batch`].
+async fn prepare_uploaded_job(
+    wal_store: &WalStore,
+    input: &Arc<SuperfileEntry>,
+    output: &SuperfileEntry,
+    merge: &dyn SuperfileMerge,
+    stale_seal_timeout: Duration,
+    max_retries: u32,
+) -> Result<PreparedJob, CompactionError> {
+    let inputs = [Arc::clone(input)];
+    let seals = seal_inputs(wal_store, &inputs, stale_seal_timeout, max_retries).await?;
+    let new_entries = vec![output_entry(&inputs, output)];
+    let carried_sidecar =
+        match carry_tombstones_to_output(merge, wal_store, &inputs, &new_entries, &seals.inputs)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                unseal_all(wal_store, seals.inputs).await;
+                return Err(e);
+            }
+        };
+    Ok(PreparedJob {
+        input_ids: vec![input.superfile_id],
+        compaction_id: seals.compaction_id,
+        sealed_at: seals.sealed_at,
+        carried_sidecar,
+        sealed: seals.inputs,
+        merged_superfile_id: output.superfile_id,
+        new_entries,
+        // Already in storage: the build uploaded it.
+        pending_storage_writes: Vec::new(),
+        bytes_for_store: None,
+        bytes_for_cache: None,
+        term_contributions: Vec::new(),
+    })
+}
+
+/// The seals one job placed on its inputs, under one compaction id.
+struct JobSeals {
+    compaction_id: Uuid,
+    sealed_at: DateTime<Utc>,
+    inputs: Vec<SealedInput>,
+}
+
+/// Seal every input's tombstone sidecar under a fresh compaction id,
+/// clearing the ones already placed if a later one fails.
+async fn seal_inputs(
+    wal_store: &WalStore,
+    inputs: &[Arc<SuperfileEntry>],
+    stale_seal_timeout: Duration,
+    max_retries: u32,
+) -> Result<JobSeals, CompactionError> {
+    let compaction_id = Uuid::new_v4();
+    let sealed_at = Utc::now();
+    let mut sealed: Vec<SealedInput> = Vec::with_capacity(inputs.len());
+    for entry in inputs {
+        let (sidecar, etag) = match seal_with_bounded_retry(
+            wal_store,
+            entry.superfile_id,
+            compaction_id,
+            sealed_at,
+            stale_seal_timeout,
+            max_retries,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                unseal_all(wal_store, sealed).await;
+                return Err(e);
+            }
+        };
+        sealed.push(SealedInput {
+            superfile_id: entry.superfile_id,
+            bitmap: sidecar.bitmap,
+            etag,
+        });
+    }
+    Ok(JobSeals {
+        compaction_id,
+        sealed_at,
+        inputs: sealed,
+    })
+}
+
+/// The manifest entry for a superfile built from `inputs`, inheriting what
+/// the inputs decide rather than what the build recorded.
+fn output_entry(inputs: &[Arc<SuperfileEntry>], built: &SuperfileEntry) -> Arc<SuperfileEntry> {
+    Arc::new(SuperfileEntry {
+        // Carry the OLDEST input's birth_version so a merge of
+        // already-drained inputs stays <= the drain watermark
+        // (skipped, not re-drained). See the hidden-index
+        // `drained_ranges` design.
+        birth_version: inputs.iter().map(|e| e.birth_version).min().unwrap_or(0),
+        // Left empty: the manifest's `update()` stamps the
+        // partition key at commit time from `partition_hint`.
+        partition_key: Vec::new(),
+        partition_hint: inputs.first().and_then(|e| e.partition_hint),
+        vector_layout: inputs
+            .first()
+            .map(|e| e.vector_layout)
+            .unwrap_or(VectorLayout::Ivf),
+        ..built.clone()
+    })
 }
 
 /// Cap on in-flight unseal calls. Single-writer model: one compactor
@@ -5459,7 +5628,7 @@ mod tests {
         );
 
         // The batch commits, removing the inputs it merged before that landed.
-        st.commit_compaction_batch(prepared_jobs)
+        st.commit_compaction_batch(prepared_jobs, &BatchCommit::EachJob)
             .await
             .expect("the batch commits");
 
@@ -5556,7 +5725,7 @@ mod tests {
         // The first attempt's fence fails, as a seal taken over mid-upload
         // would. Nothing is published by that attempt.
         FENCE_FAILS_ONCE.store(true, Ordering::SeqCst);
-        st.commit_compaction_batch(batch)
+        st.commit_compaction_batch(batch, &BatchCommit::EachJob)
             .await
             .expect("a seal taken over at the fence must not fail the commit");
         assert!(
@@ -5705,7 +5874,7 @@ mod tests {
             .expect("delete task")
             .expect("delete");
 
-        st.commit_compaction_batch(prepared_jobs)
+        st.commit_compaction_batch(prepared_jobs, &BatchCommit::EachJob)
             .await
             .expect("a batch with nothing left to commit is not an error");
 
@@ -5782,7 +5951,7 @@ mod tests {
             .await
             .expect("prepare");
         compactor
-            .commit_compaction_batch(vec![prepared])
+            .commit_compaction_batch(vec![prepared], &BatchCommit::EachJob)
             .await
             .expect("commit");
 
@@ -5881,7 +6050,7 @@ mod tests {
         // Publish the merges one at a time. Only the last frees the target.
         for prepared in prepared_jobs {
             tokio::time::sleep(COMMIT_GAP).await;
-            st.commit_compaction_batch(vec![prepared])
+            st.commit_compaction_batch(vec![prepared], &BatchCommit::EachJob)
                 .await
                 .expect("the batch commits");
         }
@@ -6030,7 +6199,9 @@ mod tests {
         assert_eq!(total, outstanding.len(), "the orphan must be dropped");
 
         // Leave no seals behind for the tempdir teardown.
-        st.commit_compaction_batch(batch).await.expect("commit");
+        st.commit_compaction_batch(batch, &BatchCommit::EachJob)
+            .await
+            .expect("commit");
     }
 
     /// A job whose inputs another compactor merged away between planning and
@@ -6074,7 +6245,7 @@ mod tests {
         .expect("the racing compactor commits");
 
         let docs_before = st.reader().expect("reader").n_docs_total();
-        st.commit_compaction_batch(vec![staged])
+        st.commit_compaction_batch(vec![staged], &BatchCommit::EachJob)
             .await
             .expect("a vanished job is benign, not an error");
         assert_eq!(

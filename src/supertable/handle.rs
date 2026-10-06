@@ -259,13 +259,19 @@ pub(super) struct SupertableInner {
 
 impl SupertableInner {
     /// Builder options for a superfile this table is about to commit: the
-    /// static configuration plus the table-wide FTS length statistics as
-    /// of the current manifest, so the new file bakes — and is scored at
-    /// — the corpus average rather than its own.
+    /// configuration of the current manifest plus the table-wide FTS length
+    /// statistics as of it, so the new file bakes — and is scored at — the
+    /// corpus average rather than its own.
+    ///
+    /// From the manifest rather than the handle's own options because an
+    /// analyzer change publishes new options with the manifest: a handle
+    /// that ran one builds under the new analyzer from that commit on.
     pub(super) fn builder_options(&self) -> BuilderOptions {
-        self.options
+        let manifest = self.manifest.load();
+        manifest
+            .options
             .builder_options()
-            .with_fts_corpus_stats(self.manifest.load().fts_corpus_stats(&HashSet::new()))
+            .with_fts_corpus_stats(manifest.fts_corpus_stats(&HashSet::new()))
     }
 
     /// Runtime driving the sync API's async kernels when the caller

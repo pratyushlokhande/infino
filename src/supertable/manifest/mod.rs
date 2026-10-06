@@ -1453,6 +1453,17 @@ impl ManifestSnapshot {
         }
     }
 
+    /// This manifest carrying `options` instead of its own, id unchanged.
+    ///
+    /// The base for a commit that changes the table's options: `update`
+    /// stamps the successor's options hash from the options it carries, so
+    /// committing on top of this publishes `options` as the table's.
+    pub(crate) fn with_options(&self, options: Arc<SupertableOptions>) -> Self {
+        let mut snapshot = self.with_list_edited(false, |_| {});
+        snapshot.superfile_list.options = options;
+        snapshot
+    }
+
     /// Successor manifest (bumped id) with the term-stats sidecar
     /// reference stamped — the maintenance publish, mirroring
     /// [`Self::with_slow_vector_state`].
@@ -1784,20 +1795,22 @@ impl ManifestSnapshot {
         self.list.as_ref().map(|l| &l.superseded_cells)
     }
 
-    /// Stamp `id`'s tombstone seq to this manifest's own id, so the
+    /// Stamp each of `ids`' tombstone seq to this manifest's own id, so the
     /// manifest that publishes a superfile also makes its sidecar visible.
     ///
     /// The seq map is what makes a sidecar exist for readers: an absent
     /// entry means "no tombstones" and the sidecar is never fetched.
-    pub(crate) fn register_tombstone_sidecar(&mut self, id: Option<Uuid>) {
-        let Some(id) = id else {
+    pub(crate) fn register_tombstone_sidecars(&mut self, ids: &[Uuid]) {
+        if ids.is_empty() {
             return;
-        };
+        }
         let Some(list) = self.list.as_mut() else {
             debug_assert!(false, "a sidecar was written for a manifest with no list");
             return;
         };
-        list.tombstone_seqs.insert(id, list.manifest_id);
+        for id in ids {
+            list.tombstone_seqs.insert(*id, list.manifest_id);
+        }
     }
 
     /// Build a successor manifest identical to `self` except that every

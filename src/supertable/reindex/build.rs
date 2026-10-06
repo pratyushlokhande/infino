@@ -20,7 +20,7 @@ use roaring::RoaringBitmap;
 
 use crate::{
     superfile::{
-        builder::{CarryScope, SuperfileBuilder, merge_builder_opts},
+        builder::{BuilderOptions, CarryScope, SuperfileBuilder, merge_builder_opts},
         error::BuildError as SuperfileBuildError,
         fts::reader::ColumnLengthStats,
         reader::SuperfileReader,
@@ -81,6 +81,17 @@ fn carried_doc_count(
     Ok(())
 }
 
+/// The builder options `repair` builds with, from those recovered from
+/// the input: the input's own analysis for a layout repair, re-analysis of
+/// every stored column otherwise, under `standard` where that is the repair.
+fn reanalysis_opts(repair: Repair, opts: BuilderOptions) -> BuilderOptions {
+    match repair {
+        Repair::Layout => opts,
+        Repair::Terms => opts.reanalyze_stored_columns(),
+        Repair::Standard => opts.with_standard_analyzer().reanalyze_stored_columns(),
+    }
+}
+
 /// A reindex's build, parameterised by the repair the plan chose.
 ///
 /// One type rather than two: the two repairs differ in which builder call
@@ -103,7 +114,9 @@ impl SuperfileMerge for RepairMerge {
             // could drift from the one the table is actually compacted with.
             None => match self.0 {
                 Repair::Layout => CompactionMerge.build(inputs, output),
-                Repair::Terms => reanalyze_to(inputs.readers, inputs.fts_corpus, output),
+                Repair::Terms | Repair::Standard => {
+                    reanalyze_to(self.0, inputs.readers, inputs.fts_corpus, output)
+                }
             },
         }
     }
@@ -132,15 +145,12 @@ fn repair_carrying_body_to(
 ) -> Result<SuperfileStats, BuildError> {
     let readers = [(Arc::clone(source), None)];
     let opts = merge_builder_opts(&readers, fts_corpus)?;
-    let mut builder = SuperfileBuilder::new(match repair {
-        Repair::Layout => opts,
-        Repair::Terms => opts.reanalyze_stored_columns(),
-    })?;
+    let mut builder = SuperfileBuilder::new(reanalysis_opts(repair, opts))?;
     match repair {
         Repair::Layout => {
             builder.carry_fts_from_reader_scoped(source, None, CarryScope::AllColumns)?
         }
-        Repair::Terms => builder.reanalyze_fts_from_reader(source)?,
+        Repair::Terms | Repair::Standard => builder.reanalyze_fts_from_reader(source)?,
     }
     carried_doc_count(source, entry)?;
     builder.set_carried_doc_count(entry.n_docs);
@@ -164,11 +174,12 @@ fn repair_carrying_body_to(
 /// repair carries its body instead and never reaches here; a file that
 /// does needs a vector-preserving rebuild first.
 fn reanalyze_to<W: Write>(
+    repair: Repair,
     readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
     fts_corpus: &HashMap<String, ColumnLengthStats>,
     output: W,
 ) -> Result<SuperfileStats, BuildError> {
-    let builder_opts = merge_builder_opts(readers, fts_corpus)?.reanalyze_stored_columns();
+    let builder_opts = reanalysis_opts(repair, merge_builder_opts(readers, fts_corpus)?);
     if !builder_opts.vector_columns.is_empty() {
         let columns: Vec<&str> = builder_opts
             .vector_columns
@@ -318,8 +329,13 @@ mod tests {
             SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open"),
         );
 
-        let err = reanalyze_to(&[(source, None)], &HashMap::new(), Vec::new())
-            .expect_err("a vector-bearing rebuild must refuse");
+        let err = reanalyze_to(
+            Repair::Terms,
+            &[(source, None)],
+            &HashMap::new(),
+            Vec::new(),
+        )
+        .expect_err("a vector-bearing rebuild must refuse");
         assert!(err.to_string().contains("emb"), "{err}");
     }
 }

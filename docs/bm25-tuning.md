@@ -306,6 +306,36 @@ decide what a query can ask for. `Supertable::tokenize(column, text)`
 returns exactly what the column's chain produces, which settles most
 "why did this not match" questions in one call.
 
+#### Moving an `ascii_lower` table to `standard`
+
+One change of analysis does not need a re-ingest: an existing table's
+`ascii_lower` columns can be moved to `standard` in place, from their
+stored text.
+
+```rust
+let report = table.index_staleness(&ReindexOptions::default())?;
+if !report.ascii_lower_columns.is_empty() {
+    table.reindex(&ReindexOptions::to_standard_analyzer())?;
+}
+```
+
+(`mode="to_standard_analyzer"` in Python, `mode: "to_standard_analyzer"`
+in Node.) Every superfile is re-analyzed, stopword and stemmer filters
+kept, and brought to the current format. All of them are published in
+one commit together with the new analyzer, so queries see the table
+either entirely before or entirely after. Rows, ids, deletes and vectors
+are unchanged.
+
+What does change is what the table matches: accented and non-Latin
+words, emoji, `don't` and `3.14` become terms, and queries that relied
+on `ascii_lower` splitting those apart stop matching. A column created
+with `stored(false)` has no text to re-analyze, so the run refuses the
+table before writing anything. The run holds the table's compaction
+slot, and stops without publishing if other writers keep adding
+superfiles faster than it can rebuild them; pause ingest and run it
+again. Handles opened elsewhere before the change fail their next
+refresh and need reopening.
+
 ### Stopwords
 
 `FtsField::stopwords(Stopwords::English)` (`stopwords="english"` in the

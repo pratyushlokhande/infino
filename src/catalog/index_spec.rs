@@ -77,8 +77,9 @@ impl FtsField {
     /// or `"ascii_lower"`, which splits on ASCII alphanumerics and
     /// drops every non-ASCII token. The analyzer is per column: each
     /// FTS column is tokenized with its own, so columns in one table
-    /// may use different analyzers. It is recorded with the table and
-    /// cannot be changed afterwards.
+    /// may use different analyzers. It is recorded with the table; the
+    /// only change available afterwards is `ascii_lower` to `standard`,
+    /// through [`crate::ReindexMode::ToStandardAnalyzer`].
     ///
     /// This names the *base* tokenizer. [`FtsField::stopwords`] and
     /// [`FtsField::stemmer`] add filters on top of it, and each is

@@ -466,6 +466,32 @@ pub enum ReindexError {
         /// What went wrong underneath.
         cause: String,
     },
+    /// An analyzer change found `ascii_lower` columns whose text was never
+    /// stored, so nothing can re-analyze them. Nothing was written; the
+    /// table has to be re-ingested from its source.
+    #[error(
+        "cannot move index-only columns {columns:?} to the standard analyzer: their text \
+         was never stored"
+    )]
+    IndexOnlyColumns {
+        /// The `ascii_lower` columns created with `stored(false)`.
+        columns: Vec<String>,
+    },
+    /// An analyzer change kept finding superfiles it had not rebuilt —
+    /// appends, compactions or seals from other writers — through every
+    /// round it allows. Nothing was published; run again once the table
+    /// is quiet.
+    #[error(
+        "the table kept changing through {rounds} rounds of an analyzer change; nothing was \
+         published"
+    )]
+    TableKeptChanging {
+        /// Rounds of rebuilding before the run gave up.
+        rounds: usize,
+    },
+    /// Publishing an analyzer change failed. Nothing was published.
+    #[error("failed to publish the analyzer change: {0}")]
+    Publish(String),
 }
 
 /// Errors raised by [`crate::Supertable::optimize`].
@@ -538,6 +564,7 @@ impl From<CompactionError> for OptimizeError {
             CompactionError::Seal(s) => OptimizeError::Seal(s),
             CompactionError::Build(s) => OptimizeError::Build(s),
             CompactionError::Commit(s) => OptimizeError::Commit(s),
+            e @ CompactionError::UnplannedSuperfile(_) => OptimizeError::Commit(e.to_string()),
             CompactionError::Refresh(s) => OptimizeError::Refresh(s),
             CompactionError::AlreadyCompacting => OptimizeError::AlreadyRunning,
         }
@@ -555,6 +582,12 @@ pub(crate) enum CompactionError {
     /// current manifest snapshot.
     #[error("superfile {0} not found in manifest snapshot")]
     SuperfileNotFound(uuid::Uuid),
+
+    /// A batch that has to replace every superfile in the table found one
+    /// it does not replace: another writer committed it after the batch was
+    /// planned.
+    #[error("superfile {0} was committed after the whole-table batch was planned")]
+    UnplannedSuperfile(uuid::Uuid),
 
     #[error("empty merged superfile")]
     EmptyMergedSuperfile,

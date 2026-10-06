@@ -1117,6 +1117,19 @@ pub enum ReindexMode {
     /// thing this offers over [`ReindexMode::Auto`], and the reason to
     /// reach for it is not trusting that record.
     Reanalyze,
+    /// Move every `ascii_lower` full-text column to the `standard`
+    /// analyzer, re-analyzing each superfile's stored text and bringing its
+    /// layout current.
+    ///
+    /// Changes what the table matches, so it is never chosen for you:
+    /// `standard` keeps non-ASCII words, emoji, `don't` and `3.14` as terms
+    /// where `ascii_lower` dropped or split them. Every superfile is
+    /// rebuilt first and all of them are published in one manifest commit
+    /// together with the new analyzer, so no query sees a table that is
+    /// half one and half the other. A column whose text is not stored
+    /// cannot be re-analyzed, and the run refuses the table before writing
+    /// anything.
+    ToStandardAnalyzer,
 }
 
 /// What a reindex repairs.
@@ -1213,6 +1226,15 @@ impl ReindexOptions {
     pub fn reanalyzing() -> Self {
         Self {
             mode: ReindexMode::Reanalyze,
+            ..Self::default()
+        }
+    }
+
+    /// Move the table's `ascii_lower` columns to the `standard` analyzer;
+    /// see [`ReindexMode::ToStandardAnalyzer`].
+    pub fn to_standard_analyzer() -> Self {
+        Self {
+            mode: ReindexMode::ToStandardAnalyzer,
             ..Self::default()
         }
     }

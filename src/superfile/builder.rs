@@ -109,7 +109,7 @@ use crate::{
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
-            tokenize::{AsciiLowerTokenizer, STANDARD_TOKENIZER},
+            tokenize::{ASCII_LOWER_TOKENIZER, AsciiLowerTokenizer, STANDARD_TOKENIZER},
         },
         id_space::{FtsDocId, RowId, StableId},
         ids,
@@ -692,6 +692,20 @@ impl BuilderOptions {
         for column in &mut self.fts_columns {
             if column.stored {
                 column.carried_analysis_revision = None;
+            }
+        }
+        self
+    }
+
+    /// Move every stored `ascii_lower` column to `standard`, ahead of a
+    /// re-analysis. Filters are kept.
+    ///
+    /// An index-only column keeps its analyzer: its postings are carried,
+    /// not rebuilt, so renaming its analyzer would mislabel them.
+    pub(crate) fn with_standard_analyzer(mut self) -> Self {
+        for column in &mut self.fts_columns {
+            if column.stored && column.analyzer == ASCII_LOWER_TOKENIZER {
+                column.analyzer = STANDARD_TOKENIZER.to_string();
             }
         }
         self

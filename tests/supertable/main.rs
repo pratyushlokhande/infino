@@ -46,6 +46,7 @@ mod gc_stale_snapshot;
 mod manifest;
 mod query;
 mod reindex;
+mod reindex_analyzer;
 mod reindex_crash;
 mod reindex_invariance;
 mod storage;

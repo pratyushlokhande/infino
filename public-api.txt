@@ -212,10 +212,15 @@ impl core::panic::unwind_safe::UnwindSafe for infino::RecalibratePolicy
 #[non_exhaustive] pub enum infino::ReindexError
 pub infino::ReindexError::AlreadyRunning
 pub infino::ReindexError::Assess(alloc::string::String)
+pub infino::ReindexError::IndexOnlyColumns
+pub infino::ReindexError::IndexOnlyColumns::columns: alloc::vec::Vec<alloc::string::String>
 pub infino::ReindexError::NoStorage
+pub infino::ReindexError::Publish(alloc::string::String)
 pub infino::ReindexError::Rewrite
 pub infino::ReindexError::Rewrite::cause: alloc::string::String
 pub infino::ReindexError::Rewrite::superfile_id: uuid::Uuid
+pub infino::ReindexError::TableKeptChanging
+pub infino::ReindexError::TableKeptChanging::rounds: usize
 impl core::error::Error for infino::ReindexError
 impl core::fmt::Debug for infino::ReindexError
 pub fn infino::ReindexError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -232,6 +237,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::ReindexError
 pub infino::ReindexMode::Auto
 pub infino::ReindexMode::Reanalyze
 pub infino::ReindexMode::Rewrite
+pub infino::ReindexMode::ToStandardAnalyzer
 impl core::clone::Clone for infino::ReindexMode
 pub fn infino::ReindexMode::clone(&self) -> Self
 impl core::cmp::Eq for infino::ReindexMode
@@ -604,6 +610,7 @@ pub infino::ReindexOptions::trust_writer_analysis: bool
 impl infino::ReindexOptions
 pub fn infino::ReindexOptions::reanalyzing() -> Self
 pub fn infino::ReindexOptions::rewriting() -> Self
+pub fn infino::ReindexOptions::to_standard_analyzer() -> Self
 pub fn infino::ReindexOptions::trusting_writer_analysis(self) -> Self
 pub fn infino::ReindexOptions::with_mode(self, infino::ReindexMode) -> Self
 pub fn infino::ReindexOptions::with_stale_seal_timeout_ms(self, u64) -> Self
@@ -651,6 +658,7 @@ impl core::marker::UnsafeUnpin for infino::ReindexReport
 impl core::panic::unwind_safe::RefUnwindSafe for infino::ReindexReport
 impl core::panic::unwind_safe::UnwindSafe for infino::ReindexReport
 #[non_exhaustive] pub struct infino::StalenessReport
+pub infino::StalenessReport::ascii_lower_columns: alloc::vec::Vec<alloc::string::String>
 pub infino::StalenessReport::awaiting_reanalysis: usize
 pub infino::StalenessReport::bytes_to_rewrite: u64
 pub infino::StalenessReport::inconsistent_footers: alloc::vec::Vec<uuid::Uuid>
