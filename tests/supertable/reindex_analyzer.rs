@@ -10,25 +10,39 @@
 //! with its analysis recorded, and the table answering as a `standard` table
 //! does, with its rows, deletes, filters and vectors as they were.
 
-use std::{fs, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use bytes::Bytes;
 
 use datafusion::prelude::{col, lit};
 use infino::{
     BoolMode, CompactionSettings, ConnectOptions, Connection, Consistency, InfinoError,
     OptimizeOptions, ReindexError, ReindexMode, ReindexOptions, Supertable,
     arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
-        RecordBatch,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+        LargeStringArray, RecordBatch,
     },
     arrow_schema::{DataType, Field},
     connect, connect_with,
-    superfile::format::fts::VERSION_CURRENT,
+    superfile::{
+        SuperfileReader,
+        format::{fts::VERSION_CURRENT, kv},
+    },
+    supertable::manifest::SuperfileEntry,
 };
+use uuid::Uuid;
 
 use crate::corpus_shapes::{
     ANALYZER_PROBES, ASCII_LOWER_SHAPE_LIVE_ROWS, EMBEDDING_DIM, N_DOCS, TABLE, TITLES_WITH_JUMP,
-    blob_versions, connect_corpus, corpus_dir, embedding, fts_column, fts_columns, hits, hits_k,
-    open_corpus, probe_embedding, superfile_paths, vector_hits,
+    blob_versions, connect_corpus, corpus_dir, embedding, files_with_extension, first_region,
+    fts_column, fts_columns, hits, hits_k, open_corpus, probe_embedding, raw_footer_kvs,
+    superfile_paths, table_dir, vector_hits,
 };
 
 /// Shared-corpus documents whose `notes` column carries text.
@@ -693,4 +707,387 @@ fn a_migrated_table_reads_and_writes_on_every_path() {
             .iter()
             .all(|a| a == "standard")
     );
+}
+
+/// What the audit compares about one superfile.
+struct SuperfileFacts {
+    superfile_id: Uuid,
+    bytes: Bytes,
+    fts: (u64, u64),
+    vec: Option<(u64, u64)>,
+    ids: Vec<i128>,
+    columns: Vec<serde_json::Value>,
+    birth_version: u64,
+    partition_key: Vec<u8>,
+}
+
+/// Read `entry`'s superfile under `dir` and the facts the audit needs.
+fn superfile_facts(dir: &Path, entry: &SuperfileEntry) -> SuperfileFacts {
+    let path = entry.storage_path();
+    let bytes = Bytes::from(fs::read(dir.join(&path)).expect("read superfile"));
+    let kvs = raw_footer_kvs(&bytes);
+    let fts = first_region(&kvs, kv::FTS_OFFSET, kv::FTS_LENGTH)
+        .unwrap_or_else(|| panic!("{path}: no FTS region"));
+    let vec = first_region(&kvs, kv::VEC_OFFSET, kv::VEC_LENGTH);
+    let columns_json = &kvs
+        .iter()
+        .find(|(k, _)| k == kv::FTS_COLUMNS)
+        .unwrap_or_else(|| panic!("{path}: no {}", kv::FTS_COLUMNS))
+        .1;
+    let reader = SuperfileReader::open(bytes.clone()).expect("open superfile");
+    let batch = reader.get_record_batch(None).expect("read rows");
+    let ids = batch
+        .column_by_name("_id")
+        .expect("_id column")
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("_id is Decimal128")
+        .values()
+        .to_vec();
+    SuperfileFacts {
+        superfile_id: entry.superfile_id,
+        bytes,
+        fts,
+        vec,
+        ids,
+        columns: serde_json::from_str(columns_json).expect("inf.fts.columns is JSON"),
+        birth_version: entry.birth_version,
+        partition_key: entry.partition_key.clone(),
+    }
+}
+
+/// BM25 `k1` a reader assumes for a column entry written before the
+/// parameters were recorded.
+const UNRECORDED_K1: f64 = 1.2;
+/// BM25 `b` a reader assumes for a column entry written before the
+/// parameters were recorded.
+const UNRECORDED_B: f64 = 0.75;
+
+/// A column's `inf.fts.columns` entry without the two fields an analyzer
+/// change is meant to move, and with the BM25 pair an older writer left
+/// implicit spelled out, as today's writer records it.
+fn without_analysis(column: &serde_json::Value) -> serde_json::Value {
+    let mut column = column.clone();
+    let fields = column.as_object_mut().expect("column entry is an object");
+    fields.remove("tokenizer");
+    fields.remove("analysis_revision");
+    fields
+        .entry("k1")
+        .or_insert_with(|| serde_json::json!(UNRECORDED_K1));
+    fields
+        .entry("b")
+        .or_insert_with(|| serde_json::json!(UNRECORDED_B));
+    column
+}
+
+/// Every file under `dir`, recursively, relative to it and sorted; empty
+/// when `dir` does not exist.
+fn listing(dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            match path.is_dir() {
+                true => walk(&path, out),
+                false => out.push(path),
+            }
+        }
+    }
+    let mut files = Vec::new();
+    if dir.is_dir() {
+        walk(dir, &mut files);
+    }
+    let mut names: Vec<String> = files
+        .iter()
+        .map(|p| {
+            p.strip_prefix(dir)
+                .expect("under dir")
+                .display()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The manifest list the table's pointer names, as raw JSON.
+fn current_manifest_list(dir: &Path) -> serde_json::Value {
+    let pointer = fs::read_to_string(dir.join("_supertable").join("current")).expect("pointer");
+    let uri = pointer
+        .lines()
+        .find_map(|l| l.strip_prefix("manifest_uri="))
+        .expect("pointer names a manifest");
+    serde_json::from_slice(&fs::read(dir.join(uri)).expect("read manifest list"))
+        .expect("manifest list is JSON")
+}
+
+/// `body` with every empty list dropped from its table records.
+///
+/// A record written by an older engine lacks the per-column lists added
+/// since, and any catalog write by this one spells them out as empty; the
+/// reader treats the two the same, so the comparison does too.
+fn without_empty_lists(body: &serde_json::Value) -> serde_json::Value {
+    let mut body = body.clone();
+    if let Some(tables) = body["tables"].as_object_mut() {
+        for record in tables.values_mut() {
+            if let Some(fields) = record.as_object_mut() {
+                fields.retain(|_, v| v.as_array().is_none_or(|list| !list.is_empty()));
+            }
+        }
+    }
+    body
+}
+
+/// The catalog body, as raw JSON.
+fn catalog_json(root: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(root.join("_catalog").join("current")).expect("read catalog"))
+        .expect("catalog is JSON")
+}
+
+/// After the change, every byte that should be carried is carried, every
+/// byte that should change has changed, and nothing is left behind: the
+/// superfiles' bodies, vectors and footers, the manifest, the deleted-rows
+/// files, the catalog record, and the directories they live in, each read
+/// back from disk rather than through the engine's own decoders.
+fn assert_migration_leaves_no_debt(shape: &str) {
+    let Some((_tmp, db, root)) = connect_corpus(shape) else {
+        return;
+    };
+    let table = db.open_table(TABLE).expect("open");
+    let dir = table_dir(&root);
+    let hidden_dir = fs::read_dir(&dir)
+        .expect("read table dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.is_dir() && p.to_string_lossy().ends_with("_vector_index"));
+
+    let catalog_before = catalog_json(&root);
+    let list_before = current_manifest_list(&dir);
+    let hidden_before = hidden_dir.as_deref().map(listing).unwrap_or_default();
+    let wal_before = listing(&dir.join("wal"));
+    let inputs: HashMap<i128, SuperfileFacts> = table
+        .local_handle()
+        .reader()
+        .expect("reader")
+        .manifest()
+        .get_all_superfiles()
+        .iter()
+        .map(|entry| {
+            let facts = superfile_facts(&dir, entry);
+            (facts.ids[0], facts)
+        })
+        .collect();
+
+    table
+        .reindex(&ReindexOptions::to_standard_analyzer())
+        .expect("move to standard");
+    table.gc(Duration::ZERO).expect("collect replaced files");
+
+    let reader = table.local_handle().reader().expect("reader");
+    let entries = reader.manifest().get_all_superfiles();
+    assert_eq!(entries.len(), inputs.len(), "{shape}: one output per input");
+    for entry in entries {
+        let path = entry.storage_path();
+        let out = superfile_facts(&dir, entry);
+        let input = inputs
+            .get(&out.ids[0])
+            .unwrap_or_else(|| panic!("{path}: matches no input's rows"));
+        assert_ne!(
+            out.superfile_id, input.superfile_id,
+            "{path}: not a new superfile"
+        );
+        assert_eq!(out.ids, input.ids, "{path}: rows or their order changed");
+        assert_eq!(
+            out.birth_version, input.birth_version,
+            "{path}: birth version"
+        );
+        assert_eq!(out.partition_key, input.partition_key, "{path}: partition");
+
+        // The Parquet body is carried byte for byte, so the FTS blob starts
+        // where it did.
+        let body_end = input.fts.0 as usize;
+        assert_eq!(out.fts.0, input.fts.0, "{path}: body length changed");
+        assert!(
+            out.bytes[..body_end] == input.bytes[..body_end],
+            "{path}: body bytes changed"
+        );
+        // The vector subsection is carried byte for byte, right after the
+        // new FTS blob.
+        match (input.vec, out.vec) {
+            (None, None) => {}
+            (Some((in_at, in_len)), Some((out_at, out_len))) => {
+                assert_eq!(out_at, out.fts.0 + out.fts.1, "{path}: vector placement");
+                assert!(
+                    out.bytes[out_at as usize..(out_at + out_len) as usize]
+                        == input.bytes[in_at as usize..(in_at + in_len) as usize],
+                    "{path}: vector bytes changed"
+                );
+            }
+            (before, after) => panic!("{path}: vector region {before:?} became {after:?}"),
+        }
+
+        // The FTS blob is the current format.
+        let blob = &out.bytes[out.fts.0 as usize..];
+        assert!(blob.starts_with(b"INFFTS01"), "{path}: no FTS magic");
+        let version = u32::from_le_bytes(blob[8..12].try_into().expect("u32"));
+        assert_eq!(version, VERSION_CURRENT, "{path}: FTS blob version");
+
+        // Every footer key is stored once, and the builder is this engine.
+        let kvs = raw_footer_kvs(&out.bytes);
+        let mut keys: Vec<&str> = kvs.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        let unique = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), unique, "{path}: a footer key is stored twice");
+        let builder = &kvs
+            .iter()
+            .find(|(k, _)| k == kv::BUILDER)
+            .expect("builder key")
+            .1;
+        assert!(
+            builder.contains(env!("CARGO_PKG_VERSION")),
+            "{path}: written by {builder}"
+        );
+
+        // Each column: `standard`, its analysis recorded, everything else
+        // as it was.
+        assert_eq!(out.columns.len(), input.columns.len(), "{path}: columns");
+        for (now, was) in out.columns.iter().zip(&input.columns) {
+            assert_eq!(now["tokenizer"], "standard", "{path}: {now}");
+            assert!(now["analysis_revision"].is_u64(), "{path}: {now}");
+            assert_eq!(
+                without_analysis(now),
+                without_analysis(was),
+                "{path}: a column setting other than the analyzer moved"
+            );
+        }
+
+        // The manifest names the regions the footer does.
+        let offsets = entry
+            .subsection_offsets
+            .as_ref()
+            .unwrap_or_else(|| panic!("{path}: no subsection offsets"));
+        assert_eq!(offsets.total_size, out.bytes.len() as u64, "{path}: size");
+        assert_eq!(offsets.fts, Some(out.fts), "{path}: FTS region");
+        assert_eq!(offsets.vec, out.vec, "{path}: vector region");
+    }
+
+    // On disk, the table's superfiles are exactly the live ones.
+    let mut live: Vec<String> = entries.iter().map(|e| e.storage_path()).collect();
+    live.sort();
+    let mut on_disk: Vec<String> = superfile_paths(&dir)
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&dir)
+                .expect("under table")
+                .display()
+                .to_string()
+        })
+        .collect();
+    on_disk.sort();
+    assert_eq!(
+        on_disk, live,
+        "{shape}: replaced or orphaned superfiles remain"
+    );
+
+    // The manifest list: new options, a complete term index that exists,
+    // and deleted-rows files registered only for live superfiles — each of
+    // which is on disk, with no file left for a replaced superfile.
+    let list = current_manifest_list(&dir);
+    assert_ne!(
+        list["options_hash"], list_before["options_hash"],
+        "{shape}: options hash"
+    );
+    assert_eq!(
+        list["term_index_complete"], true,
+        "{shape}: term index incomplete"
+    );
+    let index = list["term_index_uri"].as_str().expect("term index uri");
+    assert!(
+        dir.join(index).is_file(),
+        "{shape}: term index {index} missing"
+    );
+    let live_ids: Vec<String> = entries.iter().map(|e| e.superfile_id.to_string()).collect();
+    let mut registered: Vec<String> = list["tombstone_seqs"]
+        .as_object()
+        .expect("tombstone seqs")
+        .keys()
+        .cloned()
+        .collect();
+    registered.sort();
+    let before_registered = list_before["tombstone_seqs"]
+        .as_object()
+        .map_or(0, |seqs| seqs.len());
+    assert_eq!(
+        registered.len(),
+        before_registered,
+        "{shape}: deleted-rows files were not carried one for one"
+    );
+    assert!(
+        registered.iter().all(|id| live_ids.contains(id)),
+        "{shape}: a deleted-rows file is registered for a replaced superfile"
+    );
+    let mut sidecars: Vec<String> = files_with_extension(&dir.join("superfiles"), "tombstones")
+        .iter()
+        .map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .expect("sidecar name")
+                .to_string()
+        })
+        .collect();
+    sidecars.sort();
+    assert_eq!(sidecars, registered, "{shape}: deleted-rows files on disk");
+
+    // The catalog: `standard` recorded, nothing else about the table moved.
+    let mut catalog = catalog_json(&root);
+    let mut expected = catalog_before.clone();
+    let analyzers = &mut expected["tables"][TABLE]["fts_analyzers"];
+    for analyzer in analyzers.as_array_mut().expect("analyzer list") {
+        *analyzer = serde_json::json!("standard");
+    }
+    catalog["catalog_id"] = serde_json::Value::Null;
+    expected["catalog_id"] = serde_json::Value::Null;
+    assert_eq!(
+        without_empty_lists(&catalog),
+        without_empty_lists(&expected),
+        "{shape}: catalog record"
+    );
+
+    // Untouched: the hidden vector index and the mutation log.
+    assert_eq!(
+        hidden_dir.as_deref().map(listing).unwrap_or_default(),
+        hidden_before,
+        "{shape}: the hidden vector index changed"
+    );
+    assert_eq!(
+        listing(&dir.join("wal")),
+        wal_before,
+        "{shape}: WAL state left"
+    );
+
+    let staleness = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess");
+    assert!(
+        staleness.is_current()
+            && staleness.ascii_lower_columns.is_empty()
+            && staleness.inconsistent_footers.is_empty(),
+        "{shape}: {staleness:?}"
+    );
+    assert!(
+        table
+            .reindex_plan(&ReindexOptions::default())
+            .expect("plan")
+            .is_empty(),
+        "{shape}: a default reindex still has work"
+    );
+}
+
+#[test]
+fn a_migrated_current_table_carries_no_debt() {
+    assert_migration_leaves_no_debt("v7_ascii_lower");
+}
+
+#[test]
+fn a_migrated_old_default_table_carries_no_debt() {
+    assert_migration_leaves_no_debt("v4_bitset_blocks");
 }
