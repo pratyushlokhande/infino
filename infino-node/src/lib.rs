@@ -149,15 +149,17 @@ fn reindex_err(e: ReindexError) -> Error {
     }
 }
 
-/// Parse a reindex mode name (`"auto"` / `"rewrite"` / `"reanalyze"`).
+/// Parse a reindex mode name (`"auto"` / `"rewrite"` / `"reanalyze"` /
+/// `"to_standard_analyzer"`).
 fn reindex_mode_from_str(s: &str) -> Result<ReindexMode> {
     match s.to_ascii_lowercase().as_str() {
         "auto" => Ok(ReindexMode::Auto),
         "rewrite" => Ok(ReindexMode::Rewrite),
         "reanalyze" => Ok(ReindexMode::Reanalyze),
+        "to_standard_analyzer" => Ok(ReindexMode::ToStandardAnalyzer),
         other => Err(Error::new(
             Status::InvalidArg,
-            format!("unknown reindex mode {other:?}; use 'auto', 'rewrite', or 'reanalyze'"),
+            format!("unknown reindex mode {other:?}; use 'auto', 'rewrite', 'reanalyze', or 'to_standard_analyzer'"),
         )),
     }
 }
@@ -168,8 +170,9 @@ fn reindex_mode_name(mode: ReindexMode) -> String {
         ReindexMode::Auto => "auto".into(),
         ReindexMode::Rewrite => "rewrite".into(),
         ReindexMode::Reanalyze => "reanalyze".into(),
+        ReindexMode::ToStandardAnalyzer => "to_standard_analyzer".into(),
         // `ReindexMode` is `#[non_exhaustive]`: a newer mode keeps its own
-        // name rather than masquerading as one of the three above.
+        // name rather than masquerading as one of the four above.
         other => format!("{other:?}").to_ascii_lowercase(),
     }
 }
@@ -628,8 +631,9 @@ impl From<infino::GcReport> for GcReport {
 pub struct ReindexOptions {
     /// How much to repair: `"auto"` (default — the cheapest repair that makes
     /// each superfile current), `"rewrite"` (layout only; superfiles whose
-    /// terms are stale are left and reported), or `"reanalyze"` (re-tokenize
-    /// every stale superfile from its stored text).
+    /// terms are stale are left and reported), `"reanalyze"` (re-tokenize
+    /// every stale superfile from its stored text), or `"to_standard_analyzer"`
+    /// (move every `ascii_lower` column to the standard analyzer).
     pub mode: Option<String>,
     /// How old a sealed tombstone sidecar has to be, in milliseconds, before a
     /// rewrite takes it over. Omit to use the table's compaction setting.
@@ -695,6 +699,9 @@ pub struct StalenessReport {
     /// Superfiles whose footer places a blob where the file or its manifest
     /// entry contradicts. A reindex reports these and never rewrites them.
     pub inconsistent_footers: Vec<String>,
+    /// Full-text columns still on `ascii_lower`, which only the
+    /// `"to_standard_analyzer"` mode moves.
+    pub ascii_lower_columns: Vec<String>,
     /// Whether a reindex would do nothing at all.
     pub is_current: bool,
 }
@@ -709,6 +716,7 @@ impl From<infino::StalenessReport> for StalenessReport {
             bytes_to_rewrite: r.bytes_to_rewrite as i64,
             unrepairable_columns: r.unrepairable_columns,
             inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
+            ascii_lower_columns: r.ascii_lower_columns,
         }
     }
 }
@@ -723,7 +731,8 @@ fn ids_to_strings(ids: &[impl ToString]) -> Vec<String> {
 pub struct PlannedRepair {
     /// The superfile the run reads and replaces.
     pub superfile_id: String,
-    /// The repair it gets: `"rewrite"` or `"reanalyze"`, never `"auto"`.
+    /// The repair it gets: `"rewrite"`, `"reanalyze"` or
+    /// `"to_standard_analyzer"`, never `"auto"`.
     pub mode: String,
     /// Live bytes in the superfile.
     pub live_bytes: i64,
@@ -780,7 +789,8 @@ pub struct FtsOptions {
     /// Tokenizer: `"standard"` (the default — the Unicode-aware UAX #29
     /// tokenizer that keeps non-ASCII text) or `"ascii_lower"` (ASCII
     /// split + lowercase, non-ASCII dropped). It is recorded with the
-    /// table and cannot be changed afterwards.
+    /// table; the only change available afterwards is `"ascii_lower"` to
+    /// `"standard"`, through the `"to_standard_analyzer"` reindex mode.
     pub analyzer: Option<String>,
     /// Remove this column's stopwords — the very common words whose
     /// presence says almost nothing about what a document is about.

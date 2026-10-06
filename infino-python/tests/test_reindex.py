@@ -75,6 +75,7 @@ def test_a_table_this_engine_wrote_is_current(tmp_path):
     assert staleness.bytes_to_rewrite == 0
     assert staleness.unrepairable_columns == []
     assert staleness.inconsistent_footers == []
+    assert staleness.ascii_lower_columns == []
 
     assert table.reindex_plan() == []
     report = table.reindex()
@@ -153,3 +154,26 @@ def test_a_long_seal_timeout_is_passed_through(tmp_path):
 def test_a_negative_seal_timeout_is_rejected():
     with pytest.raises(OverflowError):
         infino.ReindexOptions(stale_seal_timeout_ms=-1)
+
+
+def test_an_ascii_lower_table_moves_to_standard(tmp_path):
+    table = infino.connect(str(tmp_path)).create_table(
+        "docs", _title_schema(), infino.IndexSpec().fts("title", analyzer="ascii_lower")
+    )
+    table.append([{"title": "café crème"}])
+    table.append([{"title": "plain words"}])
+    # `ascii_lower` drops a token holding any non-ASCII byte.
+    assert _hits(table, "café") == 0
+    assert table.index_staleness().ascii_lower_columns == ["title"]
+
+    to_standard = infino.ReindexOptions(mode="to_standard_analyzer")
+    plan = table.reindex_plan(to_standard)
+    assert [p.mode for p in plan] == ["to_standard_analyzer"] * 2
+    assert table.reindex(to_standard).rewritten == 2
+
+    assert _hits(table, "café") == 1
+    assert _hits(table, "plain") == 1
+    staleness = table.index_staleness()
+    assert staleness.ascii_lower_columns == []
+    assert staleness.is_current
+    assert table.reindex(to_standard).rewritten == 0

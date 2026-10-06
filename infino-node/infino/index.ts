@@ -121,8 +121,9 @@ export interface OptimizeOptions {
 /** How much a reindex repairs. `"auto"` gives each superfile the cheapest
  * repair that makes it current; `"rewrite"` brings layouts current and leaves
  * superfiles whose terms are stale (reported); `"reanalyze"` re-tokenizes every
- * stale superfile from its stored text. */
-export type ReindexMode = "auto" | "rewrite" | "reanalyze";
+ * stale superfile from its stored text. `"to_standard_analyzer"` moves every
+ * `ascii_lower` column to the standard analyzer, which changes what it matches. */
+export type ReindexMode = "auto" | "rewrite" | "reanalyze" | "to_standard_analyzer";
 
 /** Options for `reindex`, `reindexPlan` and `indexStaleness`; all fields
  * optional (omitted ⇒ engine default). Repairs the full-text index. */
@@ -178,6 +179,9 @@ export interface StalenessReport {
   /** Superfiles whose footer places a blob where the file or its manifest
    * entry contradicts. A reindex reports these and never rewrites them. */
   inconsistentFooters: string[];
+  /** Full-text columns still on `ascii_lower`, which only
+   * `"to_standard_analyzer"` moves. */
+  asciiLowerColumns: string[];
   /** Whether a reindex would do nothing at all. */
   isCurrent: boolean;
 }

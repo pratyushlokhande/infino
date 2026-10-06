@@ -135,14 +135,16 @@ fn reindex_err(e: ReindexError) -> PyErr {
     }
 }
 
-/// Parse a reindex mode name (`"auto"` / `"rewrite"` / `"reanalyze"`).
+/// Parse a reindex mode name (`"auto"` / `"rewrite"` / `"reanalyze"` /
+/// `"to_standard_analyzer"`).
 fn reindex_mode_from_str(s: &str) -> PyResult<ReindexMode> {
     match s.to_ascii_lowercase().as_str() {
         "auto" => Ok(ReindexMode::Auto),
         "rewrite" => Ok(ReindexMode::Rewrite),
         "reanalyze" => Ok(ReindexMode::Reanalyze),
+        "to_standard_analyzer" => Ok(ReindexMode::ToStandardAnalyzer),
         other => Err(PyValueError::new_err(format!(
-            "unknown reindex mode {other:?}; use 'auto', 'rewrite', or 'reanalyze'"
+            "unknown reindex mode {other:?}; use 'auto', 'rewrite', 'reanalyze', or 'to_standard_analyzer'"
         ))),
     }
 }
@@ -153,8 +155,9 @@ fn reindex_mode_name(mode: ReindexMode) -> String {
         ReindexMode::Auto => "auto".into(),
         ReindexMode::Rewrite => "rewrite".into(),
         ReindexMode::Reanalyze => "reanalyze".into(),
+        ReindexMode::ToStandardAnalyzer => "to_standard_analyzer".into(),
         // `ReindexMode` is `#[non_exhaustive]`: a newer mode keeps its own
-        // name rather than masquerading as one of the three above.
+        // name rather than masquerading as one of the four above.
         other => format!("{other:?}").to_ascii_lowercase(),
     }
 }
@@ -328,7 +331,9 @@ impl IndexSpec {
     /// `analyzer` selects the tokenizer: `"standard"` (the default —
     /// the Unicode-aware UAX #29 tokenizer that keeps non-ASCII text)
     /// or `"ascii_lower"` (ASCII split + lowercase, non-ASCII dropped).
-    /// It is recorded with the table and cannot be changed afterwards.
+    /// It is recorded with the table; the only change available afterwards
+    /// is `"ascii_lower"` to `"standard"`, through the
+    /// `"to_standard_analyzer"` reindex mode.
     /// `stored=False` makes the column index-only: searchable, but the
     /// raw text is never kept in the table, so it cannot be selected,
     /// projected, or filtered on (append/update batches still carry it).
@@ -753,6 +758,10 @@ struct StalenessReport {
     unrepairable_columns: Vec<String>,
     #[pyo3(get)]
     inconsistent_footers: Vec<String>,
+    /// Full-text columns still on `ascii_lower`, which only the
+    /// `"to_standard_analyzer"` mode moves.
+    #[pyo3(get)]
+    ascii_lower_columns: Vec<String>,
     #[pyo3(get)]
     is_current: bool,
 }
@@ -767,6 +776,7 @@ impl StalenessReport {
             bytes_to_rewrite: r.bytes_to_rewrite,
             unrepairable_columns: r.unrepairable_columns,
             inconsistent_footers: ids_to_strings(&r.inconsistent_footers),
+            ascii_lower_columns: r.ascii_lower_columns,
         }
     }
 }
@@ -782,13 +792,14 @@ impl StalenessReport {
         format!(
             "StalenessReport(superfiles={}, needing_rewrite={}, awaiting_reanalysis={}, \
              bytes_to_rewrite={}, unrepairable_columns={:?}, inconsistent_footers={:?}, \
-             is_current={})",
+             ascii_lower_columns={:?}, is_current={})",
             self.superfiles,
             self.needing_rewrite,
             self.awaiting_reanalysis,
             self.bytes_to_rewrite,
             self.unrepairable_columns,
             self.inconsistent_footers,
+            self.ascii_lower_columns,
             if self.is_current { "True" } else { "False" },
         )
     }

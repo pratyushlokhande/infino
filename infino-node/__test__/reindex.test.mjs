@@ -75,6 +75,7 @@ test("a table this engine wrote is current", () => {
     bytesToRewrite: 0,
     unrepairableColumns: [],
     inconsistentFooters: [],
+    asciiLowerColumns: [],
     isCurrent: true,
   });
   assert.deepEqual(table.reindexPlan(), []);
@@ -163,4 +164,31 @@ test("a negative seal timeout is rejected", () => {
     assert.match(e.message, /must not be negative/);
     return true;
   });
+});
+
+test("an ascii_lower table moves to standard", () => {
+  const table = connect(tempRoot()).createTable(
+    "docs",
+    titleSchema(),
+    new IndexSpec().fts("title", { analyzer: "ascii_lower" }),
+  );
+  table.append([{ title: "café crème" }]);
+  table.append([{ title: "plain words" }]);
+  // `ascii_lower` drops a token holding any non-ASCII byte.
+  assert.equal(hits(table, "café"), 0);
+  assert.deepEqual(table.indexStaleness().asciiLowerColumns, ["title"]);
+
+  const toStandard = { mode: "to_standard_analyzer" };
+  assert.deepEqual(
+    table.reindexPlan(toStandard).map((p) => p.mode),
+    ["to_standard_analyzer", "to_standard_analyzer"],
+  );
+  assert.equal(table.reindex(toStandard).rewritten, 2);
+
+  assert.equal(hits(table, "café"), 1);
+  assert.equal(hits(table, "plain"), 1);
+  const staleness = table.indexStaleness();
+  assert.deepEqual(staleness.asciiLowerColumns, []);
+  assert.equal(staleness.isCurrent, true);
+  assert.equal(table.reindex(toStandard).rewritten, 0);
 });
