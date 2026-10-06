@@ -11,36 +11,67 @@
 // Every probe word is absent from the shared corpus, so its count is
 // decided by these documents alone.
 
-/// The `body` of each planted document, in append order. Row `i` of the
-/// second append carries `ANALYZER_DOCS[i]`.
+/// One planted row appended after the shared corpus.
 #[allow(dead_code)]
-pub const ANALYZER_DOCS: &[&str] = &[
-    // An apostrophe: `standard` keeps the word whole, `ascii_lower` splits
-    // it at the apostrophe.
-    "don't panic",
-    // A decimal: `standard` keeps it whole, `ascii_lower` splits it at the
-    // point.
-    "version 3.14 released",
-    // Accented letters: `ascii_lower` drops a token holding any non-ASCII
-    // byte.
-    "résumé attached",
-    // An emoji: a term under `standard`, dropped by `ascii_lower`.
-    "🚀 launch",
-    // Removed by the generator after it is written, so the table carries a
-    // tombstone. Holds a `standard`-only word: a re-analysis that dropped
-    // the tombstone would bring it back.
-    "über tombstoned",
+pub struct AnalyzerDoc {
+    pub title: &'static str,
+    pub body: &'static str,
+    pub deleted: bool,
+}
+
+/// The planted documents, in append order.
+#[allow(dead_code)]
+pub const ANALYZER_DOCS: &[AnalyzerDoc] = &[
+    AnalyzerDoc {
+        title: "planted p0",
+        // An apostrophe: `standard` keeps the word whole, `ascii_lower`
+        // splits it at the apostrophe.
+        body: "don't panic",
+        deleted: false,
+    },
+    AnalyzerDoc {
+        title: "planted p1",
+        // A decimal: `standard` keeps it whole, `ascii_lower` splits it at
+        // the point.
+        body: "version 3.14 released",
+        deleted: false,
+    },
+    AnalyzerDoc {
+        title: "planted p2",
+        // Accented letters: `ascii_lower` drops a token holding any
+        // non-ASCII byte.
+        body: "résumé attached",
+        deleted: false,
+    },
+    AnalyzerDoc {
+        title: "planted p3",
+        // An emoji: a term under `standard`, dropped by `ascii_lower`.
+        body: "🚀 launch",
+        deleted: false,
+    },
+    AnalyzerDoc {
+        title: "planted p4",
+        // Removed by the generator after it is written, so the table carries
+        // a tombstone. Holds a `standard`-only word: a re-analysis that
+        // dropped the tombstone would bring it back.
+        body: "über tombstoned",
+        deleted: true,
+    },
 ];
 
-/// Index into [`ANALYZER_DOCS`] of the document the generator deletes.
+/// Planted rows left live: every one not marked `deleted`.
 #[allow(dead_code)]
-pub const DELETED_ANALYZER_DOC: usize = 4;
-
-/// Title of planted document `i`, unique so the delete can name one row.
-#[allow(dead_code)]
-pub fn analyzer_title(i: usize) -> String {
-    format!("planted p{i}")
-}
+pub const LIVE_ANALYZER_DOCS: usize = {
+    let mut live = 0;
+    let mut i = 0;
+    while i < ANALYZER_DOCS.len() {
+        if !ANALYZER_DOCS[i].deleted {
+            live += 1;
+        }
+        i += 1;
+    }
+    live
+};
 
 /// A single-token probe of the `body` column, with the live documents it
 /// matches under each analyzer.

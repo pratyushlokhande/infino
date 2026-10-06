@@ -30,6 +30,33 @@ pub fn text_columns() -> Vec<LargeStringArray> {
     ]
 }
 
+/// The shared embedding column every vector-bearing corpus generator uses.
+#[allow(dead_code)]
+pub fn embedding_field() -> Field {
+    Field::new(
+        "emb",
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            EMBEDDING_DIM as i32,
+        ),
+        false,
+    )
+}
+
+/// The `emb` column for documents `ids`.
+#[allow(dead_code)]
+pub fn embeddings(
+    ids: impl Iterator<Item = u32>,
+) -> Result<ArrayRef, Box<dyn std::error::Error>> {
+    let flat: Vec<f32> = ids.flat_map(embedding).collect();
+    Ok(Arc::new(FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        EMBEDDING_DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )?))
+}
+
 /// Write the shared corpus as a text-only table indexed by `spec`.
 ///
 /// `spec` stays the caller's because it is the one thing that genuinely

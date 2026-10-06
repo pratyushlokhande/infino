@@ -30,6 +30,7 @@ shapes=(
 )
 
 wanted=("$@")
+built_gens=" "
 for entry in "${shapes[@]}"; do
   IFS=: read -r shape gen version profile <<<"$entry"
   if [ ${#wanted[@]} -gt 0 ] && [[ ! " ${wanted[*]} " =~ " ${shape} " ]]; then
@@ -38,7 +39,10 @@ for entry in "${shapes[@]}"; do
 
   echo "==> $shape (engine ${gen#v}${profile:+, $profile}, expecting blob version $version)"
   bin="generators/$gen/target/release/corpus-gen-$(echo "${gen#v}" | tr '_' '-')"
-  ( cd "generators/$gen" && cargo build --release --quiet )
+  if [[ "$built_gens" != *" $gen "* ]]; then
+    ( cd "generators/$gen" && cargo build --release --quiet )
+    built_gens+="$gen "
+  fi
 
   rm -rf "${tables:?}/$shape"
   if [[ "$profile" == reindex=* ]]; then

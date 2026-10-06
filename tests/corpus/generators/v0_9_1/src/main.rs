@@ -24,7 +24,7 @@
 //! `profile` is `index_only` to write `body` without its text. Nothing can
 //! re-analyze that column, so a migration has to refuse the table.
 
-use std::{env, sync::Arc};
+use std::{env, error::Error, sync::Arc};
 
 use datafusion::prelude::{col, lit};
 use infino::{
@@ -39,16 +39,27 @@ include!("../../shared/analyzer_data.rs");
 
 /// The `ascii_lower` base tokenizer's name.
 const ASCII_LOWER: &str = "ascii_lower";
+/// The only supported optional profile.
+const PROFILE_INDEX_ONLY: &str = "index_only";
+/// Command-line contract for this generator.
+const USAGE: &str = "usage: <output-dir> <table-name> [index_only]";
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1);
-    let out_dir = args
-        .next()
-        .ok_or("usage: <output-dir> <table-name> [profile]")?;
-    let table = args
-        .next()
-        .ok_or("usage: <output-dir> <table-name> [profile]")?;
-    let body_stored = args.next().as_deref() != Some("index_only");
+    let out_dir = args.next().ok_or(USAGE)?;
+    let table = args.next().ok_or(USAGE)?;
+    let body_stored = match args.next().as_deref() {
+        None => true,
+        Some(PROFILE_INDEX_ONLY) => false,
+        Some(other) => {
+            return Err(
+                format!("unknown profile {other:?}; expected {PROFILE_INDEX_ONLY:?}").into(),
+            );
+        }
+    };
+    if let Some(extra) = args.next() {
+        return Err(format!("unexpected extra argument {extra:?}; {USAGE}").into());
+    }
 
     let mut fields = text_fields();
     fields.push(embedding_field());
@@ -80,51 +91,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     handle.append(&RecordBatch::try_new(Arc::clone(&schema), shared)?)?;
 
     handle.append(&planted_batch(&schema)?)?;
-    let deleted = handle.delete(col("title").eq(lit(analyzer_title(DELETED_ANALYZER_DOC))))?;
-    if deleted.n_tombstoned() != 1 {
-        return Err(format!(
-            "tombstoned {} planted rows, expected 1",
-            deleted.n_tombstoned()
-        )
-        .into());
+    // Titles are unique, so each delete has to land exactly one tombstone;
+    // anything else means the table is not the one the tests expect.
+    for doc in ANALYZER_DOCS.iter().filter(|doc| doc.deleted) {
+        let deleted = handle.delete(col("title").eq(lit(doc.title)))?;
+        if deleted.n_tombstoned() != 1 {
+            return Err(format!(
+                "tombstoned {} rows titled {:?}, expected 1",
+                deleted.n_tombstoned(),
+                doc.title
+            )
+            .into());
+        }
     }
 
     println!(
-        "wrote {} docs to {out_dir}/{table}",
-        N_DOCS as usize + ANALYZER_DOCS.len()
+        "wrote {} docs to {out_dir}/{table}, {} live",
+        N_DOCS as usize + ANALYZER_DOCS.len(),
+        N_DOCS as usize + LIVE_ANALYZER_DOCS
     );
     Ok(())
 }
 
-fn embedding_field() -> Field {
-    Field::new(
-        "emb",
-        DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            EMBEDDING_DIM as i32,
-        ),
-        false,
-    )
-}
-
-/// The `emb` column for documents `ids`.
-fn embeddings(ids: impl Iterator<Item = u32>) -> Result<ArrayRef, Box<dyn std::error::Error>> {
-    let flat: Vec<f32> = ids.flat_map(embedding).collect();
-    Ok(Arc::new(FixedSizeListArray::try_new(
-        Arc::new(Field::new("item", DataType::Float32, true)),
-        EMBEDDING_DIM as i32,
-        Arc::new(Float32Array::from(flat)) as ArrayRef,
-        None,
-    )?))
-}
-
 /// The [`ANALYZER_DOCS`], numbered on from the shared corpus.
-fn planted_batch(schema: &SchemaRef) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+fn planted_batch(schema: &SchemaRef) -> Result<RecordBatch, Box<dyn Error>> {
     let n = ANALYZER_DOCS.len();
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(LargeStringArray::from(ANALYZER_DOCS.to_vec())),
         Arc::new(LargeStringArray::from(
-            (0..n).map(analyzer_title).collect::<Vec<_>>(),
+            ANALYZER_DOCS.iter().map(|doc| doc.body).collect::<Vec<_>>(),
+        )),
+        Arc::new(LargeStringArray::from(
+            ANALYZER_DOCS
+                .iter()
+                .map(|doc| doc.title)
+                .collect::<Vec<_>>(),
         )),
         Arc::new(LargeStringArray::from(vec![None::<String>; n])),
         embeddings(N_DOCS..N_DOCS + n as u32)?,

@@ -38,14 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fts(FtsField::new("title").positions(true))
         .fts(FtsField::new("notes"));
     if with_vectors {
-        fields.push(Field::new(
-            "emb",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                EMBEDDING_DIM as i32,
-            ),
-            false,
-        ));
+        fields.push(embedding_field());
         // Cosine takes the engine's default codec. Nothing here selects
         // it — that is the point of the shape.
         spec = spec.vector("emb", EMBEDDING_DIM, Metric::Cosine);
@@ -60,13 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|c| Arc::new(c) as ArrayRef)
         .collect();
     if with_vectors {
-        let flat: Vec<f32> = (0..N_DOCS).flat_map(embedding).collect();
-        columns.push(Arc::new(FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            EMBEDDING_DIM as i32,
-            Arc::new(Float32Array::from(flat)) as ArrayRef,
-            None,
-        )?));
+        columns.push(embeddings(0..N_DOCS)?);
     }
     let batch = RecordBatch::try_new(schema, columns)?;
     handle.append(&batch)?;

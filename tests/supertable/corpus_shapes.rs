@@ -84,6 +84,9 @@ include!("../corpus/generators/shared/analyzer_data.rs");
 /// while that table summarises a single span.
 const DOCS_FOR_MULTI_ENTRY_COARSE: u32 = 4096;
 
+/// Suffix of the directory a table's hidden vector index lives in.
+const HIDDEN_VECTOR_INDEX_DIR_SUFFIX: &str = "_vector_index";
+
 /// 8-byte magic at the start of an FTS blob; the version is the `u32`
 /// immediately after it.
 const FTS_MAGIC: &[u8; 8] = b"INFFTS01";
@@ -129,13 +132,33 @@ struct BlobHeader {
 
 /// Every file under `root` with `ext`, in path order.
 pub(crate) fn files_with_extension(root: &Path, ext: &str) -> Vec<PathBuf> {
+    files_under(root, ext, |_| true)
+}
+
+/// Every user-table superfile under `root`, in path order.
+///
+/// The hidden vector index a drain builds beside the table holds
+/// superfiles of its own, with no full-text index; they are not the
+/// table's and are left out.
+pub(crate) fn superfile_paths(root: &Path) -> Vec<PathBuf> {
+    files_under(root, "parquet", |dir| {
+        !dir.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(HIDDEN_VECTOR_INDEX_DIR_SUFFIX))
+    })
+}
+
+/// Every file under `root` with `ext`, in path order, descending only into
+/// the directories `descend` accepts.
+fn files_under(root: &Path, ext: &str, descend: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     let mut files = Vec::new();
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).expect("read corpus dir") {
             let path = entry.expect("dir entry").path();
             match path.is_dir() {
-                true => stack.push(path),
+                true if descend(&path) => stack.push(path),
+                true => {}
                 false if path.extension().is_some_and(|e| e == ext) => files.push(path),
                 false => {}
             }
@@ -143,11 +166,6 @@ pub(crate) fn files_with_extension(root: &Path, ext: &str) -> Vec<PathBuf> {
     }
     files.sort();
     files
-}
-
-/// Every superfile under `root`, in path order.
-pub(crate) fn superfile_paths(root: &Path) -> Vec<PathBuf> {
-    files_with_extension(root, "parquet")
 }
 
 /// The probe used against the corpus's planted embeddings: document 0's
@@ -769,22 +787,30 @@ mod v7_reindexed_vectors {
 const ASCII_LOWER_SHAPE_ROWS: usize = N_DOCS as usize + ANALYZER_DOCS.len();
 
 /// Live rows in the `ascii_lower` shapes, the `k` a count there needs.
-const ASCII_LOWER_SHAPE_LIVE_ROWS: usize = ASCII_LOWER_SHAPE_ROWS - 1;
+pub(crate) const ASCII_LOWER_SHAPE_LIVE_ROWS: usize = N_DOCS as usize + LIVE_ANALYZER_DOCS;
 
 /// Documents in the shared corpus whose title stems to `jump`.
-const TITLES_WITH_JUMP: usize = N_DOCS as usize / 3;
+pub(crate) const TITLES_WITH_JUMP: usize = N_DOCS as usize / 3;
 
 /// Every superfile's `inf.fts.columns` under `root`, parsed, so a test can
 /// name a column's analyzer without restating the JSON's layout.
-fn fts_columns(root: &Path) -> Vec<Vec<serde_json::Value>> {
-    blob_headers(root)
+pub(crate) fn fts_columns(root: &Path) -> Vec<Vec<serde_json::Value>> {
+    fts_columns_from_headers(&blob_headers(root))
+}
+
+/// Every superfile's `inf.fts.columns` from already-read headers.
+fn fts_columns_from_headers(headers: &[BlobHeader]) -> Vec<Vec<serde_json::Value>> {
+    headers
         .iter()
         .map(|h| serde_json::from_str(&h.columns_json).expect("inf.fts.columns is JSON"))
         .collect()
 }
 
 /// `column`'s entry in one superfile's parsed `inf.fts.columns`.
-fn fts_column<'a>(columns: &'a [serde_json::Value], column: &str) -> &'a serde_json::Value {
+pub(crate) fn fts_column<'a>(
+    columns: &'a [serde_json::Value],
+    column: &str,
+) -> &'a serde_json::Value {
     columns
         .iter()
         .find(|c| c["name"] == column)
@@ -818,7 +844,7 @@ fn assert_ascii_lower_shape(shape: &str, body_stored: bool) {
         );
     }
 
-    for (i, columns) in fts_columns(&root).iter().enumerate() {
+    for (i, columns) in fts_columns_from_headers(&headers).iter().enumerate() {
         for column in ["body", "title"] {
             let c = fts_column(columns, column);
             assert_eq!(

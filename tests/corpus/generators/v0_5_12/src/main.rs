@@ -10,7 +10,7 @@ use std::{env, sync::Arc};
 
 use infino::{
     IndexSpec,
-    arrow_array::{LargeStringArray, RecordBatch},
+    arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch},
     arrow_schema::{DataType, Field, Schema},
     connect,
 };
