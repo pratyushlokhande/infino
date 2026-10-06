@@ -98,7 +98,7 @@ impl Supertable {
             .ok_or(ReindexError::AlreadyRunning)?;
 
         let target = Arc::new(manifest.options.with_standard_analyzer());
-        let merge: Arc<dyn SuperfileMerge> = Arc::new(RepairMerge(Repair::Standard));
+        let merge: Arc<dyn SuperfileMerge> = Arc::new(RepairMerge::new(Repair::Standard, false));
         // Input superfile → its rebuilt, uploaded replacement.
         let mut rebuilt: HashMap<Uuid, Arc<SuperfileEntry>> = HashMap::new();
         let mut rounds = 0;
@@ -295,7 +295,7 @@ mod tests {
         };
         let ids_before = superfile_ids(&table);
 
-        let merge: Arc<dyn SuperfileMerge> = Arc::new(RepairMerge(Repair::Standard));
+        let merge: Arc<dyn SuperfileMerge> = Arc::new(RepairMerge::new(Repair::Standard, false));
         let target = Arc::new(table.inner().options.with_standard_analyzer());
         let first_rebuilt = table
             .rebuild_and_upload(first, &merge)

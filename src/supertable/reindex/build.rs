@@ -98,7 +98,21 @@ fn reanalysis_opts(repair: Repair, opts: BuilderOptions) -> BuilderOptions {
 /// produces the terms and whether the stored columns are re-analyzed, and
 /// nothing else. Spelling that as two structs and two carrying builds left
 /// four places for the parts they share to drift apart.
-pub(crate) struct RepairMerge(pub(crate) Repair);
+pub(crate) struct RepairMerge {
+    repair: Repair,
+    /// Credit an input's unrecorded analysis revision with the one its
+    /// writer emitted; see [`BuilderOptions::credit_writer_analysis`].
+    credit_writer_analysis: bool,
+}
+
+impl RepairMerge {
+    pub(crate) fn new(repair: Repair, credit_writer_analysis: bool) -> Self {
+        Self {
+            repair,
+            credit_writer_analysis,
+        }
+    }
+}
 
 impl SuperfileMerge for RepairMerge {
     fn build(
@@ -107,15 +121,20 @@ impl SuperfileMerge for RepairMerge {
         output: &mut dyn Write,
     ) -> Result<SuperfileStats, BuildError> {
         match carry_body(&inputs) {
-            Some((reader, entry)) => {
-                repair_carrying_body_to(self.0, reader, entry, inputs.fts_corpus, output)
-            }
+            Some((reader, entry)) => repair_carrying_body_to(
+                self.repair,
+                self.credit_writer_analysis,
+                reader,
+                entry,
+                inputs.fts_corpus,
+                output,
+            ),
             // Restating compaction's merge here would be a second copy that
             // could drift from the one the table is actually compacted with.
-            None => match self.0 {
+            None => match self.repair {
                 Repair::Layout => CompactionMerge.build(inputs, output),
                 Repair::Terms | Repair::Standard => {
-                    reanalyze_to(self.0, inputs.readers, inputs.fts_corpus, output)
+                    reanalyze_to(self.repair, inputs.readers, inputs.fts_corpus, output)
                 }
             },
         }
@@ -138,13 +157,17 @@ impl SuperfileMerge for RepairMerge {
 /// not perform would only be a chance to get them wrong.
 fn repair_carrying_body_to(
     repair: Repair,
+    credit_writer_analysis: bool,
     source: &Arc<SuperfileReader>,
     entry: &Arc<SuperfileEntry>,
     fts_corpus: &HashMap<String, ColumnLengthStats>,
     output: &mut dyn Write,
 ) -> Result<SuperfileStats, BuildError> {
     let readers = [(Arc::clone(source), None)];
-    let opts = merge_builder_opts(&readers, fts_corpus)?;
+    let opts = match credit_writer_analysis {
+        true => merge_builder_opts(&readers, fts_corpus)?.credit_writer_analysis(source),
+        false => merge_builder_opts(&readers, fts_corpus)?,
+    };
     let mut builder = SuperfileBuilder::new(reanalysis_opts(repair, opts))?;
     match repair {
         Repair::Layout => {

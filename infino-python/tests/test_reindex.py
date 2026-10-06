@@ -132,17 +132,22 @@ def test_a_rewrite_leaves_analysis_stale_superfiles_reported(tmp_path):
 
 def test_trusting_writer_analysis_reaches_the_engine_and_is_off_by_default(tmp_path):
     # The fixture's superfiles record no analysis revision, but the engine that
-    # wrote them emitted the current one — so trusting the writer reads the
-    # table as current, and the default must not.
+    # wrote them emitted the current one. Trusting the writer finds nothing to
+    # re-analyze and one cheap rewrite per file to write the revision down; the
+    # default re-analyzes everything.
     table = _old_format_table(tmp_path)
-    trusting = infino.ReindexOptions(trust_writer_analysis=True)
+    trusting = infino.ReindexOptions(mode="rewrite", trust_writer_analysis=True)
 
-    assert table.index_staleness(trusting).is_current
-    assert table.reindex_plan(trusting) == []
-
-    assert not table.index_staleness().is_current
-    assert not table.index_staleness(infino.ReindexOptions()).is_current
+    staleness = table.index_staleness(trusting)
+    assert staleness.awaiting_reanalysis == 0
+    assert staleness.needing_rewrite == OLD_FORMAT_SUPERFILES
+    assert [p.mode for p in table.reindex_plan(trusting)] == ["rewrite"] * OLD_FORMAT_SUPERFILES
     assert len(table.reindex_plan(infino.ReindexOptions())) == OLD_FORMAT_SUPERFILES
+
+    assert table.reindex(trusting).rewritten == OLD_FORMAT_SUPERFILES
+    # The revision is now in the files, so nothing needs trusting.
+    assert table.index_staleness().is_current
+    assert table.reindex_plan(infino.ReindexOptions()) == []
 
 
 def test_a_long_seal_timeout_is_passed_through(tmp_path):

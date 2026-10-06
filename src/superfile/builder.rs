@@ -101,8 +101,8 @@ use crate::{
         },
         fts::{
             analysis::{
-                Base, Stemmer, Stopwords, UNKNOWN_ANALYSIS_REVISION, chain_name, chain_revision,
-                chain_tokenizer,
+                Base, Stemmer, Stopwords, UNKNOWN_ANALYSIS_REVISION, analysis_revision_written_by,
+                chain_name, chain_revision, chain_tokenizer,
             },
             bm25,
             builder::FtsBuilder,
@@ -113,6 +113,7 @@ use crate::{
         },
         id_space::{FtsDocId, RowId, StableId},
         ids,
+        reader::writer_builder_of,
         stats::SuperfileStats,
         vector::{
             builder::{
@@ -692,6 +693,34 @@ impl BuilderOptions {
         for column in &mut self.fts_columns {
             if column.stored {
                 column.carried_analysis_revision = None;
+            }
+        }
+        self
+    }
+
+    /// Credit each column `reader` records no analysis revision for with
+    /// the revision its writer emitted, read from the file's `inf.builder`.
+    ///
+    /// For a rewrite the caller has vouched for: a carried column then
+    /// records the revision its terms were produced at, where it would
+    /// otherwise carry the unknown forward. A recorded revision is never
+    /// changed, and a writer this cannot identify credits nothing.
+    pub(crate) fn credit_writer_analysis(mut self, reader: &SuperfileReader) -> Self {
+        let Some(fts) = reader.fts() else {
+            return self;
+        };
+        let credited = writer_builder_of(reader.parquet_metadata())
+            .map_or(UNKNOWN_ANALYSIS_REVISION, analysis_revision_written_by);
+        for remote in fts.fts_columns_config() {
+            if remote.analysis_revision.is_some() {
+                continue;
+            }
+            if let Some(own) = self
+                .fts_columns
+                .iter_mut()
+                .find(|c| c.column == remote.name)
+            {
+                own.carried_analysis_revision = Some(credited);
             }
         }
         self

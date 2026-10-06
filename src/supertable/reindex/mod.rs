@@ -80,6 +80,11 @@ pub(crate) struct StaleSuperfile {
     /// engine reads is sound, and a rewrite lays the footer out afresh
     /// from it, so it repairs this whatever the FTS index's state.
     pub(crate) has_duplicated_region_keys: bool,
+    /// The caller trusts the writer, and a column records no analysis
+    /// revision. Its terms read as current, but only on that trust; a
+    /// rewrite records the credited revision so they read as current
+    /// without it.
+    pub(crate) unrecorded_revision: bool,
 }
 
 /// Where a superfile's footer says its blobs sit, judged against the file
@@ -133,24 +138,31 @@ impl StaleSuperfile {
             .fts()
             .map(|f| f.staleness(assumed))
             .unwrap_or_default();
+        let unrecorded_revision = trust_writer_analysis
+            && reader.fts().is_some_and(|f| {
+                f.fts_columns_config()
+                    .any(|c| c.analysis_revision.is_none())
+            });
         Self {
             superfile_id,
             partition_key,
             live_bytes,
             fts,
             has_duplicated_region_keys,
+            unrecorded_revision,
         }
     }
 
     /// Whether a rewrite would change anything: the container is behind,
-    /// or the footer stores a stale duplicate.
+    /// the footer stores a stale duplicate, or a trusted revision is not
+    /// yet recorded.
     pub(crate) fn needs_rewrite(&self) -> bool {
-        self.fts.needs_rewrite() || self.has_duplicated_region_keys
+        self.fts.needs_rewrite() || self.has_duplicated_region_keys || self.unrecorded_revision
     }
 
     /// Whether this file is behind on anything a reindex repairs.
     pub(crate) fn is_current(&self) -> bool {
-        self.fts.is_current() && !self.has_duplicated_region_keys
+        self.fts.is_current() && !self.has_duplicated_region_keys && !self.unrecorded_revision
     }
 
     /// Columns a rewrite cannot repair, because their text was never
@@ -747,7 +759,8 @@ impl Supertable {
         // this tool's own. All carry the row set; the plan picks one per
         // superfile.
         for (done, (job, repair)) in plan_jobs(&all, opts.mode).into_iter().enumerate() {
-            let merge: Arc<dyn SuperfileMerge> = Arc::new(build::RepairMerge(repair));
+            let merge: Arc<dyn SuperfileMerge> =
+                Arc::new(build::RepairMerge::new(repair, opts.trust_writer_analysis));
             let superfile_id = job.inputs[0];
             let outcome = match self
                 .run_compaction_job_with(job, stale_seal_timeout, merge)
@@ -820,6 +833,7 @@ impl Supertable {
 mod tests {
     use std::{fs, slice};
 
+    use arrow_array::{Array, Decimal128Array, Float32Array};
     use bytes::Bytes;
     use datafusion::prelude::{col, lit};
     use tempfile::TempDir;
@@ -1109,6 +1123,94 @@ mod tests {
         );
     }
 
+    /// Every hit `term` has on `title`, as `(id, score)` pairs sorted by id,
+    /// so a rewrite that renumbers superfiles still compares equal.
+    fn scored_hits(table: &Supertable, term: &str) -> Vec<(i128, f32)> {
+        let mut hits: Vec<(i128, f32)> = table
+            .bm25_search("title", term, 100, Bm25SearchOptions::default(), None)
+            .expect("search")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("_id")
+                    .expect("_id")
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("_id is Decimal128")
+                    .clone();
+                let scores = batch
+                    .column_by_name("score")
+                    .expect("score")
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("score is Float32")
+                    .clone();
+                (0..batch.num_rows())
+                    .map(|i| (ids.value(i), scores.value(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        hits.sort_by_key(|(id, _)| *id);
+        hits
+    }
+
+    /// Data that is up to date but predates the recorded revision is
+    /// brought level with a migrated table by one trusted rewrite: postings
+    /// are copied rather than re-analyzed, the revision its writer emitted
+    /// is recorded, and from then on the files read as current without
+    /// trusting anything.
+    ///
+    /// The fixture is `infino/0.8.6` output: the current container, the
+    /// current chains, no revision recorded. Trusted, it reads as current
+    /// in what it holds and still as owing a rewrite, because the trust is
+    /// not yet written down.
+    #[test]
+    fn a_trusted_rewrite_records_the_revision_its_writer_emitted() {
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&old_format_fts_fixture(), dir.path());
+        let (_storage, table) = open_old_format_fts_fixture(dir.path(), |o| o);
+        let trusted = ReindexOptions::rewriting().trusting_writer_analysis();
+        let before = scored_hits(&table, "shared");
+        assert!(!before.is_empty(), "the fixture has hits to compare");
+
+        let assessed = table.index_staleness(&trusted).expect("staleness");
+        assert_eq!(assessed.awaiting_reanalysis, 0, "{assessed:?}");
+        assert_eq!(
+            assessed.needing_rewrite, assessed.superfiles,
+            "every file owes the recorded revision: {assessed:?}"
+        );
+        let planned = table.reindex_plan(&trusted).expect("plan");
+        assert_eq!(planned.len(), assessed.superfiles, "{planned:?}");
+        assert!(
+            planned.iter().all(|p| p.mode == ReindexMode::Rewrite),
+            "postings are copied, not re-analyzed: {planned:?}"
+        );
+
+        let report = table.reindex(&trusted).expect("trusted rewrite");
+        assert_eq!(report.rewritten, assessed.superfiles, "{report:?}");
+
+        // Nothing a query sees moved, which a copy of the postings implies.
+        assert_eq!(scored_hits(&table, "shared"), before);
+        // And the default — trusting nothing — now reads the table as a
+        // migrated one, because the revision is in the files.
+        let current = table
+            .index_staleness(&ReindexOptions::default())
+            .expect("staleness");
+        assert!(current.is_current(), "{current:?}");
+        assert!(
+            table
+                .reindex_plan(&ReindexOptions::default())
+                .expect("plan")
+                .is_empty(),
+            "a default reindex still has work"
+        );
+        assert_eq!(
+            table.reindex(&trusted).expect("second run").rewritten,
+            0,
+            "the trusted rewrite is not idempotent"
+        );
+    }
+
     fn entry(id: u128, fts: FtsStaleness) -> StaleSuperfile {
         StaleSuperfile {
             superfile_id: Uuid::from_u128(id),
@@ -1116,6 +1218,7 @@ mod tests {
             live_bytes: 1_024,
             fts,
             has_duplicated_region_keys: false,
+            unrecorded_revision: false,
         }
     }
 

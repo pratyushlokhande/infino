@@ -1200,6 +1200,12 @@ pub struct ReindexOptions {
     /// Setting this reads the writer's version out of `inf.builder` and
     /// credits what that version's chains emitted, skipping those files.
     ///
+    /// A run with it set records the credit: each such file gets one
+    /// layout rewrite that copies its postings and writes the revision
+    /// down, after which it reads as current without trusting anything.
+    /// That is the cheap way to bring a table whose terms are already
+    /// current level with a migrated one.
+    ///
     /// **Only sound when the table never held superfiles older than the
     /// writer's version.** A merge carries postings rather than
     /// re-analyzing them, and engines that did not record revisions did

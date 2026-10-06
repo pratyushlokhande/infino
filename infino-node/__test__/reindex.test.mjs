@@ -138,17 +138,25 @@ test("a rewrite leaves analysis-stale superfiles reported", () => {
 
 test("trusting writer analysis reaches the engine and is off by default", () => {
   // The fixture's superfiles record no analysis revision, but the engine that
-  // wrote them emitted the current one — so trusting the writer reads the
-  // table as current, and the default must not.
+  // wrote them emitted the current one. Trusting the writer finds nothing to
+  // re-analyze and one cheap rewrite per file to write the revision down; the
+  // default re-analyzes everything.
   const table = oldFormatTable(tempRoot());
-  const trusting = { trustWriterAnalysis: true };
+  const trusting = { mode: "rewrite", trustWriterAnalysis: true };
 
-  assert.equal(table.indexStaleness(trusting).isCurrent, true);
-  assert.deepEqual(table.reindexPlan(trusting), []);
-
-  assert.equal(table.indexStaleness().isCurrent, false);
-  assert.equal(table.indexStaleness({}).isCurrent, false);
+  const staleness = table.indexStaleness(trusting);
+  assert.equal(staleness.awaitingReanalysis, 0);
+  assert.equal(staleness.needingRewrite, OLD_FORMAT_SUPERFILES);
+  assert.deepEqual(
+    table.reindexPlan(trusting).map((p) => p.mode),
+    Array(OLD_FORMAT_SUPERFILES).fill("rewrite"),
+  );
   assert.equal(table.reindexPlan({}).length, OLD_FORMAT_SUPERFILES);
+
+  assert.equal(table.reindex(trusting).rewritten, OLD_FORMAT_SUPERFILES);
+  // The revision is now in the files, so nothing needs trusting.
+  assert.equal(table.indexStaleness().isCurrent, true);
+  assert.deepEqual(table.reindexPlan({}), []);
 });
 
 test("a long seal timeout is passed through", () => {

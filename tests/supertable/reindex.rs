@@ -25,8 +25,8 @@ use infino::{
 };
 
 use crate::corpus_shapes::{
-    N_DOCS, assert_scores_equivalent, blob_versions, corpus_dir, first_region, hits, hits_k,
-    open_corpus, probe_embedding, raw_footer_kvs, scores_by_id, table_dir, vector_hits,
+    N_DOCS, assert_scores_equivalent, blob_versions, corpus_dir, first_region, fts_columns, hits,
+    hits_k, open_corpus, probe_embedding, raw_footer_kvs, scores_by_id, table_dir, vector_hits,
 };
 
 /// Neighbours a footer-only open is probed for, matching the table-level
@@ -851,4 +851,87 @@ fn a_vector_region_a_past_reindex_misplaced_is_found_and_repaired() {
         .reindex(&ReindexOptions::default())
         .expect("second run");
     assert_eq!(again.rewritten, 0, "{again:?}");
+}
+
+/// The current analysis revision, as a column records it.
+const CURRENT_ANALYSIS_REVISION: u64 = 1;
+
+/// A table whose terms are already current but whose files predate the
+/// recorded revision reaches the same end state as a migrated one in a
+/// single trusted rewrite: the current container, the revision recorded,
+/// every answer unchanged, and nothing left for a default reindex.
+///
+/// `v6_positional` is 0.8.3 output, the first release with the current
+/// tokenization and one that records no revision.
+#[test]
+fn a_trusted_rewrite_brings_an_unrecorded_current_table_level() {
+    const SHAPE: &str = "v6_positional";
+    let Some((_tmp, table, root)) = open_corpus(SHAPE) else {
+        return;
+    };
+    let trusted = ReindexOptions::rewriting().trusting_writer_analysis();
+    let ranking_before = scores_by_id(&table, "body", "common shared", N_DOCS as usize);
+
+    let report = table.reindex(&trusted).expect("trusted rewrite");
+    assert!(report.rewritten > 0, "{report:?}");
+    table.gc(Duration::ZERO).expect("collect superseded bytes");
+
+    assert!(
+        blob_versions(&root).iter().all(|v| *v == VERSION_CURRENT),
+        "{:?}",
+        blob_versions(&root)
+    );
+    for columns in fts_columns(&root) {
+        for column in &columns {
+            assert_eq!(
+                column["analysis_revision"], CURRENT_ANALYSIS_REVISION,
+                "{SHAPE}: {column}"
+            );
+        }
+    }
+    assert_scores_equivalent(
+        &scores_by_id(&table, "body", "common shared", N_DOCS as usize),
+        &ranking_before,
+        SHAPE,
+    );
+    let after = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess without trust");
+    assert!(after.is_current(), "{SHAPE}: {after:?}");
+}
+
+/// Trust credits a file by its own writer, so one written before the
+/// current tokenization is not credited: it reaches the current container
+/// and stays owed a re-analysis, because its terms really are older.
+///
+/// `v5_positional` is 0.8.2 output, one release before the tokenization
+/// changed.
+#[test]
+fn a_trusted_rewrite_does_not_credit_a_writer_older_than_the_terms() {
+    const SHAPE: &str = "v5_positional";
+    let Some((_tmp, table, root)) = open_corpus(SHAPE) else {
+        return;
+    };
+    let trusted = ReindexOptions::rewriting().trusting_writer_analysis();
+    let before = table.index_staleness(&trusted).expect("assess");
+    assert_eq!(
+        before.awaiting_reanalysis, before.superfiles,
+        "{SHAPE}: a pre-0.8.3 writer earns no credit: {before:?}"
+    );
+
+    table.reindex(&trusted).expect("trusted rewrite");
+    table.gc(Duration::ZERO).expect("collect superseded bytes");
+
+    assert!(
+        blob_versions(&root).iter().all(|v| *v == VERSION_CURRENT),
+        "{:?}",
+        blob_versions(&root)
+    );
+    let after = table
+        .index_staleness(&ReindexOptions::default())
+        .expect("assess without trust");
+    assert_eq!(
+        after.awaiting_reanalysis, after.superfiles,
+        "{SHAPE}: older terms were certified current: {after:?}"
+    );
 }
