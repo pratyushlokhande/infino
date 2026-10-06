@@ -1,0 +1,19 @@
+# Writes `ascii_lower` corpus tables with the engine as it shipped in 0.9.1,
+# the shape a table created today on an explicit `ascii_lower` analyzer is
+# in: current container, recorded analysis revision, and an analyzer only a
+# change of analyzer can move.
+# Detached from the engine workspace (`[workspace]` below) so this pinned
+# dependency graph never takes part in resolving the engine's own.
+[package]
+name = "corpus-gen-0-9-1"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Exact: the point of this crate is the bytes this one release writes.
+infino = "=0.9.1"
+# The delete predicate's expression type; must match the engine's major.
+datafusion = { version = "54", default-features = false }

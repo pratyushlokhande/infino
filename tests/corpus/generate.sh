@@ -25,6 +25,8 @@ shapes=(
   "v6_positional:v0_8_3:6"
   "v6_with_vectors:v0_8_3:6:vectors"
   "v7_reindexed_vectors:v0_9_0:7:reindex=v6_with_vectors"
+  "v7_ascii_lower:v0_9_1:7"
+  "v7_ascii_lower_index_only:v0_9_1:7:index_only"
 )
 
 wanted=("$@")

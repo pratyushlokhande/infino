@@ -75,6 +75,7 @@ pub(crate) const TABLE: &str = "corpus";
 // test that keeps its own copy of the corpus's shape can drift from the
 // corpus and still pass.
 include!("../corpus/generators/shared/corpus_data.rs");
+include!("../corpus/generators/shared/analyzer_data.rs");
 
 /// A superfile holding at least this many documents gives a term present
 /// in every document more than `BLOCK_LEN * COARSE_BLOCK_MAX_SPAN` (128 *
@@ -759,6 +760,176 @@ mod v7_reindexed_vectors {
                 path.display()
             );
         }
+    }
+}
+
+/// Rows the `ascii_lower` shapes hold: the shared corpus plus the planted
+/// documents, the deleted one included, since a blob counts every row it
+/// indexed.
+const ASCII_LOWER_SHAPE_ROWS: usize = N_DOCS as usize + ANALYZER_DOCS.len();
+
+/// Live rows in the `ascii_lower` shapes, the `k` a count there needs.
+const ASCII_LOWER_SHAPE_LIVE_ROWS: usize = ASCII_LOWER_SHAPE_ROWS - 1;
+
+/// Documents in the shared corpus whose title stems to `jump`.
+const TITLES_WITH_JUMP: usize = N_DOCS as usize / 3;
+
+/// Every superfile's `inf.fts.columns` under `root`, parsed, so a test can
+/// name a column's analyzer without restating the JSON's layout.
+fn fts_columns(root: &Path) -> Vec<Vec<serde_json::Value>> {
+    blob_headers(root)
+        .iter()
+        .map(|h| serde_json::from_str(&h.columns_json).expect("inf.fts.columns is JSON"))
+        .collect()
+}
+
+/// `column`'s entry in one superfile's parsed `inf.fts.columns`.
+fn fts_column<'a>(columns: &'a [serde_json::Value], column: &str) -> &'a serde_json::Value {
+    columns
+        .iter()
+        .find(|c| c["name"] == column)
+        .unwrap_or_else(|| panic!("no FTS column {column}"))
+}
+
+/// Asserts an `ascii_lower` shape: several superfiles, each at the current
+/// container with a recorded revision, `body` and `title` naming
+/// `ascii_lower` and `notes` naming `standard`.
+///
+/// The recorded revision is what separates these from the older
+/// `ascii_lower` shapes: nothing about the files is stale, so a plain
+/// reindex leaves them alone and only a change of analyzer has work to do.
+fn assert_ascii_lower_shape(shape: &str, body_stored: bool) {
+    let Some(root) = corpus_dir(shape) else {
+        return;
+    };
+    let headers = blob_headers(&root);
+    assert!(
+        headers.len() >= 2,
+        "{shape}: {} superfile(s); a migration has to publish several together",
+        headers.len()
+    );
+    let total: usize = headers.iter().map(|h| h.n_docs as usize).sum();
+    assert_eq!(total, ASCII_LOWER_SHAPE_ROWS, "{shape}: row count drifted");
+    for (i, h) in headers.iter().enumerate() {
+        assert_eq!(
+            h.version, VERSION_CURRENT,
+            "{shape}: superfile {i} carries blob version {}",
+            h.version
+        );
+    }
+
+    for (i, columns) in fts_columns(&root).iter().enumerate() {
+        for column in ["body", "title"] {
+            let c = fts_column(columns, column);
+            assert_eq!(
+                c["tokenizer"], "ascii_lower",
+                "{shape}: superfile {i} {column}"
+            );
+            assert!(
+                c["analysis_revision"].is_u64(),
+                "{shape}: superfile {i} {column} records no analysis revision: {c}"
+            );
+        }
+        assert_eq!(
+            fts_column(columns, "notes")["tokenizer"],
+            "standard",
+            "{shape}: superfile {i} notes"
+        );
+        let title = fts_column(columns, "title");
+        assert_eq!(title["positions"], true, "{shape}: superfile {i} title");
+        assert_eq!(
+            title["stopwords"], "english",
+            "{shape}: superfile {i} title"
+        );
+        assert_eq!(title["stemmer"], "english", "{shape}: superfile {i} title");
+        // The writer omits the flag for a stored column.
+        assert_eq!(
+            fts_column(columns, "body")["stored"]
+                .as_bool()
+                .unwrap_or(true),
+            body_stored,
+            "{shape}: superfile {i} body"
+        );
+    }
+}
+
+/// The table answers as an `ascii_lower` table does: every planted probe
+/// matches its `ascii_lower` count, the deleted document stays deleted,
+/// and `title`'s stemmer folds an inflection the corpus never wrote.
+///
+/// Pinned before any migration runs, so a migration test that checks the
+/// `standard` counts afterwards is checking a change rather than a corpus
+/// that already answered that way.
+fn assert_answers_as_ascii_lower(shape: &str) {
+    let Some((_tmp, table, _root)) = open_corpus(shape) else {
+        return;
+    };
+    let k = ASCII_LOWER_SHAPE_LIVE_ROWS;
+    assert_eq!(
+        hits_k(&table, "body", "common", k),
+        N_DOCS as usize,
+        "{shape}: the corpus-wide term did not match every shared document"
+    );
+    for probe in ANALYZER_PROBES {
+        assert_eq!(
+            hits_k(&table, "body", probe.term, k),
+            probe.ascii_lower_hits,
+            "{shape}: body {:?}",
+            probe.term
+        );
+    }
+    assert_eq!(
+        hits_k(&table, "title", "jumping", k),
+        TITLES_WITH_JUMP,
+        "{shape}: title's stemmer did not fold `jumping` onto `jumps`"
+    );
+}
+
+/// The table a current release writes for an explicit `ascii_lower`
+/// analyzer, and the input an analyzer migration exists for.
+mod v7_ascii_lower {
+    use super::*;
+
+    const SHAPE: &str = "v7_ascii_lower";
+
+    #[test]
+    fn carries_its_format_shape() {
+        assert_ascii_lower_shape(SHAPE, true);
+    }
+
+    #[test]
+    fn answers_as_ascii_lower() {
+        assert_answers_as_ascii_lower(SHAPE);
+    }
+
+    /// The vector column is there to be carried, so it has to answer.
+    #[test]
+    fn answers_vector_queries() {
+        let Some((_tmp, table, _root)) = open_corpus(SHAPE) else {
+            return;
+        };
+        assert!(
+            !vector_hits(&table, &probe_embedding()).is_empty(),
+            "{SHAPE}: the vector index returned nothing"
+        );
+    }
+}
+
+/// [`v7_ascii_lower`] with `body` index-only: its text was never stored,
+/// so nothing can re-analyze it and a migration has to refuse the table.
+mod v7_ascii_lower_index_only {
+    use super::*;
+
+    const SHAPE: &str = "v7_ascii_lower_index_only";
+
+    #[test]
+    fn carries_its_format_shape() {
+        assert_ascii_lower_shape(SHAPE, false);
+    }
+
+    #[test]
+    fn answers_as_ascii_lower() {
+        assert_answers_as_ascii_lower(SHAPE);
     }
 }
 
