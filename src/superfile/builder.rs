@@ -821,7 +821,16 @@ impl BuilderOptions {
     /// Inputs from one table can never disagree (the table's options
     /// identity pins the per-column config), so every error here is a
     /// misuse of the merge entry points — made loud instead of silent.
-    fn check_fts_carry_compat(&self, remote: Option<&[&ColumnMeta]>) -> Result<(), BuildError> {
+    ///
+    /// The analyzer is compared only on the columns `scope` carries. A
+    /// column re-analyzed from its stored text takes none of the input's
+    /// terms, so the input's analyzer says nothing about the output's;
+    /// that is what lets a re-analysis change it.
+    fn check_fts_carry_compat(
+        &self,
+        remote: Option<&[&ColumnMeta]>,
+        scope: CarryScope,
+    ) -> Result<(), BuildError> {
         let remote = remote.unwrap_or(&[]);
         if self.fts_columns.len() != remote.len() {
             return Err(BuildError::FTSSchemaMismatch(format!(
@@ -843,7 +852,7 @@ impl BuilderOptions {
             // mixes two tokenizations.
             let own_analysis = own.chain_name().unwrap_or(own.analyzer.as_str());
             let other_analysis = other.tokenizer.name();
-            if own_analysis != other_analysis {
+            if scope.carries(own) && own_analysis != other_analysis {
                 return Err(BuildError::FTSSchemaMismatch(format!(
                     "column {}: mismatched analyzer. self {} vs other {}",
                     own.column, own_analysis, other_analysis
@@ -871,6 +880,7 @@ impl BuilderOptions {
         remote_schema: &Arc<Schema>,
         remote_fts_columns: Option<Vec<&ColumnMeta>>,
         remote_vector_columns: Option<Vec<&ColumnReader>>,
+        scope: CarryScope,
     ) -> Result<bool, BuildError> {
         if self.id_column != *remote_id_col {
             return Err(BuildError::IdColumnMismatch(
@@ -886,7 +896,7 @@ impl BuilderOptions {
             });
         }
 
-        self.check_fts_carry_compat(remote_fts_columns.as_deref())?;
+        self.check_fts_carry_compat(remote_fts_columns.as_deref(), scope)?;
 
         if let Some(remote_vector_columns) = remote_vector_columns {
             let self_vec_columns = &self.vector_columns;
@@ -1343,7 +1353,8 @@ impl SuperfileBuilder {
         let remote_cfg = reader
             .fts()
             .map(|f| f.fts_columns_config().collect::<Vec<_>>());
-        self.opts.check_fts_carry_compat(remote_cfg.as_deref())?;
+        self.opts
+            .check_fts_carry_compat(remote_cfg.as_deref(), scope)?;
         let Some(fts) = reader.fts() else {
             return Ok(None);
         };
@@ -1425,7 +1436,8 @@ impl SuperfileBuilder {
         let remote_cfg = reader
             .fts()
             .map(|f| f.fts_columns_config().collect::<Vec<_>>());
-        self.opts.check_fts_carry_compat(remote_cfg.as_deref())?;
+        self.opts
+            .check_fts_carry_compat(remote_cfg.as_deref(), scope)?;
         let Some(fts) = reader.fts() else {
             return Ok(());
         };
@@ -1708,7 +1720,7 @@ impl SuperfileBuilder {
                 .map(|f| f.fts_columns_config().collect::<Vec<_>>());
             superfile_builder
                 .opts
-                .check_fts_carry_compat(remote_cfg.as_deref())?;
+                .check_fts_carry_compat(remote_cfg.as_deref(), CarryScope::AllColumns)?;
             scalar_batches.push(record_batch);
         }
 
@@ -2071,6 +2083,7 @@ impl SuperfileBuilder {
             reader
                 .vec()
                 .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+            scope,
         )?;
         let record_batch = reader
             .get_record_batch(deleted_docs_bitmap.clone())
@@ -2454,6 +2467,7 @@ impl SuperfileBuilder {
                 reader
                     .vec()
                     .map(|v| v.vector_columns_config().collect::<Vec<_>>()),
+                CarryScope::AllColumns,
             )?;
             let start = std::time::Instant::now();
             let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
