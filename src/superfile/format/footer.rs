@@ -685,20 +685,57 @@ pub(crate) fn resolved_regions(metadata: &ParquetMetaData) -> Option<BlobRegions
     })
 }
 
-/// Test-only: where `bytes`' footer starts, and the footer decoded.
-#[cfg(test)]
-fn split_footer(bytes: &[u8]) -> (usize, ParquetMetaData) {
+/// Where `bytes`' footer starts, and the footer decoded.
+pub(crate) fn split_footer(bytes: &[u8]) -> Result<(usize, ParquetMetaData), FooterError> {
     let n = bytes.len();
+    let suffix_start = n
+        .checked_sub(PARQUET_FOOTER_SUFFIX_BYTES)
+        .ok_or(FooterError::Malformed("file shorter than a parquet footer"))?;
     let len_bytes: [u8; PARQUET_FOOTER_LEN_FIELD_BYTES] = bytes
-        [n - PARQUET_FOOTER_SUFFIX_BYTES..n - PARQUET_MAGIC_LEN]
+        [suffix_start..n - PARQUET_MAGIC_LEN]
         .try_into()
-        .expect("footer length field");
+        .map_err(|_| FooterError::Malformed("footer length field"))?;
     let footer_len = u32::from_le_bytes(len_bytes) as usize;
-    let start = n - PARQUET_FOOTER_SUFFIX_BYTES - footer_len;
-    let metadata =
-        ParquetMetaDataReader::decode_metadata(&bytes[start..n - PARQUET_FOOTER_SUFFIX_BYTES])
-            .expect("decode footer");
-    (start, metadata)
+    let start = suffix_start
+        .checked_sub(footer_len)
+        .ok_or(FooterError::Malformed("footer longer than the file"))?;
+    let metadata = ParquetMetaDataReader::decode_metadata(&bytes[start..suffix_start])?;
+    Ok((start, metadata))
+}
+
+/// Write `bytes` to `output` with its footer's `key` set to `value`,
+/// copying every byte ahead of the footer unchanged; returns the bytes
+/// written.
+///
+/// Sound only for a value nothing in the file is located by: the body and
+/// the blobs keep their positions, so the row-group offsets and the
+/// region keys stay true. Errors unless the footer stores `key` exactly
+/// once.
+pub(crate) fn rewrite_footer_value_to<W: Write>(
+    bytes: &[u8],
+    key: &str,
+    value: &str,
+    mut output: W,
+) -> Result<u64, FooterError> {
+    let (start, metadata) = split_footer(bytes)?;
+    let mut kvs = metadata
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default();
+    let mut matching = kvs.iter_mut().filter(|entry| entry.key == key);
+    let (Some(entry), None) = (matching.next(), matching.next()) else {
+        return Err(FooterError::Malformed(
+            "footer does not store the rewritten key exactly once",
+        ));
+    };
+    entry.value = Some(value.to_string());
+    output.write_all(&bytes[..start])?;
+    let mut footer = Vec::new();
+    ParquetMetaDataWriter::new(&mut footer, &with_kv_list(&metadata, kvs)).finish()?;
+    output.write_all(&footer)?;
+    output.flush()?;
+    Ok((start + footer.len()) as u64)
 }
 
 /// Test-only: `metadata` with `extra` appended to its key-value list.
@@ -717,7 +754,7 @@ pub(crate) fn with_appended_kv(
 /// malformed footers [`splice_carried_body_to`] refuses to write.
 #[cfg(test)]
 pub(crate) fn with_forged_footer_kv(bytes: &[u8], extra: &[(&str, &str)]) -> Bytes {
-    let (start, metadata) = split_footer(bytes);
+    let (start, metadata) = split_footer(bytes).expect("decode footer");
     let mut kvs = key_values(extra);
     kvs.extend(stored_kvs(&metadata));
     let mut out = bytes[..start].to_vec();
@@ -746,8 +783,8 @@ fn key_values(pairs: &[(&str, &str)]) -> Vec<KeyValue> {
         .collect()
 }
 
-/// Test-only: `metadata` with its key-value list replaced by `kvs`.
-#[cfg(test)]
+/// `metadata` with its key-value list replaced by `kvs`, row groups and
+/// indexes carried through unchanged.
 fn with_kv_list(metadata: &ParquetMetaData, kvs: Vec<KeyValue>) -> ParquetMetaData {
     let fm = metadata.file_metadata();
     let fm = FileMetaData::new(
@@ -912,7 +949,7 @@ mod tests {
 
     /// The footer of `bytes`, decoded.
     fn footer_metadata(bytes: &[u8]) -> ParquetMetaData {
-        split_footer(bytes).1
+        split_footer(bytes).expect("decode footer").1
     }
 
     /// A superfile with an FTS and a vector blob, built with `extra_kv`.

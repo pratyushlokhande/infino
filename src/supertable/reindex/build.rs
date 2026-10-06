@@ -20,8 +20,12 @@ use roaring::RoaringBitmap;
 
 use crate::{
     superfile::{
-        builder::{BuilderOptions, CarryScope, SuperfileBuilder, merge_builder_opts},
+        builder::{
+            BuilderOptions, CarryScope, SuperfileBuilder, credited_fts_columns_json,
+            merge_builder_opts,
+        },
         error::BuildError as SuperfileBuildError,
+        format::{footer::rewrite_footer_value_to, kv},
         fts::reader::ColumnLengthStats,
         reader::SuperfileReader,
         stats::SuperfileStats,
@@ -89,6 +93,8 @@ fn reanalysis_opts(repair: Repair, opts: BuilderOptions) -> BuilderOptions {
         Repair::Layout => opts,
         Repair::Terms => opts.reanalyze_stored_columns(),
         Repair::Standard => opts.with_standard_analyzer().reanalyze_stored_columns(),
+        // Builds nothing: the footer is rewritten in place of a build.
+        Repair::Stamp => opts,
     }
 }
 
@@ -120,6 +126,14 @@ impl SuperfileMerge for RepairMerge {
         inputs: MergeInputs<'_>,
         output: &mut dyn Write,
     ) -> Result<SuperfileStats, BuildError> {
+        if self.repair == Repair::Stamp {
+            let (reader, entry) = carry_body(&inputs).ok_or_else(|| {
+                BuildError::Superfile(SuperfileBuildError::Io(Error::other(
+                    "recording a revision needs the whole superfile, every row kept",
+                )))
+            })?;
+            return stamp_credited_revision_to(reader, entry, output);
+        }
         match carry_body(&inputs) {
             Some((reader, entry)) => repair_carrying_body_to(
                 self.repair,
@@ -132,7 +146,7 @@ impl SuperfileMerge for RepairMerge {
             // Restating compaction's merge here would be a second copy that
             // could drift from the one the table is actually compacted with.
             None => match self.repair {
-                Repair::Layout => CompactionMerge.build(inputs, output),
+                Repair::Layout | Repair::Stamp => CompactionMerge.build(inputs, output),
                 Repair::Terms | Repair::Standard => {
                     reanalyze_to(self.repair, inputs.readers, inputs.fts_corpus, output)
                 }
@@ -143,6 +157,38 @@ impl SuperfileMerge for RepairMerge {
     fn preserves_tombstones(&self) -> bool {
         true
     }
+}
+
+/// Copy `source` to `output` with its footer's `inf.fts.columns` recording
+/// the credited analysis revision, every byte ahead of the footer unchanged.
+///
+/// Sound because the revision is read from the footer alone: no checksum
+/// covers it and no offset depends on it, so the body, the blobs and the
+/// row-group metadata stay exactly as they were.
+fn stamp_credited_revision_to(
+    source: &Arc<SuperfileReader>,
+    entry: &Arc<SuperfileEntry>,
+    output: &mut dyn Write,
+) -> Result<SuperfileStats, BuildError> {
+    carried_doc_count(source, entry)?;
+    let bytes = source.whole_file_bytes().ok_or_else(|| {
+        BuildError::Superfile(SuperfileBuildError::Io(Error::other(
+            "recording a revision needs a resident source",
+        )))
+    })?;
+    rewrite_footer_value_to(
+        bytes,
+        kv::FTS_COLUMNS,
+        &credited_fts_columns_json(source),
+        output,
+    )
+    .map_err(|e| BuildError::Superfile(SuperfileBuildError::Io(Error::other(e.to_string()))))?;
+    Ok(SuperfileStats {
+        n_docs: entry.n_docs,
+        id_min: entry.id_min,
+        id_max: entry.id_max,
+        scalar_stats: entry.scalar_stats.clone(),
+    })
 }
 
 /// Apply `repair` to `source`'s FTS index, and copy every other byte
@@ -174,6 +220,9 @@ fn repair_carrying_body_to(
             builder.carry_fts_from_reader_scoped(source, None, CarryScope::AllColumns)?
         }
         Repair::Terms | Repair::Standard => builder.reanalyze_fts_from_reader(source)?,
+        Repair::Stamp => {
+            builder.carry_fts_from_reader_scoped(source, None, CarryScope::AllColumns)?
+        }
     }
     carried_doc_count(source, entry)?;
     builder.set_carried_doc_count(entry.n_docs);

@@ -3373,6 +3373,17 @@ pub(crate) fn merge_builder_opts(
     Ok(opts)
 }
 
+/// `source`'s `inf.fts.columns` with each unrecorded analysis revision
+/// credited from its writer (see [`BuilderOptions::credit_writer_analysis`]),
+/// serialized exactly as a build writes it.
+pub(crate) fn credited_fts_columns_json(source: &SuperfileReader) -> String {
+    fts_columns_json(
+        &BuilderOptions::new_from_reader(source)
+            .credit_writer_analysis(source)
+            .fts_columns,
+    )
+}
+
 fn fts_columns_json(cols: &[FtsConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {

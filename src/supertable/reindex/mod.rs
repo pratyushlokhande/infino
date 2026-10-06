@@ -160,6 +160,16 @@ impl StaleSuperfile {
         self.fts.needs_rewrite() || self.has_duplicated_region_keys || self.unrecorded_revision
     }
 
+    /// Whether the only thing this file owes is a trusted revision written
+    /// down: its container is current and its footer sound, so rewriting
+    /// the footer is the whole repair.
+    pub(crate) fn only_owes_its_revision(&self) -> bool {
+        self.unrecorded_revision
+            && self.fts.container.is_none()
+            && !self.has_duplicated_region_keys
+            && !self.fts.needs_reanalysis()
+    }
+
     /// Whether this file is behind on anything a reindex repairs.
     pub(crate) fn is_current(&self) -> bool {
         self.fts.is_current() && !self.has_duplicated_region_keys && !self.unrecorded_revision
@@ -398,16 +408,16 @@ pub(crate) fn plan_jobs(
         .into_iter()
         .map(|s| {
             let repair = match mode {
+                ReindexMode::Rewrite if s.only_owes_its_revision() => Repair::Stamp,
                 ReindexMode::Rewrite => Repair::Layout,
                 ReindexMode::Reanalyze => Repair::Terms,
                 ReindexMode::ToStandardAnalyzer => Repair::Standard,
                 // The cheapest repair that makes *this* file current:
                 // copying postings cannot clear a stale revision, so only
                 // a file whose terms are current can take the cheap one.
-                ReindexMode::Auto => match s.fts.needs_reanalysis() {
-                    true => Repair::Terms,
-                    false => Repair::Layout,
-                },
+                ReindexMode::Auto if s.fts.needs_reanalysis() => Repair::Terms,
+                ReindexMode::Auto if s.only_owes_its_revision() => Repair::Stamp,
+                ReindexMode::Auto => Repair::Layout,
             };
             let job = CompactionJob {
                 partition_key: s.partition_key.clone(),
@@ -446,6 +456,9 @@ pub(crate) enum Repair {
     /// Re-analyze the stored text with every `ascii_lower` column moved to
     /// `standard`.
     Standard,
+    /// Record a trusted, unrecorded analysis revision in the footer of a
+    /// file that is otherwise current, copying every other byte.
+    Stamp,
 }
 
 impl Supertable {
@@ -578,7 +591,7 @@ impl Supertable {
             .map(|(job, repair)| PlannedRepair {
                 superfile_id: job.inputs[0],
                 mode: match repair {
-                    Repair::Layout => ReindexMode::Rewrite,
+                    Repair::Layout | Repair::Stamp => ReindexMode::Rewrite,
                     Repair::Terms => ReindexMode::Reanalyze,
                     Repair::Standard => ReindexMode::ToStandardAnalyzer,
                 },
@@ -831,11 +844,12 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, slice};
+    use std::{collections::HashMap, fs, path::Path, slice};
 
     use arrow_array::{Array, Decimal128Array, Float32Array};
     use bytes::Bytes;
     use datafusion::prelude::{col, lit};
+    use parquet::file::metadata::ParquetMetaData;
     use tempfile::TempDir;
 
     use super::*;
@@ -843,7 +857,10 @@ mod tests {
         Bm25SearchOptions,
         storage::StorageProvider,
         superfile::{
-            format::{footer::with_forged_footer_kv, kv},
+            format::{
+                footer::{split_footer, with_forged_footer_kv},
+                kv,
+            },
             fts::reader::StaleColumn,
         },
         supertable::{
@@ -1154,6 +1171,24 @@ mod tests {
         hits
     }
 
+    /// Every superfile's bytes, keyed by its first row id so a rewrite that
+    /// renumbers superfiles still lines up with its input.
+    fn superfile_bytes_by_first_id(table: &Supertable, dir: &Path) -> HashMap<i128, Vec<u8>> {
+        table
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| {
+                (
+                    e.id_min,
+                    fs::read(dir.join(e.storage_path())).expect("read superfile"),
+                )
+            })
+            .collect()
+    }
+
     /// Data that is up to date but predates the recorded revision is
     /// brought level with a migrated table by one trusted rewrite: postings
     /// are copied rather than re-analyzed, the revision its writer emitted
@@ -1172,6 +1207,7 @@ mod tests {
         let trusted = ReindexOptions::rewriting().trusting_writer_analysis();
         let before = scored_hits(&table, "shared");
         assert!(!before.is_empty(), "the fixture has hits to compare");
+        let files_before = superfile_bytes_by_first_id(&table, dir.path());
 
         let assessed = table.index_staleness(&trusted).expect("staleness");
         assert_eq!(assessed.awaiting_reanalysis, 0, "{assessed:?}");
@@ -1188,6 +1224,47 @@ mod tests {
 
         let report = table.reindex(&trusted).expect("trusted rewrite");
         assert_eq!(report.rewritten, assessed.superfiles, "{report:?}");
+
+        // Only the footer was rewritten, and in it only the column entries:
+        // the bytes ahead of it, every other key — the writer's name
+        // included, which a rebuild would have replaced — and the row-group
+        // metadata, page-index locations among it, are as they were.
+        let files_after = superfile_bytes_by_first_id(&table, dir.path());
+        assert_eq!(files_after.len(), files_before.len());
+        for (first_id, after) in &files_after {
+            let before = &files_before[first_id];
+            let (start_before, meta_before) = split_footer(before).expect("footer before");
+            let (start_after, meta_after) = split_footer(after).expect("footer after");
+            assert_eq!(
+                start_after, start_before,
+                "the bytes ahead of the footer moved"
+            );
+            assert!(
+                after[..start_after] == before[..start_before],
+                "body or blob bytes changed"
+            );
+            assert_eq!(
+                format!("{:?}", meta_after.row_groups()),
+                format!("{:?}", meta_before.row_groups()),
+                "row-group metadata changed"
+            );
+            let kvs = |m: &ParquetMetaData| -> Vec<(String, Option<String>)> {
+                m.file_metadata()
+                    .key_value_metadata()
+                    .into_iter()
+                    .flatten()
+                    .map(|e| (e.key.clone(), e.value.clone()))
+                    .collect()
+            };
+            let (kvs_before, kvs_after) = (kvs(&meta_before), kvs(&meta_after));
+            assert_eq!(kvs_after.len(), kvs_before.len(), "keys added or dropped");
+            for ((key, value), (key_before, value_before)) in kvs_after.iter().zip(&kvs_before) {
+                assert_eq!(key, key_before, "footer keys reordered");
+                if key != kv::FTS_COLUMNS {
+                    assert_eq!(value, value_before, "{key} changed");
+                }
+            }
+        }
 
         // Nothing a query sees moved, which a copy of the postings implies.
         assert_eq!(scored_hits(&table, "shared"), before);
