@@ -19,17 +19,8 @@
 //! inputs for the whole length of the rebuild, which on a large table is
 //! hours.
 
-use std::{
-    collections::HashMap,
-    slice,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, slice, sync::Arc, time::Duration};
 
-use tokio::time;
 use uuid::Uuid;
 
 use crate::{
@@ -40,7 +31,7 @@ use crate::{
         manifest::{SuperfileEntry, listed_once},
         optimize::compact::{BatchCommit, SuperfileMerge},
         reindex::{PlannedRepair, ReindexReport, Repair, build::RepairMerge},
-        writer::{PreparedSuperfile, backoff_delay, write_superfile_list},
+        writer::{PreparedSuperfile, write_superfile_list},
     },
 };
 
@@ -149,17 +140,9 @@ impl Supertable {
                 continue;
             }
 
-            // An append or update on this handle builds under the analyzer
-            // its manifest names when it starts; holding the slot keeps one
-            // that started under `ascii_lower` from committing after the
-            // swap.
-            let Some(_writer) = self.hold_writer_slot().await else {
-                rounds += 1;
-                if rounds > MAX_CATCH_UP_ROUNDS {
-                    return Err(ReindexError::TableKeptChanging { rounds });
-                }
-                continue;
-            };
+            // An append or update in flight on this handle built under
+            // `ascii_lower`; the publish bumps the handle's options
+            // generation, which refuses that commit.
             match self
                 .publish_rebuilt(&pairs, &merge, &target, stale_seal_timeout)
                 .await
@@ -183,22 +166,6 @@ impl Supertable {
                 Err(e) => return Err(ReindexError::Publish(e.to_string())),
             }
         }
-    }
-
-    /// Take this handle's writer slot, waiting out an append or update that
-    /// holds it; `None` if one still does after the commit retry budget.
-    async fn hold_writer_slot(&self) -> Option<WriterSlot<'_>> {
-        let slot = &self.inner().writer_outstanding;
-        for attempt in 0..self.inner().options.max_commit_retries.max(1) {
-            if slot
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Some(WriterSlot(slot));
-            }
-            time::sleep(backoff_delay(attempt)).await;
-        }
-        None
     }
 
     /// Rebuild `input` under `merge` and put the result in storage, without
@@ -253,15 +220,6 @@ impl Supertable {
     }
 }
 
-/// This handle's writer slot, released on drop.
-struct WriterSlot<'a>(&'a AtomicBool);
-
-impl Drop for WriterSlot<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 /// Whether a publish failed because another writer moved the table under
 /// it, which another round can absorb, rather than for a reason that will
 /// repeat.
@@ -284,6 +242,10 @@ mod tests {
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{builder::FtsConfig, fts::tokenize::ASCII_LOWER_TOKENIZER},
+        supertable::{
+            error::CommitError,
+            writer::{CommitListMetadata, persist_commit_async},
+        },
         test_helpers::{build_title_batch, default_supertable_options},
     };
 
@@ -394,5 +356,48 @@ mod tests {
                 .all(|e| !ids_before.contains(&e.superfile_id)),
             "both superfiles were replaced"
         );
+    }
+
+    /// What a write built under the options before a change is refused at
+    /// publish: the change moved the handle's options generation, and the
+    /// publish carries the one it built under.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_publish_built_before_the_change_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let table = ascii_lower_table(&dir);
+        commit_titles(&table, &["don't panic"]);
+        let built_under = table.inner().options_generation();
+
+        table
+            .change_to_standard_analyzer(SEAL_TIMEOUT)
+            .await
+            .expect("move to standard");
+        assert_ne!(
+            table.inner().options_generation(),
+            built_under,
+            "publishing new options moves the generation"
+        );
+
+        let storage = table
+            .inner()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed");
+        let refused = persist_commit_async(
+            table.inner(),
+            storage,
+            Vec::new(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+            CommitListMetadata::empty(),
+            Vec::new(),
+            Some(built_under),
+        )
+        .await
+        .expect_err("a build from before the change must not publish");
+        assert!(matches!(refused, CommitError::OptionsChanged), "{refused}");
+        assert!(refused.is_conflict(), "refused retryably");
     }
 }

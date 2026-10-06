@@ -192,6 +192,19 @@ pub struct SuperfileList {
     pub(crate) next_manifest_id_floor: u64,
 }
 
+/// `options` with its `ascii_lower` columns on `standard`, when that is
+/// exactly what `list` was stamped with; `None` otherwise.
+fn moved_to_standard(
+    options: &Arc<SupertableOptions>,
+    list: &Manifest,
+) -> Option<Arc<SupertableOptions>> {
+    options.ascii_lower_columns().next()?;
+    let standard = options.with_standard_analyzer();
+    options_hash::verify_options_hash(&standard, &list.partition_strategy, list.options_hash)
+        .ok()?;
+    Some(Arc::new(standard))
+}
+
 /// `items` with every repeat of a superfile id dropped, keeping the
 /// first-listed copy.
 ///
@@ -846,14 +859,25 @@ impl ManifestSnapshot {
         // manifest's stamped digest. The all-zero stored
         // hash bypasses validation (legacy + synthetic
         // fixtures).
-        if let Err(mismatch) =
-            options_hash::verify_options_hash(&options, &list.partition_strategy, list.options_hash)
-        {
-            return Err(ManifestLoadError::ContentHashMismatch {
-                expected: mismatch.expected,
-                actual: mismatch.actual,
-            });
-        }
+        let options = match options_hash::verify_options_hash(
+            &options,
+            &list.partition_strategy,
+            list.options_hash,
+        ) {
+            Ok(()) => options,
+            // An analyzer change moved the table to `standard` after these
+            // options were taken. The stored hash is matched exactly, so
+            // this adopts that change and nothing else.
+            Err(mismatch) => match moved_to_standard(&options, &list) {
+                Some(standard) => standard,
+                None => {
+                    return Err(ManifestLoadError::ContentHashMismatch {
+                        expected: mismatch.expected,
+                        actual: mismatch.actual,
+                    });
+                }
+            },
+        };
 
         // 3. Build the loader, superfiles & parts. Consumer memory mode
         //    loads each part's routing sibling (counts + 1-bit slab, no

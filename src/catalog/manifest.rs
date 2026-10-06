@@ -172,6 +172,29 @@ where
     ))
 }
 
+/// Rewrite the analyzer names recorded for `name` with `update`, if `name`
+/// still names the table at `location`.
+///
+/// Keyed on the location as well as the name: a table dropped and created
+/// again under the same name is a different table, and its record is not
+/// this one's to change.
+pub(crate) async fn update_recorded_analyzers(
+    storage: &dyn StorageProvider,
+    name: &str,
+    location: &str,
+    update: impl Fn(&mut Vec<String>),
+) -> Result<(), InfinoError> {
+    commit_catalog(storage, |body| {
+        if let Some(entry) = body.tables.get_mut(name)
+            && entry.location == location
+        {
+            update(&mut entry.fts_analyzers);
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Serialize a user schema to Arrow-IPC bytes (schema-only stream).
 pub(crate) fn schema_to_ipc(schema: &Schema) -> Result<Vec<u8>, InfinoError> {
     let mut out = Vec::new();

@@ -346,6 +346,10 @@ async fn do_apply(
     op_stats: Option<Arc<OpStatsCollector>>,
 ) -> Result<(WalStateDoc, Etag), AppendPhaseError> {
     let inner = supertable.inner();
+    // Taken before the replacement superfile is built: the build reads the
+    // manifest's options, and the publish refuses if those have changed
+    // since.
+    let built_under = inner.options_generation();
     let storage = inner
         .options
         .storage
@@ -559,6 +563,7 @@ async fn do_apply(
         Vec::new(),
         CommitListMetadata::empty(),
         term_contribution.into_iter().collect(),
+        Some(built_under),
     )
     .map_err(|e| AppendPhaseError::ManifestCommit(Box::new(e)))?;
 

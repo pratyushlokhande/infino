@@ -2845,7 +2845,9 @@ impl Supertable {
     /// have one.
     pub fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError> {
         let reader = self.reader()?;
-        let options = reader.options();
+        // The manifest's options, like every query: an analyzer change
+        // publishes new ones there, and this has to tokenize as they do.
+        let options = &reader.manifest().options;
         let Some(tokenizer) = options.try_fts_tokenizer_for(column) else {
             return Err(
                 InfinoError::from(QueryError::InvalidQuery(no_fts_index_message(

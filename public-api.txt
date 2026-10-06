@@ -212,6 +212,7 @@ impl core::panic::unwind_safe::UnwindSafe for infino::RecalibratePolicy
 #[non_exhaustive] pub enum infino::ReindexError
 pub infino::ReindexError::AlreadyRunning
 pub infino::ReindexError::Assess(alloc::string::String)
+pub infino::ReindexError::CatalogRecord(alloc::string::String)
 pub infino::ReindexError::IndexOnlyColumns
 pub infino::ReindexError::IndexOnlyColumns::columns: alloc::vec::Vec<alloc::string::String>
 pub infino::ReindexError::NoStorage

@@ -700,6 +700,7 @@ mod tests {
                 ..CommitListMetadata::empty()
             },
             Vec::new(),
+            None,
         )
         .await
         .expect("stamp");

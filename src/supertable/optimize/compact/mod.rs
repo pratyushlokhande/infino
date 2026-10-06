@@ -1180,7 +1180,8 @@ impl Supertable {
                     // This attempt's own removals, resolved against its own base above, so a
                     // retry that found fewer inputs records only those.
                     inner.note_superseded(&current, &new_manifest, &entries_to_remove);
-                    inner.manifest.store(Arc::new(new_manifest));
+                    // A whole-table batch may publish new options.
+                    inner.store_manifest(Arc::new(new_manifest));
                     // Point the sidecar cache at the manifest just published;
                     // until then a carried sidecar has no seq and reads as absent.
                     inner.reconcile_tombstone_seqs();

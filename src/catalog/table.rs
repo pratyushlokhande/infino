@@ -20,9 +20,14 @@ use datafusion::prelude::Expr;
 
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
-    catalog::ensure_expr_within_connective_cap,
-    superfile::VectorSearchOptions,
+    OptimizeOptions, ReindexError, ReindexMode, ReindexOptions, VectorFilter,
+    catalog::{ensure_expr_within_connective_cap, manifest::update_recorded_analyzers},
+    runtime_bridge::{bridge_on_runtime, shared_io_runtime},
+    storage::StorageProvider,
+    superfile::{
+        VectorSearchOptions,
+        fts::tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
+    },
     supertable::{
         Supertable as SupertableHandle,
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
@@ -211,6 +216,46 @@ impl Table for SupertableHandle {
 #[derive(Clone)]
 pub struct Supertable {
     pub(crate) inner: Arc<dyn Table>,
+    /// The catalog record this table was opened from, when a storage-backed
+    /// connection opened it. Operations that change what the table is
+    /// record the change there too.
+    catalog_record: Option<Arc<CatalogRecord>>,
+}
+
+/// Where a table's catalog record lives.
+pub(crate) struct CatalogRecord {
+    root: Arc<dyn StorageProvider>,
+    name: String,
+    location: String,
+}
+
+impl CatalogRecord {
+    pub(crate) fn new(root: Arc<dyn StorageProvider>, name: &str, location: String) -> Self {
+        Self {
+            root,
+            name: name.to_string(),
+            location,
+        }
+    }
+
+    /// Record `standard` for every column the record names `ascii_lower`.
+    fn record_standard_analyzer(&self) -> Result<(), InfinoError> {
+        bridge_on_runtime(
+            update_recorded_analyzers(
+                self.root.as_ref(),
+                &self.name,
+                &self.location,
+                |analyzers| {
+                    for analyzer in analyzers.iter_mut() {
+                        if analyzer == ASCII_LOWER_TOKENIZER {
+                            *analyzer = STANDARD_TOKENIZER.to_string();
+                        }
+                    }
+                },
+            ),
+            &shared_io_runtime(),
+        )
+    }
 }
 
 impl Supertable {
@@ -221,7 +266,16 @@ impl Supertable {
 
     /// Wrap any table implementation (local or hosted).
     pub(crate) fn from_table(inner: Arc<dyn Table>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            catalog_record: None,
+        }
+    }
+
+    /// This table, recording the changes that need it in `record`.
+    pub(crate) fn with_catalog_record(mut self, record: CatalogRecord) -> Self {
+        self.catalog_record = Some(Arc::new(record));
+        self
     }
 
     /// The table's Arrow schema — the shape `append` and `update`
@@ -488,8 +542,26 @@ impl Supertable {
     /// over once it is older than
     /// [`ReindexOptions::stale_seal_timeout_ms`], which is the knob to
     /// lower when a crash is known rather than suspected.
+    ///
+    /// [`ReindexMode::ToStandardAnalyzer`] on a table opened through a
+    /// connection also records `standard` in the table's catalog record, so
+    /// an engine that builds the table's options from that record opens it
+    /// as it now is.
+    ///
+    /// # Errors
+    ///
+    /// [`ReindexError::CatalogRecord`] when the table moved to `standard`
+    /// but its record could not be updated; running again updates it.
     pub fn reindex(&self, opts: &ReindexOptions) -> Result<ReindexReport, ReindexError> {
-        self.inner.reindex(opts)
+        let report = self.inner.reindex(opts)?;
+        if opts.mode == ReindexMode::ToStandardAnalyzer
+            && let Some(record) = &self.catalog_record
+        {
+            record
+                .record_standard_analyzer()
+                .map_err(|e| ReindexError::CatalogRecord(e.to_string()))?;
+        }
+        Ok(report)
     }
 
     /// What a [`Self::reindex`] would do, without doing it.

@@ -1556,6 +1556,7 @@ mod tests {
             Vec::new(),
             CommitListMetadata::empty(),
             Vec::new(),
+            None,
         ))
         .expect("commit")
     }

@@ -282,6 +282,12 @@ pub enum CommitError {
     /// seal moved and committing the rest.
     #[error("input {superfile_id} changed under this commit's seal")]
     InputsChanged { superfile_id: uuid::Uuid },
+
+    /// The table's options changed — an analyzer change landed — after
+    /// this commit built its superfiles under the old ones. Nothing was
+    /// published; retrying builds under the new options.
+    #[error("the table's analyzer changed while this commit was building; retry it")]
+    OptionsChanged,
 }
 
 impl CommitError {
@@ -294,7 +300,9 @@ impl CommitError {
     pub(crate) fn is_conflict(&self) -> bool {
         match self {
             // Both are a race lost to another writer with nothing published.
-            CommitError::WriteContentionExhausted | CommitError::InputsChanged { .. } => true,
+            CommitError::WriteContentionExhausted
+            | CommitError::InputsChanged { .. }
+            | CommitError::OptionsChanged => true,
             CommitError::Storage(e) => e.is_conflict(),
             CommitError::Build(b) => b.is_conflict(),
             _ => false,
@@ -492,6 +500,12 @@ pub enum ReindexError {
     /// Publishing an analyzer change failed. Nothing was published.
     #[error("failed to publish the analyzer change: {0}")]
     Publish(String),
+    /// The table moved to `standard`, but its catalog record still names
+    /// `ascii_lower`. An engine that builds the table's options from that
+    /// record cannot open it until it is corrected; running the change
+    /// again corrects it, as does opening the table with this engine.
+    #[error("the analyzer change is published, but the catalog record was not updated: {0}")]
+    CatalogRecord(String),
 }
 
 /// Errors raised by [`crate::Supertable::optimize`].

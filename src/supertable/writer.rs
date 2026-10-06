@@ -2013,6 +2013,9 @@ impl SupertableWriter {
         buffer: &[BufferedBatch],
         stem: Option<&str>,
     ) -> Result<(), BuildError> {
+        // Taken before anything is built: the builds read the manifest's
+        // options, and the publish refuses if those have changed since.
+        let built_under = self.inner.options_generation();
         // Phase A — train the global cell grid from the FIRST committed batch
         // into pending OCC metadata (not a bare ArcSwap.store). The pack path
         // below reads the same local `pending_gvi` / existing manifest grid;
@@ -2218,7 +2221,12 @@ impl SupertableWriter {
                 .map(|_| commit_output_stats(&user_batch));
             let publish_t0 = time::Instant::now();
             bridge_on_runtime(
-                persist_superfile_publish_batch_async(&self.inner, user_batch, list_metadata),
+                persist_superfile_publish_batch_async(
+                    &self.inner,
+                    user_batch,
+                    list_metadata,
+                    built_under,
+                ),
                 &self.inner.query_runtime(),
             )?;
             if let (Some(stats), Some((superfiles, bytes, fts_terms))) =
@@ -2363,7 +2371,12 @@ impl SupertableWriter {
             .as_ref()
             .map(|_| commit_output_stats(&user_batch));
         bridge_on_runtime(
-            persist_superfile_publish_batch_async(&user_inner, user_batch, list_metadata),
+            persist_superfile_publish_batch_async(
+                &user_inner,
+                user_batch,
+                list_metadata,
+                built_under,
+            ),
             &self.inner.query_runtime(),
         )?;
         if let (Some(stats), Some((n_superfiles, bytes, fts_terms))) =
@@ -3551,10 +3564,13 @@ fn prepare_user_superfile_batch(
         .install(|| prepare_user_superfile_batch_in_scope(inner, outputs, hints, stem))
 }
 
+/// `built_under` is the options generation the batch was built under; see
+/// [`persist_commit_async`].
 async fn persist_superfile_publish_batch_async(
     inner: &SupertableInner,
     batch: SuperfilePublishBatch,
     list_metadata: CommitListMetadata,
+    built_under: u64,
 ) -> Result<(), BuildError> {
     if batch.new_entries.is_empty() {
         return Ok(());
@@ -3569,6 +3585,7 @@ async fn persist_superfile_publish_batch_async(
             Vec::new(),
             list_metadata,
             batch.term_contributions,
+            Some(built_under),
         )
         .await
         .map_err(BuildError::from)?;
@@ -5344,6 +5361,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             Vec::new(),
             list_metadata,
             Vec::new(),
+            None,
         )
         .await
         .map_err(BuildError::from)?;
@@ -7761,6 +7779,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         Vec::new(),
         list_metadata,
         term_contributions,
+        None,
     )
     .await
     {
@@ -8247,6 +8266,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         Vec::new(),
         list_metadata,
         term_contributions,
+        None,
     )
     .await
     {
@@ -8598,6 +8618,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
             Vec::new(),
             list_metadata,
             Vec::new(),
+            None,
         )
         .await
         .map_err(BuildError::from)?;
@@ -10267,6 +10288,11 @@ impl CommitListMetadata {
     }
 }
 
+/// `built_under` is the [`SupertableInner::options_generation`] the new
+/// superfiles were built under, for a commit that built them from the
+/// table's own options. Every attempt refuses with
+/// [`SupertableCommitError::OptionsChanged`] once the generation has moved.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::supertable) async fn persist_commit_async(
     inner: &SupertableInner,
     storage: Arc<dyn StorageProvider>,
@@ -10276,6 +10302,7 @@ pub(in crate::supertable) async fn persist_commit_async(
     mut pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
+    built_under: Option<u64>,
 ) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -10285,6 +10312,12 @@ pub(in crate::supertable) async fn persist_commit_async(
         let mut next_id_floor: u64 = 0;
         for attempt in 0..max_retries {
             let old = inner.manifest.load_full();
+            // Read after the base: the generation is bumped before a new
+            // options' manifest is stored, so a base carrying them is never
+            // paired here with the generation from before.
+            if built_under.is_some_and(|generation| generation != inner.options_generation()) {
+                return Err(SupertableCommitError::OptionsChanged);
+            }
             // A prior attempt found its id occupied by a crash-orphaned
             // manifest list — derive this attempt's successor past it.
             let old = if next_id_floor > 0 {
@@ -10395,6 +10428,8 @@ fn published_by_earlier_attempt(
     Some(refreshed)
 }
 
+/// [`persist_commit_async`], driven to completion; see it for `built_under`.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::supertable) fn persist_commit(
     inner: &SupertableInner,
     storage: Arc<dyn StorageProvider>,
@@ -10404,6 +10439,7 @@ pub(in crate::supertable) fn persist_commit(
     pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
+    built_under: Option<u64>,
 ) -> Result<(), SupertableCommitError> {
     let drive = persist_commit_async(
         inner,
@@ -10414,6 +10450,7 @@ pub(in crate::supertable) fn persist_commit(
         pending_storage_replaces,
         list_metadata,
         term_contributions,
+        built_under,
     );
     let new_manifest = bridge_on_runtime(drive, &inner.query_runtime())?;
     inner.manifest.store(new_manifest);
@@ -10915,7 +10952,7 @@ pub(in crate::supertable) async fn refresh_inner_state_async(
             ));
         }
     };
-    inner.manifest.store(manifest);
+    inner.store_manifest(manifest);
     inner.reconcile_tombstone_seqs();
     Ok(())
 }

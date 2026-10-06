@@ -54,8 +54,10 @@ use futures::future::try_join_all;
 pub use index_spec::{FtsField, IndexSpec};
 use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
+    update_recorded_analyzers,
 };
 pub use options::{ColdFetchMode, ConnectOptions};
+use table::CatalogRecord;
 pub use table::Supertable;
 use tokio::runtime::{Handle, Runtime};
 use tracing::{Instrument, debug, info, warn};
@@ -96,7 +98,6 @@ use crate::{
         fts::{
             analysis::{Stemmer, Stopwords},
             bm25,
-            tokenize::{ASCII_LOWER_TOKENIZER, STANDARD_TOKENIZER},
         },
         vector::{builder::VectorConfig, distance::Metric},
     },
@@ -296,7 +297,7 @@ enum CatalogStore {
         root: Arc<dyn StorageProvider>,
         /// Warm cache of live handles. Sharded so concurrent queries on one
         /// `Connection` don't serialize on a lock.
-        handles: DashMap<String, SupertableHandle>,
+        handles: DashMap<String, CachedTable>,
         /// Per-name build/evict lock. Never removed once created: a concurrent
         /// opener may hold or await the `Arc`, so evicting it mid-use would let
         /// two builds proceed.
@@ -525,10 +526,22 @@ impl Connection {
 
                 // Seed the memo: `query_sql` reads back through this same
                 // handle, so in-process writes are visible at once.
-                handles.insert(name.to_string(), handle.clone());
+                handles.insert(
+                    name.to_string(),
+                    CachedTable {
+                        handle: handle.clone(),
+                        location: location.clone(),
+                    },
+                );
 
                 info!(table = name, location = %location, "created table");
-                Ok(Supertable::from_local(handle))
+                Ok(
+                    Supertable::from_local(handle).with_catalog_record(CatalogRecord::new(
+                        Arc::clone(root),
+                        name,
+                        location,
+                    )),
+                )
             }
             #[cfg(feature = "remote")]
             CatalogStore::Remote(c) => c.create_table(name, schema, indexes),
@@ -540,6 +553,13 @@ impl Connection {
     /// for SQL, `reader` for the search TVFs) go through this; the public
     /// [`open_table`](Self::open_table) wraps the result.
     pub(crate) fn open_table_handle(&self, name: &str) -> Result<SupertableHandle, InfinoError> {
+        self.open_local(name).map(|(handle, _)| handle)
+    }
+
+    /// [`Self::open_table_handle`], with the storage location the table was
+    /// opened at; `None` for a `memory://` table, which has no catalog
+    /// record.
+    fn open_local(&self, name: &str) -> Result<(SupertableHandle, Option<String>), InfinoError> {
         debug!(table = name, "opening table");
         match &self.inner.store {
             CatalogStore::Memory(map) => map
@@ -547,6 +567,7 @@ impl Connection {
                 .expect("catalog mutex poisoned")
                 .get(name)
                 .cloned()
+                .map(|handle| (handle, None))
                 .ok_or_else(|| {
                     InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
                 }),
@@ -559,8 +580,8 @@ impl Connection {
                 // Warm path: lock-free sharded lookup, no serialization. A
                 // handle purged elsewhere is dropped here, so the cold path
                 // re-resolves it against the catalog.
-                if let Some(handle) = live_handle(handles, name) {
-                    return Ok(handle);
+                if let Some(cached) = live_handle(handles, name) {
+                    return Ok((cached.handle, Some(cached.location)));
                 }
 
                 // Cold path: build once under the gate. Blocks here if a
@@ -570,8 +591,8 @@ impl Connection {
                 let _built = lock_gate(&gate);
 
                 // A peer may have built it while we waited on the gate.
-                if let Some(handle) = live_handle(handles, name) {
-                    return Ok(handle);
+                if let Some(cached) = live_handle(handles, name) {
+                    return Ok((cached.handle, Some(cached.location)));
                 }
 
                 let (body, _etag) =
@@ -581,21 +602,25 @@ impl Connection {
                     InfinoError::NotFound(name.to_string()).with_context("open_table", Some(name))
                 })?;
 
-                let handle = match SupertableHandle::open(self.recorded_table_options(
+                // Opens a table an analyzer change has moved to `standard`
+                // even while its record still names `ascii_lower`: the
+                // manifest load adopts that change.
+                let handle = SupertableHandle::open(self.recorded_table_options(
                     name,
                     entry,
                     &entry.fts_analyzers,
-                )?) {
-                    Ok(handle) => handle,
-                    Err(e) => self
-                        .open_after_analyzer_change(root, name, entry)
-                        .ok_or_else(|| {
-                            InfinoError::from(e).with_context("open_table", Some(name))
-                        })?,
-                };
-                handles.insert(name.to_string(), handle.clone());
+                )?)
+                .map_err(|e| InfinoError::from(e).with_context("open_table", Some(name)))?;
+                correct_recorded_analyzers(root, name, entry, &handle);
+                handles.insert(
+                    name.to_string(),
+                    CachedTable {
+                        handle: handle.clone(),
+                        location: entry.location.clone(),
+                    },
+                );
 
-                Ok(handle)
+                Ok((handle, Some(entry.location.clone())))
             }
             // The local handle backs the local SQL / search-TVF paths, which a
             // remote connection never takes (it forwards `query_sql`). Reaching
@@ -735,64 +760,6 @@ impl Connection {
         Ok(opts)
     }
 
-    /// Open a table an analyzer change moved to `standard` while its catalog
-    /// record still names `ascii_lower`, and correct the record.
-    ///
-    /// The change publishes the table's new options in its own manifest
-    /// and leaves the record to whoever opens the table next, so a table
-    /// that has been migrated always looks like this once. Opening it under
-    /// the recorded analyzer fails the options-hash check; opening it with
-    /// every `ascii_lower` column as `standard` passes only if that is
-    /// exactly what the table is, because the check compares exact hashes.
-    fn open_after_analyzer_change(
-        &self,
-        root: &Arc<dyn StorageProvider>,
-        name: &str,
-        entry: &TableEntry,
-    ) -> Option<SupertableHandle> {
-        if !entry
-            .fts_analyzers
-            .iter()
-            .any(|a| a == ASCII_LOWER_TOKENIZER)
-        {
-            return None;
-        }
-        let analyzers: Vec<String> = entry
-            .fts_analyzers
-            .iter()
-            .map(|a| match a.as_str() {
-                ASCII_LOWER_TOKENIZER => STANDARD_TOKENIZER.to_string(),
-                _ => a.clone(),
-            })
-            .collect();
-        let handle =
-            SupertableHandle::open(self.recorded_table_options(name, entry, &analyzers).ok()?)
-                .ok()?;
-
-        // Best effort: until the record is corrected every open of this
-        // table takes this path, which costs a failed open and nothing else.
-        let (table, location) = (name.to_string(), entry.location.clone());
-        let corrected = bridge_on_runtime(
-            commit_catalog(root.as_ref(), move |body| {
-                if let Some(record) = body.tables.get_mut(&table)
-                    && record.location == location
-                {
-                    record.fts_analyzers = analyzers.clone();
-                }
-                Ok(())
-            }),
-            &shared_io_runtime(),
-        );
-        match corrected {
-            Ok(()) => info!(
-                table = name,
-                "recorded the standard analyzer after an analyzer change"
-            ),
-            Err(e) => warn!(table = name, error = %e, "could not record the standard analyzer"),
-        }
-        Some(handle)
-    }
-
     /// Open an existing table by name. Fails with
     /// [`InfinoError::NotFound`] if no such table is registered.
     ///
@@ -812,7 +779,12 @@ impl Connection {
         if let CatalogStore::Remote(c) = &self.inner.store {
             return c.open_table(name);
         }
-        Ok(Supertable::from_local(self.open_table_handle(name)?))
+        let (handle, location) = self.open_local(name)?;
+        Ok(match (&self.inner.store, location) {
+            (CatalogStore::Storage { root, .. }, Some(location)) => Supertable::from_local(handle)
+                .with_catalog_record(CatalogRecord::new(Arc::clone(root), name, location)),
+            _ => Supertable::from_local(handle),
+        })
     }
 
     /// Rotate the GCS bearer token in place, returning `true` when it was
@@ -1493,15 +1465,49 @@ fn build_disk_cache(
     Ok(Some((cache, manifest_cache)))
 }
 
+/// A warm handle, and the storage location its catalog record names.
+#[derive(Clone)]
+struct CachedTable {
+    handle: SupertableHandle,
+    location: String,
+}
+
+/// Bring `entry`'s analyzer names in line with the table `handle` opened.
+///
+/// An analyzer change records itself in the catalog after its manifest
+/// commit, so a run that stopped between the two leaves a record naming
+/// `ascii_lower` for a table on `standard`. This engine opens it anyway;
+/// the record is corrected for engines that build a table's options from
+/// it and would otherwise fail to open the table at all. Best effort: the
+/// next open tries again.
+fn correct_recorded_analyzers(
+    root: &Arc<dyn StorageProvider>,
+    name: &str,
+    entry: &TableEntry,
+    handle: &SupertableHandle,
+) {
+    let analyzers = handle.fts_analyzers();
+    if analyzers == entry.fts_analyzers {
+        return;
+    }
+    let corrected = bridge_on_runtime(
+        update_recorded_analyzers(root.as_ref(), name, &entry.location, |recorded| {
+            *recorded = analyzers.clone();
+        }),
+        &shared_io_runtime(),
+    );
+    match corrected {
+        Ok(()) => info!(table = name, "corrected the table's recorded analyzers"),
+        Err(e) => warn!(table = name, error = %e, "could not correct the recorded analyzers"),
+    }
+}
+
 /// The cached handle for `name`, or `None` (after evicting it) if its table was
 /// dropped and purged elsewhere — `handles` is per-process, so such a drop never
 /// reaches it. The `Ref` is dropped before `remove`, which would else deadlock.
-fn live_handle(
-    handles: &DashMap<String, SupertableHandle>,
-    name: &str,
-) -> Option<SupertableHandle> {
+fn live_handle(handles: &DashMap<String, CachedTable>, name: &str) -> Option<CachedTable> {
     let entry = handles.get(name)?;
-    if !entry.pointer_vanished() {
+    if !entry.handle.pointer_vanished() {
         return Some(entry.clone());
     }
     drop(entry);
@@ -1700,7 +1706,7 @@ mod tests {
         conn: &Connection,
     ) -> (
         &DashMap<String, Arc<Mutex<()>>>,
-        &DashMap<String, SupertableHandle>,
+        &DashMap<String, CachedTable>,
     ) {
         match &conn.inner.store {
             CatalogStore::Storage {

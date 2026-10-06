@@ -14,14 +14,14 @@ use std::{fs, path::Path, sync::Arc, time::Duration};
 
 use datafusion::prelude::{col, lit};
 use infino::{
-    BoolMode, CompactionSettings, Connection, OptimizeOptions, ReindexError, ReindexMode,
-    ReindexOptions, Supertable,
+    BoolMode, CompactionSettings, ConnectOptions, Connection, Consistency, InfinoError,
+    OptimizeOptions, ReindexError, ReindexMode, ReindexOptions, Supertable,
     arrow_array::{
         Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
         RecordBatch,
     },
     arrow_schema::{DataType, Field},
-    connect,
+    connect, connect_with,
     superfile::format::fts::VERSION_CURRENT,
 };
 
@@ -70,6 +70,16 @@ fn catalog_analyzers(root: &Path) -> Vec<String> {
         .iter()
         .map(|a| a.as_str().expect("analyzer name").to_string())
         .collect()
+}
+
+/// Overwrite the analyzer names the catalog records for the corpus table,
+/// as a run that stopped before its catalog write would have left them.
+fn set_catalog_analyzers(root: &Path, analyzers: &[&str]) {
+    let path = root.join("_catalog").join("current");
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("read catalog")).expect("catalog is JSON");
+    body["tables"][TABLE]["fts_analyzers"] = serde_json::json!(analyzers);
+    fs::write(&path, serde_json::to_vec(&body).expect("encode catalog")).expect("write catalog");
 }
 
 /// The distances of a vector search's hits, in rank order.
@@ -205,10 +215,34 @@ fn moves_an_ascii_lower_table_to_standard_in_the_current_format() {
     assert_eq!(hits_k(&table, "body", POST_MIGRATION_WORD, k + 1), 1);
 }
 
-/// A connection opened after the change finds the table on `standard`, and
-/// corrects the catalog record the change left naming `ascii_lower`.
+/// The change records `standard` in the catalog in the same operation, so
+/// an engine that builds the table's options from its record opens it as
+/// it now is without this engine having opened it first.
 #[test]
-fn a_later_open_reads_the_change_and_corrects_the_catalog() {
+fn the_change_records_standard_in_the_catalog() {
+    const SHAPE: &str = "v7_ascii_lower";
+    let Some((_tmp, db, root)) = connect_corpus(SHAPE) else {
+        return;
+    };
+    assert_eq!(
+        catalog_analyzers(&root),
+        ["ascii_lower", "ascii_lower", "standard"]
+    );
+    db.open_table(TABLE)
+        .expect("open")
+        .reindex(&ReindexOptions::to_standard_analyzer())
+        .expect("move to standard");
+    assert_eq!(
+        catalog_analyzers(&root),
+        ["standard", "standard", "standard"]
+    );
+}
+
+/// A run that stopped after its manifest commit and before its catalog
+/// write leaves the record naming `ascii_lower`; the next open still finds
+/// the table on `standard`, and corrects the record.
+#[test]
+fn an_open_corrects_a_record_the_change_did_not_reach() {
     const SHAPE: &str = "v7_ascii_lower";
     let Some((_tmp, db, root)) = connect_corpus(SHAPE) else {
         return;
@@ -218,11 +252,7 @@ fn a_later_open_reads_the_change_and_corrects_the_catalog() {
         .reindex(&ReindexOptions::to_standard_analyzer())
         .expect("move to standard");
     drop(db);
-    assert_eq!(
-        catalog_analyzers(&root),
-        ["ascii_lower", "ascii_lower", "standard"],
-        "the change itself leaves the record to the next open"
-    );
+    set_catalog_analyzers(&root, &["ascii_lower", "ascii_lower", "standard"]);
 
     let db = connect(root.to_str().expect("utf-8 path")).expect("reconnect");
     let table = db.open_table(TABLE).expect("open a migrated table");
@@ -240,28 +270,68 @@ fn a_later_open_reads_the_change_and_corrects_the_catalog() {
     );
 }
 
-/// A handle that opened before the change cannot commit superfiles built
-/// under the old analyzer into the migrated table.
+/// Handles opened before the change move to it rather than failing: a
+/// reader answers under `standard` once it refreshes, and a writer's
+/// appends land under `standard` — at most one is refused, retryably, for
+/// having been built under the old analyzer.
 #[test]
-fn a_handle_opened_before_the_change_cannot_write_into_it() {
+fn a_handle_opened_before_the_change_moves_to_it() {
     const SHAPE: &str = "v7_ascii_lower";
-    let Some((_tmp, stale_db, root)) = connect_corpus(SHAPE) else {
+    let Some((_tmp, _db, root)) = connect_corpus(SHAPE) else {
         return;
     };
-    let stale = stale_db.open_table(TABLE).expect("open before");
+    let path = root.to_str().expect("utf-8 path");
+    // Strong, so every query refreshes and the reader's move is observable
+    // without waiting out a staleness window.
+    let reader = connect_with(
+        path,
+        ConnectOptions::new().with_read_consistency(Consistency::Strong),
+    )
+    .expect("reader connection")
+    .open_table(TABLE)
+    .expect("open the reader before the change");
+    let writer = connect(path)
+        .expect("writer connection")
+        .open_table(TABLE)
+        .expect("open the writer before the change");
+    let k = ASCII_LOWER_SHAPE_LIVE_ROWS;
+    assert_eq!(
+        hits_k(&reader, "body", "résumé", k),
+        0,
+        "ascii_lower before"
+    );
 
-    let db = connect(root.to_str().expect("utf-8 path")).expect("second connection");
-    db.open_table(TABLE)
+    connect(path)
+        .expect("migrating connection")
+        .open_table(TABLE)
         .expect("open")
         .reindex(&ReindexOptions::to_standard_analyzer())
         .expect("move to standard");
 
-    let e = stale
-        .append(&one_row(&stale, POST_MIGRATION_WORD))
-        .expect_err("an ascii_lower build must not land in a standard table");
-    // It fails on the options hash: the table no longer is what this
-    // handle opened.
-    assert!(e.to_string().contains("content-hash mismatch"), "{e}");
+    assert_eq!(hits_k(&reader, "body", "résumé", k), 1, "standard after");
+    assert_eq!(hits_k(&reader, "body", "don", k), 0, "standard after");
+
+    let row = one_row(&writer, POST_MIGRATION_WORD);
+    if let Err(refused) = writer.append(&row) {
+        assert!(matches!(refused, InfinoError::Conflict(_)), "{refused}");
+        writer
+            .append(&row)
+            .expect("the retry builds under standard");
+    }
+    assert_eq!(hits_k(&writer, "body", POST_MIGRATION_WORD, k + 1), 1);
+    assert_eq!(hits_k(&reader, "body", POST_MIGRATION_WORD, k + 1), 1);
+
+    // What matters most: nothing built under `ascii_lower` landed.
+    writer
+        .gc(Duration::ZERO)
+        .expect("collect replaced superfiles");
+    assert!(
+        column_analyzers(&root, "body")
+            .iter()
+            .all(|a| a == "standard"),
+        "{:?}",
+        column_analyzers(&root, "body")
+    );
 }
 
 /// An index-only `ascii_lower` column has no text to re-analyze, so the run

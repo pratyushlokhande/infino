@@ -333,8 +333,14 @@ with `stored(false)` has no text to re-analyze, so the run refuses the
 table before writing anything. The run holds the table's compaction
 slot, and stops without publishing if other writers keep adding
 superfiles faster than it can rebuild them; pause ingest and run it
-again. Handles opened elsewhere before the change fail their next
-refresh and need reopening.
+again.
+
+Run through a connection, the change also records `standard` in the
+table's catalog record. Handles already open, in this process or
+another, move to `standard` at their next refresh. A write that was
+built under `ascii_lower` while the change landed is refused with a
+conflict instead of being published; retrying it builds under
+`standard`.
 
 ### Stopwords
 

@@ -18,7 +18,10 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
-    sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock, Weak, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex, OnceLock, RwLock as StdRwLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -142,6 +145,13 @@ pub(super) struct SupertableInner {
     /// readers do ArcSwap::load_full at construction to pin a
     /// snapshot for the duration of their queries.
     pub(super) manifest: ArcSwap<ManifestSnapshot>,
+    /// Bumped before [`Self::manifest`] takes a snapshot carrying options
+    /// other than the ones in force, which only an analyzer change does.
+    ///
+    /// A write records it before building and refuses to publish once it
+    /// has moved: what it built under the old options must not land in a
+    /// table that has switched to the new ones.
+    pub(super) options_generation: AtomicU64,
     /// Single-writer slot: the writer flips this true on
     /// acquisition (via compare-exchange) and (via Drop) flips
     /// it false on release. Atomic flag, not a lock — never
@@ -272,6 +282,24 @@ impl SupertableInner {
             .options
             .builder_options()
             .with_fts_corpus_stats(manifest.fts_corpus_stats(&HashSet::new()))
+    }
+
+    /// Make `next` the current manifest, bumping
+    /// [`Self::options_generation`] first when it carries options other
+    /// than the ones in force.
+    ///
+    /// Bumped before the store so a write that reads the manifest and then
+    /// the generation can never see the new options with the old count.
+    pub(super) fn store_manifest(&self, next: Arc<ManifestSnapshot>) {
+        if !Arc::ptr_eq(&self.manifest.load().options, &next.options) {
+            self.options_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.manifest.store(next);
+    }
+
+    /// The current [`Self::options_generation`].
+    pub(super) fn options_generation(&self) -> u64 {
+        self.options_generation.load(Ordering::SeqCst)
     }
 
     /// Runtime driving the sync API's async kernels when the caller
@@ -426,7 +454,7 @@ impl SupertableInner {
             Err(err) => return Err(err),
         };
 
-        self.manifest.store(manifest);
+        self.store_manifest(manifest);
 
         self.reconcile_tombstone_seqs();
 
@@ -901,6 +929,20 @@ impl Supertable {
     /// swallows errors by design, so this latch is how that fact escapes.
     pub(crate) fn pointer_vanished(&self) -> bool {
         self.inner.pointer_vanished.get().is_some()
+    }
+
+    /// Each full-text column's base analyzer, as the current manifest has
+    /// them; after an analyzer change these differ from the options the
+    /// handle was opened with.
+    pub(crate) fn fts_analyzers(&self) -> Vec<String> {
+        self.inner
+            .manifest
+            .load()
+            .options
+            .fts_columns
+            .iter()
+            .map(|c| c.analyzer.clone())
+            .collect()
     }
 
     test_visible! {
@@ -1840,6 +1882,7 @@ async fn build_handle(
         options,
         role,
         manifest: ArcSwap::new(manifest),
+        options_generation: AtomicU64::new(0),
         writer_outstanding: AtomicBool::new(false),
         compaction_outstanding: AtomicBool::new(false),
         id_generator: Mutex::new(id_generator),
@@ -6284,6 +6327,7 @@ mod tests {
                 Vec::new(),
                 list_metadata,
                 Vec::new(),
+                None,
             ))
             .expect("plant stale law");
         hidden.inner().manifest.store(planted_manifest);
@@ -6483,6 +6527,7 @@ mod tests {
                 Vec::new(),
                 list_metadata,
                 Vec::new(),
+                None,
             ))
             .expect("plant stale law");
         hidden.inner().manifest.store(planted_manifest);
@@ -6559,6 +6604,7 @@ mod tests {
                 Vec::new(),
                 zero_metadata,
                 Vec::new(),
+                None,
             ))
             .expect("plant zero law");
         hidden.inner().manifest.store(zero_manifest);
@@ -6764,6 +6810,7 @@ mod tests {
                 Vec::new(),
                 list_metadata,
                 Vec::new(),
+                None,
             ))
             .expect("plant cleared law");
         hidden.inner().manifest.store(planted_manifest);
@@ -6945,6 +6992,7 @@ mod tests {
                 Vec::new(),
                 list_metadata,
                 Vec::new(),
+                None,
             ))
             .expect("plant cleared law");
         hidden.inner().manifest.store(planted_manifest);

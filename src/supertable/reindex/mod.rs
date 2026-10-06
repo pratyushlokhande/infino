@@ -882,6 +882,7 @@ mod tests {
                 Vec::new(),
                 CommitListMetadata::empty(),
                 Vec::new(),
+                None,
             ))
             .expect("drop all but one superfile");
         table.block_on_query(table.refresh()).expect("refresh");
