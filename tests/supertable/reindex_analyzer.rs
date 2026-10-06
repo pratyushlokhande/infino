@@ -19,7 +19,6 @@ use std::{
 };
 
 use bytes::Bytes;
-
 use datafusion::prelude::{col, lit};
 use infino::{
     BoolMode, CompactionSettings, ConnectOptions, Connection, Consistency, InfinoError,
