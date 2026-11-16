@@ -127,7 +127,7 @@ use crate::{
             reader::{
                 Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
                 LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
-                ScoringView,
+                ScoringView, least_norm_table,
             },
             tokenize::Phrase,
         },
@@ -1662,6 +1662,13 @@ impl SupertableReader {
             None => HashSet::new(),
         });
         let merge_in_unit = exact_count || ceilings.is_none();
+        // What bounds a document whose length is known only from below, at
+        // the table's average and the declared parameters; `None` under a
+        // parameter override.
+        let norm_min: Option<Arc<[f32; 256]>> = match (bm25_params, column_params(manifest, column)) {
+            (None, Some(params)) => Some(least_norm_table(table_avgdl, params)),
+            _ => None,
+        };
         // What the merge, started at the fan-out below, scores and seeds.
         let merge_idf = global_idf.clone();
         let merge_floor = Arc::clone(&shared);
@@ -1670,9 +1677,11 @@ impl SupertableReader {
                 range,
                 superfile_id: suid,
                 uri,
+                id_min,
                 id_max,
                 ..
             } = params;
+            let norm_min = norm_min.clone();
             let avgdl = at_table_avgdl.contains(&suid).then_some(table_avgdl);
             let column_arc = Arc::clone(&column_arc);
             let must_arc = Arc::clone(&must_arc);
@@ -1743,7 +1752,65 @@ impl SupertableReader {
                     // superfile's hits costs one round trip for their blocks.
                     join(scoring, r.prewarm_id_directory()).await;
                 };
-                let (memo, ()): (Option<Arc<FetchedTermMemo>>, ()) = join(memo, prewarm).await;
+                // Once a floor stands, a superfile whose postings show that no
+                // document can beat it is skipped before its length array is
+                // read: each document is bounded at the shortest length its
+                // query-term occurrences allow. A superfile it cannot rule out
+                // reads its lengths after the postings, one round trip later.
+                let precheck = norm_min.is_some()
+                    && range.is_none()
+                    && !exact_count
+                    && avgdl.is_some()
+                    && r.parquet_bytes().is_none()
+                    && shared.floor() > f32::NEG_INFINITY
+                    && r.fts().is_some_and(|f| !f.norms_loaded(&column_arc));
+                let memo: Option<Arc<FetchedTermMemo>> = match (precheck, norm_min) {
+                    (true, Some(norm_min)) => {
+                        let memo = memo.await;
+                        if let (Some(fts), Some(m)) = (r.fts(), memo.as_deref()) {
+                            let must_refs: Vec<&str> =
+                                must_arc.iter().map(String::as_str).collect();
+                            let should_refs: Vec<&str> =
+                                should_arc.iter().map(String::as_str).collect();
+                            let lists = ClauseLists {
+                                musts: &must_refs,
+                                shoulds: &should_refs,
+                                negatives: &[],
+                                must_phrases: &must_ph_arc,
+                                should_phrases: &should_ph_arc,
+                                negative_phrases: &[],
+                                idf: QueryIdf::Table(&global_idf),
+                                prefetched: Some(m),
+                                live_floor: None,
+                                allow: None,
+                                exact_count: false,
+                            };
+                            if let Ok(Some(ceiling)) =
+                                fts.posting_ceiling(&column_arc, &lists).await
+                            {
+                                let bar = competitive_floor(shared.floor(), score_tolerance);
+                                let bound = run_on_pool_unless_blocking(
+                                    Some(&reader_pool),
+                                    "posting ceiling",
+                                    move || ceiling.walk(&norm_min, bar),
+                                )
+                                .await
+                                .map_err(|e| QueryError::Internal(e.to_string()))?;
+                                let floor = competitive_floor(shared.floor(), score_tolerance);
+                                if !ceiling_can_compete(bound, floor)
+                                    || (score_tolerance <= 0.0
+                                        && bound == floor
+                                        && shared.tie_skippable(floor, id_min))
+                                {
+                                    return Ok(Vec::new());
+                                }
+                            }
+                        }
+                        prewarm.await;
+                        memo
+                    }
+                    _ => join(memo, prewarm).await.0,
+                };
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
                 // scan against the running top-k instead of returning a full

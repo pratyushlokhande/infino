@@ -236,6 +236,41 @@ pub fn tf_factor(tf: u32, dl_norm_k1: f32) -> f32 {
     tf / (tf + dl_norm_k1)
 }
 
+/// The largest frequency a phrase is bounded at by the kernel's own
+/// arithmetic. The score `idf·tf / (tf + norm)` rises with `tf` by at least
+/// `norm / (tf·(tf + 1 + norm))` of itself per step: up to this frequency,
+/// at a norm of at least [`PHRASE_EXACT_MIN_NORM`], the step is more than
+/// twice the rounding the arithmetic can add, so a document at a lower
+/// frequency never rounds above the bound. Past it a bound takes slack.
+pub(crate) const PHRASE_TF_EXACT_MAX: u32 = 512;
+/// The smallest length norm at which the phrase bound is the kernel's
+/// score with no slack: `k1·(1 − b)`, the least a norm can be, at the
+/// defaults. A larger `b` lets a short document in a column of long ones
+/// take a norm near zero, where the score stops rising with `tf` in f32
+/// and one at a lower frequency can round an ulp above it; the bound
+/// there takes the slack.
+pub(crate) const PHRASE_EXACT_MIN_NORM: f32 = 0.3;
+
+/// Widening of a score taken where it may not rise with the frequency in
+/// f32: a rounding or two of the kernel's arithmetic.
+pub(crate) const MONOTONE_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
+
+/// An upper bound on what a term of weight `idf` contributes to a document
+/// of length norm `norm` at `tf` occurrences or fewer: the kernel's score
+/// at `tf`, where the score rises with the frequency in f32 (see
+/// [`PHRASE_TF_EXACT_MAX`]), and that score widened by [`MONOTONE_SLACK`]
+/// elsewhere.
+pub(crate) fn score_at_most(idf: f32, tf: u32, norm: f32) -> f32 {
+    if tf == 0 {
+        return 0.0;
+    }
+    let score = score_with_dl_norm_k1(idf, tf, norm);
+    match tf <= PHRASE_TF_EXACT_MAX && norm >= PHRASE_EXACT_MIN_NORM {
+        true => score,
+        false => score * MONOTONE_SLACK,
+    }
+}
+
 /// BM25 score using a precomputed `dl_norm_k1 = K1 * (1 - B + B * dl/avgdl)`
 /// and `idf_weight = idf` (folding in any query-term-frequency weight).
 ///

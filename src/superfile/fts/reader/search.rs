@@ -598,6 +598,85 @@ impl FtsReader {
         }
     }
 
+    /// The positive atoms of `lists` over this file's postings, as cursors
+    /// that read no lengths, for bounding every document's score before the
+    /// column's length array is read (see [`PostingCeiling::walk`]). `None`
+    /// when a term's postings are not in `lists.prefetched` (when given),
+    /// its idf is not the table's, or the query counts every match.
+    pub(crate) async fn posting_ceiling(
+        &self,
+        column: &str,
+        lists: &ClauseLists<'_>,
+    ) -> Result<Option<PostingCeiling>, FtsError> {
+        let (QueryIdf::Table(idf_of), false) = (lists.idf, lists.exact_count) else {
+            return Ok(None);
+        };
+        let column_id = self.resolve_column_id(column)?;
+        let mut terms: Vec<&str> = Vec::new();
+        let phrases = lists.must_phrases.iter().chain(lists.should_phrases);
+        let mut bare: Vec<(usize, f32)> = Vec::new();
+        let mut required: Vec<usize> = Vec::new();
+        for (list, must) in [(lists.musts, true), (lists.shoulds, false)] {
+            let (distinct, qtf) = Self::dedup_terms_with_qtf(list);
+            for (term, weight) in distinct.into_iter().zip(qtf) {
+                let Some(&idf) = idf_of.get(term) else {
+                    return Ok(None);
+                };
+                let at = slot(term, &mut terms);
+                bare.push((at, idf * weight as f32));
+                if must {
+                    required.push(at);
+                }
+            }
+        }
+        let mut phrase_atoms: Vec<(Vec<usize>, f32)> = Vec::new();
+        let musts = lists.must_phrases.len();
+        for (i, phrase) in phrases.enumerate() {
+            // The phrase's idf counts every position, summed in phrase
+            // order, as its cursor sums it.
+            let mut idf_sum = 0.0f32;
+            let mut members: Vec<usize> = Vec::new();
+            for term in &phrase.terms {
+                let Some(&idf) = idf_of.get(term.as_str()) else {
+                    return Ok(None);
+                };
+                idf_sum += idf;
+                let at = slot(term, &mut terms);
+                if !members.contains(&at) {
+                    members.push(at);
+                }
+            }
+            if i < musts {
+                required.extend(&members);
+            }
+            phrase_atoms.push((members, idf_sum));
+        }
+        if terms.is_empty()
+            || lists
+                .prefetched
+                .is_some_and(|m| !terms.iter().all(|t| m.contains(t)))
+        {
+            return Ok(None);
+        }
+        let cursors = self
+            .build_term_cursors_opt(
+                column_id,
+                &terms,
+                lists.idf,
+                CursorUse::Match,
+                None,
+                lists.prefetched,
+                None,
+            )
+            .await?;
+        Ok(Some(PostingCeiling {
+            cursors,
+            required,
+            bare,
+            phrases: phrase_atoms,
+        }))
+    }
+
     pub(crate) async fn prepare_clauses(
         &self,
         column: &str,
@@ -2222,8 +2301,280 @@ impl SingleTermWalk<'_> {
     }
 }
 
+/// A query's positive atoms over one file's postings: what bounds each
+/// document's score from its term frequencies alone.
+pub(crate) struct PostingCeiling {
+    /// One cursor per distinct term, `None` where the file lacks it.
+    cursors: Vec<Option<TermCursor>>,
+    /// The terms every match carries: the musts and the members of
+    /// must-phrases.
+    required: Vec<usize>,
+    /// Each bare term's cursor and idf, weighted by its repeats in the query.
+    bare: Vec<(usize, f32)>,
+    /// Each phrase's distinct members and its idf summed over its positions.
+    phrases: Vec<(Vec<usize>, f32)>,
+}
+
+impl PostingCeiling {
+    /// The highest score any document of the file can reach, or infinity
+    /// once a document's bound passes `bar`: the walk stops there, so what
+    /// it has seen bounds nothing about the rest. A document missing a
+    /// required term is no match and bounds nothing. A document's query
+    /// terms are tokens of it, so it is at least as long as their
+    /// frequencies sum to; scored at the least norm a bucket that long or
+    /// longer takes (`norm_min`), each atom is at least what the kernel
+    /// gives it, and a phrase occurs no more often than its rarest member.
+    pub(crate) fn walk(mut self, norm_min: &[f32; 256], bar: f32) -> f32 {
+        let mut tfs = vec![0u32; self.cursors.len()];
+        let mut atoms: Vec<f32> = Vec::new();
+        let mut best = f32::NEG_INFINITY;
+        loop {
+            let doc = self
+                .cursors
+                .iter()
+                .flatten()
+                .map(TermCursor::current_doc_id)
+                .min()
+                .unwrap_or(u32::MAX);
+            if doc == u32::MAX {
+                return best;
+            }
+            let mut len = 0u32;
+            for (tf, cursor) in tfs.iter_mut().zip(self.cursors.iter_mut()) {
+                *tf = 0;
+                if let Some(c) = cursor
+                    && c.current_doc_id() == doc
+                {
+                    *tf = c.current_tf();
+                    len = len.saturating_add(*tf);
+                    c.next();
+                }
+            }
+            if self.required.iter().any(|&t| tfs[t] == 0) {
+                continue;
+            }
+            let bucket = bm25::quantize_len(len.min(format::fts::DOC_LENGTH_STORED_MAX));
+            let norm = norm_min[usize::from(bucket)];
+            atoms.clear();
+            for &(t, idf) in &self.bare {
+                if tfs[t] > 0 {
+                    atoms.push(bm25::score_with_dl_norm_k1(idf, tfs[t], norm));
+                }
+            }
+            for (members, idf_sum) in &self.phrases {
+                let tf = members.iter().map(|&t| tfs[t]).min().unwrap_or(0);
+                if tf > 0 {
+                    atoms.push(bm25::score_at_most(*idf_sum, tf, norm));
+                }
+            }
+            let bound = sum_bound(&atoms);
+            if bound > bar {
+                return f32::INFINITY;
+            }
+            best = best.max(bound);
+        }
+    }
+}
+
+/// `term`'s place in `terms`, appended when new.
+fn slot<'a>(term: &'a str, terms: &mut Vec<&'a str>) -> usize {
+    match terms.iter().position(|t| *t == term) {
+        Some(i) => i,
+        None => {
+            terms.push(term);
+            terms.len() - 1
+        }
+    }
+}
+
+/// An upper bound on the kernel's sum of `atoms` in whatever order it adds
+/// them: the sum itself for two or fewer, the largest of the three pairings
+/// for three, and the sum widened by a rounding per addition past that.
+/// `NEG_INFINITY` for a document no atom matches, which no kernel returns.
+fn sum_bound(atoms: &[f32]) -> f32 {
+    match *atoms {
+        [] => f32::NEG_INFINITY,
+        [a] => a,
+        [a, b] => a + b,
+        [a, b, c] => ((a + b) + c).max((a + c) + b).max((b + c) + a),
+        _ => {
+            let sum: f32 = atoms.iter().sum();
+            sum * (1.0 + (8 + atoms.len()) as f32 * f32::EPSILON)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::test_util::xorshift;
+
+    /// Documents the posting ceiling is checked over: words in a fixed order,
+    /// each repeated one to three times, padding, and a rare pair.
+    const CEILING_DOCS: usize = 400;
+    /// The common words of the posting-ceiling corpora, by falling frequency.
+    const CEILING_WORDS: [&str; 4] = ["the", "data", "search", "index"];
+    /// Words that occur in only a few rows, so their postings are short.
+    const CEILING_RARE: [&str; 2] = ["quokka", "tensor"];
+
+    /// The posting ceiling is at least every score the kernel gives, for
+    /// disjunctions and conjunctions of one to four terms, phrases (a
+    /// repeated word among them) and a phrase beside a term, over documents
+    /// of varied lengths and frequencies.
+    #[test]
+    fn the_posting_ceiling_is_at_least_every_kernel_score() {
+        let mut next = xorshift(0xA5A5_5A5A_1234_5678);
+        let docs: Vec<String> = (0..CEILING_DOCS)
+            .map(|_| {
+                let mut out: Vec<&str> = Vec::new();
+                for (rank, w) in CEILING_WORDS.iter().enumerate() {
+                    if next() % (rank as u64 + 2) == 0 {
+                        out.extend(std::iter::repeat_n(*w, 1 + (next() % 3) as usize));
+                    }
+                }
+                out.extend(std::iter::repeat_n("filler", (next() % 6) as usize));
+                if next().is_multiple_of(40) {
+                    out.push("quokka");
+                    out.push("tensor");
+                } else if next().is_multiple_of(60) {
+                    out.push("tensor");
+                }
+                if out.is_empty() {
+                    out.push("filler");
+                }
+                out.join(" ")
+            })
+            .collect();
+        // Rows of query words alone, where a bound at the shortest length
+        // the occurrences allow is the kernel's score exactly.
+        let pure = [
+            "quokka tensor",
+            "the",
+            "the data",
+            "data search index",
+            "the data search index",
+            "the the",
+            "data search",
+            "index the data",
+        ];
+        let refs: Vec<&str> = docs.iter().map(String::as_str).chain(pure).collect();
+        check_posting_ceiling(&refs, false);
+        // Only the common words, so each row is as short as the
+        // occurrences of the query naming them all allow.
+        let mut next = xorshift(0x5A5A_A5A5_8765_4321);
+        let pure_rows: Vec<String> = (0..CEILING_DOCS)
+            .map(|_| {
+                let mut out: Vec<&str> = Vec::new();
+                for w in &CEILING_WORDS {
+                    if next().is_multiple_of(2) {
+                        out.extend(std::iter::repeat_n(*w, 1 + (next() % 3) as usize));
+                    }
+                }
+                if out.is_empty() {
+                    out.push("the");
+                }
+                out.join(" ")
+            })
+            .collect();
+        let refs: Vec<&str> = pure_rows.iter().map(String::as_str).collect();
+        check_posting_ceiling(&refs, true);
+    }
+
+    /// The posting ceiling over `docs` checked against the kernel for each
+    /// query shape; `tight` when every row holds query words alone.
+    fn check_posting_ceiling(refs: &[&str], tight: bool) {
+        // Positions, so phrases are among the shapes checked.
+        let mut builder = FtsBuilder::new();
+        builder
+            .register_column("body".into(), true)
+            .expect("register column");
+        for (row, doc) in refs.iter().enumerate() {
+            builder.add_doc(0, row as u32, doc).expect("add doc");
+        }
+        let blob = Bytes::from(builder.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let reader = FtsReader::open(blob, json).expect("open");
+        let stats = reader
+            .column_length_stats("body")
+            .expect("stats")
+            .expect("scored");
+        let avgdl = reader.column_baked_avgdl("body").expect("avgdl");
+        let params = bm25::Bm25Params::default();
+        let least = super::super::least_norm_table(avgdl, params);
+        let mut idf_of = GlobalTermIdf::new();
+        for w in CEILING_WORDS.iter().chain(&CEILING_RARE) {
+            let (df, _) = futures::executor::block_on(reader.term_df("body", w)).expect("df");
+            idf_of.insert((*w).to_owned(), bm25::idf(stats.n_scored_docs, df));
+        }
+        let phrase = |terms: &[&str]| Phrase {
+            terms: terms.iter().map(|t| (*t).to_owned()).collect(),
+            offsets: (0..terms.len() as u32).collect(),
+        };
+        let none: Vec<Phrase<String>> = Vec::new();
+        let should_the_data = vec![phrase(&["the", "data"])];
+        let must_data_search = vec![phrase(&["data", "search"])];
+        let should_the_the = vec![phrase(&["the", "the"])];
+        // (musts, shoulds, must phrases, should phrases)
+        let shapes: [(&[&str], &[&str], &[Phrase<String>], &[Phrase<String>]); 12] = [
+            (&["quokka", "tensor"], &[], &none, &none),
+            (&[], &["quokka", "tensor"], &none, &none),
+            (&[], &["the"], &none, &none),
+            (&[], &["the", "data"], &none, &none),
+            (&["the", "data"], &[], &none, &none),
+            (&[], &["the", "data", "search"], &none, &none),
+            (&["data", "search", "index"], &[], &none, &none),
+            (&[], &["the", "data", "search", "index"], &none, &none),
+            (&[], &[], &none, &should_the_data),
+            (&[], &[], &must_data_search, &none),
+            (&[], &[], &none, &should_the_the),
+            (&[], &["index"], &none, &should_the_data),
+        ];
+        for (musts, shoulds, must_phrases, should_phrases) in shapes {
+            let lists = || ClauseLists {
+                musts,
+                shoulds,
+                must_phrases,
+                should_phrases,
+                idf: QueryIdf::Table(&idf_of),
+                ..ClauseLists::default()
+            };
+            let label = format!("{musts:?} {shoulds:?} {must_phrases:?} {should_phrases:?}");
+            let prep = futures::executor::block_on(reader.prepare_clauses(
+                "body",
+                lists(),
+                1,
+                f32::NEG_INFINITY,
+            ))
+            .expect("prepare");
+            let best = reader
+                .run_prepared(prep)
+                .expect("run")
+                .first()
+                .map_or(f32::NEG_INFINITY, |h| h.1);
+            let ceiling = |bar: f32| {
+                futures::executor::block_on(reader.posting_ceiling("body", &lists()))
+                    .expect("ceiling")
+                    .expect("served")
+                    .walk(&least, bar)
+            };
+            let bound = ceiling(f32::INFINITY);
+            assert!(best <= bound, "{label}: the kernel's best {best} is above the ceiling {bound}");
+            // Over rows of the query's words alone, the bound of the query
+            // naming all of them is the best row's score, up to the slack a
+            // sum of four takes.
+            if tight && shoulds == CEILING_WORDS.as_slice() {
+                assert!(
+                    bound <= best * (1.0 + 16.0 * f32::EPSILON),
+                    "{label}: the ceiling {bound} is loose over {best}"
+                );
+            }
+            // A walk that stops at a bound past its bar has not seen the
+            // rest, so it rules nothing out.
+            if best.is_finite() {
+                assert_eq!(ceiling(f32::NEG_INFINITY), f32::INFINITY, "{label}: a stopped walk");
+            }
+        }
+    }
+
     use std::{
         collections::{HashMap, HashSet},
         sync::Arc,

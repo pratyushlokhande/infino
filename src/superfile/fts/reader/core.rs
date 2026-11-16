@@ -1227,6 +1227,13 @@ impl FtsReader {
 
     /// The average document length `column` was built at, which its stored
     /// bounds assume; `None` when the index has no such column.
+    /// Whether `column`'s length array is already in memory, so scoring
+    /// reads nothing more for it.
+    pub(crate) fn norms_loaded(&self, column: &str) -> bool {
+        self.resolve_column_id(column)
+            .is_ok_and(|id| self.columns[id as usize].norms_loaded())
+    }
+
     pub(crate) fn column_baked_avgdl(&self, column: &str) -> Option<f32> {
         let id = self.resolve_column_id(column).ok()?;
         Some(self.columns[id as usize].baked_avgdl)

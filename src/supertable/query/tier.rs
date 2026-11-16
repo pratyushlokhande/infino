@@ -76,7 +76,10 @@ use crate::{
     superfile::{
         format::fts::DOC_LENGTH_STORED_MAX,
         fts::{
-            bm25::{Bm25Params, dequantize_len, score_with_dl_norm_k1, tf_factor},
+            bm25::{
+                Bm25Params, PHRASE_EXACT_MIN_NORM, PHRASE_TF_EXACT_MAX, dequantize_len,
+                score_at_most, score_with_dl_norm_k1, tf_factor,
+            },
             reader::{GlobalTermIdf, norm_table},
         },
     },
@@ -489,22 +492,6 @@ const LEN_BITS: u32 = 8;
 /// The packed term frequency that stands for any frequency too large to
 /// pack: the document's phrase bound then falls back to its contribution.
 const TF_UNKNOWN: u32 = u32::MAX >> LEN_BITS;
-
-/// The largest frequency a phrase is bounded at by the kernel's own
-/// arithmetic. The score `idf·tf / (tf + norm)` rises with `tf` by at least
-/// `norm / (tf·(tf + 1 + norm))` of itself per step: up to this frequency,
-/// at a norm of at least [`PHRASE_EXACT_MIN_NORM`], the step is more than
-/// twice the rounding the arithmetic can add, so a document at a lower
-/// frequency never rounds above the bound. Past it the phrase is bounded
-/// by its members' keys, with slack.
-const PHRASE_TF_EXACT_MAX: u32 = 512;
-/// The smallest length norm at which the phrase bound is the kernel's
-/// score with no slack: `k1·(1 − b)`, the least a norm can be, at the
-/// defaults. A larger `b` lets a short document in a column of long ones
-/// take a norm near zero, where the score stops rising with `tf` in f32
-/// and one at a lower frequency can round an ulp above it; the bound
-/// there takes the slack.
-const PHRASE_EXACT_MIN_NORM: f32 = 0.3;
 
 /// A document's term frequency and one-byte length bucket in one word.
 fn pack_tf_len(tf: u32, len: u8) -> u32 {
@@ -1787,22 +1774,6 @@ fn max_tf(key: f32, params: Bm25Params, avgdl: f32, len: u8, cap: u32) -> u32 {
         tf -= 1;
     }
     tf
-}
-
-/// An upper bound on what a term of weight `idf` contributes to a document
-/// of length norm `norm` at `tf` occurrences or fewer: the kernel's score
-/// at `tf`, where the score rises with the frequency in f32 (see
-/// [`PHRASE_TF_EXACT_MAX`]), and that score widened by [`BOUND_SLACK`]
-/// elsewhere.
-fn score_at_most(idf: f32, tf: u32, norm: f32) -> f32 {
-    if tf == 0 {
-        return 0.0;
-    }
-    let score = score_with_dl_norm_k1(idf, tf, norm);
-    match tf <= PHRASE_TF_EXACT_MAX && norm >= PHRASE_EXACT_MIN_NORM {
-        true => score,
-        false => score * BOUND_SLACK,
-    }
 }
 
 /// Above what the greedy split of a length budget may search, the budget

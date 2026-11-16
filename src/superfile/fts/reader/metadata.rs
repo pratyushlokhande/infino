@@ -17,7 +17,7 @@ use crate::{
     superfile::{
         ReadError,
         error::FtsError,
-        format::{CRC_BYTES, checksum::crc32c},
+        format::{CRC_BYTES, checksum::crc32c, fts::DOC_LENGTH_STORED_MAX},
         fts::{
             analysis::{Stemmer, Stopwords},
             bm25,
@@ -350,6 +350,19 @@ pub(crate) fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]>
         *slot = params.dl_norm_k1(dl, avgdl);
     }
     Arc::from(lut)
+}
+
+/// Per length bucket, the least norm a document of that bucket or a longer
+/// one scores at: what bounds a document whose length is known only from
+/// below. Only the codes a stored length can take count; the codes past the
+/// saturated length decode out of order and occur in no file.
+pub(crate) fn least_norm_table(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
+    let mut least = *build_lut(avgdl, params);
+    let top = usize::from(bm25::quantize_len(DOC_LENGTH_STORED_MAX));
+    for bucket in (0..top).rev() {
+        least[bucket] = least[bucket].min(least[bucket + 1]);
+    }
+    Arc::new(least)
 }
 
 /// Per-column metadata, indexed by column_id (declaration order).
