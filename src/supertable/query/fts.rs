@@ -1358,10 +1358,18 @@ impl SupertableReader {
         // order, and its kernel seeds its own floor from its own blocks; the
         // merge would only cost its reads and rounds on every query, and the
         // gate its samples learning so.
+        // A bare disjunction of more terms than a mask holds, a prefix's
+        // expansion, merges its whole-headed terms as one (see
+        // `tier::prepare_merge`).
+        let bare_or = musts.is_empty()
+            && must_phrases.is_empty()
+            && should_phrases.is_empty()
+            && negatives.is_empty()
+            && negative_phrases.is_empty();
         let tiers_serve = index_column.is_some()
             && kept.len() > 1
             && scope.is_none_or(|s| !s.bounds_rows(&kept))
-            && all_terms.len() <= tier::MAX_TIER_TERMS
+            && (all_terms.len() <= tier::MAX_TIER_TERMS || bare_or)
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
         // Whether to merge at all is the table's learned call per class of
@@ -1453,7 +1461,15 @@ impl SupertableReader {
             // Bits over the distinct terms: the bare terms score on their
             // own; a match must carry the musts and every member of a
             // must-phrase.
-            let index_of = |n: &String| merge_term_refs.iter().position(|t| *t == n.as_str());
+            // Past what a mask holds the query is a bare disjunction, which
+            // the merge serves without masks.
+            let masked = merge_term_refs.len() <= tier::MAX_TIER_TERMS;
+            let index_of = |n: &String| {
+                merge_term_refs
+                    .iter()
+                    .position(|t| *t == n.as_str())
+                    .filter(|_| masked)
+            };
             let bits = |names: &[String]| -> tier::TermMask {
                 names
                     .iter()
@@ -1481,7 +1497,11 @@ impl SupertableReader {
             // A bare term repeated in the query is weighted by its count in
             // the kernels; the tiers score each term once, so such a query
             // is not served.
-            let repeated = musts.len() + shoulds.len() != scoring.count_ones() as usize;
+            let distinct = match masked {
+                true => scoring.count_ones() as usize,
+                false => merge_term_refs.len(),
+            };
+            let repeated = musts.len() + shoulds.len() != distinct;
             if let Some(params) = column_params(manifest, column)
                 && !repeated
                 && deny_known
@@ -1492,6 +1512,7 @@ impl SupertableReader {
                     required,
                     scoring,
                     phrases: tier_phrases,
+                    bare_or,
                     // A negated phrase excludes as a negated term does: the
                     // heads cannot see the adjacency that unmakes a match.
                     negated: !negatives.is_empty() || !negative_phrases.is_empty(),

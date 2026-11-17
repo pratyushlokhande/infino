@@ -703,8 +703,10 @@ fn a_per_term_budget_cuts_heads_and_answers_the_same() {
     assert!(served > 0, "the cut heads still serve queries");
 }
 
-/// The merge serves up to sixty-four distinct terms, a bit each; one more
-/// keeps the ceilings. Both answer as the table without tiers does.
+/// The merge serves up to sixty-four distinct terms, a bit each. Past that
+/// a bare disjunction is still served, its whole-headed terms merged as
+/// one, while a query with a must keeps the ceilings. Every shape answers
+/// as the table without tiers does.
 #[test]
 fn many_terms_are_served_up_to_the_mask_width() {
     let with_dir = TempDir::new().expect("tempdir");
@@ -719,7 +721,12 @@ fn many_terms_are_served_up_to_the_mask_width() {
     let sixty_four = words.join(" ");
     words.push("w60".to_owned());
     let sixty_five = words.join(" ");
-    for (query, expect_tiers) in [(&sixty_four, true), (&sixty_five, false)] {
+    let sixty_five_with_a_must = format!("+{sixty_five}");
+    for (query, expect_tiers) in [
+        (&sixty_four, true),
+        (&sixty_five, true),
+        (&sixty_five_with_a_must, false),
+    ] {
         for k in [10usize, 100] {
             let (a, stats, _) = run(&with, query, BoolMode::Or, k);
             let (b, _, _) = run(&without, query, BoolMode::Or, k);
@@ -984,4 +991,133 @@ fn a_table_indexed_by_the_layout_before_tiers_serves_as_before_and_rebuilds() {
         served |= stats.tier_entries > 0 || stats.superfiles_resolved > 0;
     }
     assert!(served, "after the rebuild the tiers serve");
+}
+
+/// Superfiles in the prefix tables.
+const PREFIX_SUPERFILES: usize = 8;
+/// Rows per superfile in the prefix tables.
+const PREFIX_DOCS: usize = 600;
+/// Distinct words sharing the prefix `p`: more than a term mask holds.
+const PREFIX_WORDS: u64 = 150;
+/// Head depth of the prefix tables: the common prefixed word holds more
+/// documents than this in every superfile, so its heads are cut.
+const PREFIX_HEAD_DEPTH: usize = 64;
+
+/// A row of the prefix corpus: one to three of the prefixed words, the
+/// common prefixed word in about half the rows, and a few fixed rows every
+/// superfile holds, so their scores tie across superfiles.
+fn prefix_document(superfile: usize, row: usize) -> String {
+    match row {
+        0 => return "p007".to_owned(),
+        1 => return "p001 p002".to_owned(),
+        2 => return "p001 p002 p003".to_owned(),
+        _ => {}
+    }
+    let mut next = infino::test_helpers::xorshift(
+        ((superfile * PREFIX_DOCS + row) as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    );
+    let mut words: Vec<String> = (0..1 + next() % 3)
+        .map(|_| format!("p{:03}", next() % PREFIX_WORDS))
+        .collect();
+    if next().is_multiple_of(2) {
+        words.push("pcommon".to_owned());
+    }
+    words.extend(std::iter::repeat_n("filler".to_owned(), (next() % 4) as usize));
+    words.join(" ")
+}
+
+fn prefix_table(dir: &TempDir, tiers: bool) -> Supertable {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let mut options = SupertableOptions::new(schema(), vec![FtsConfig::new("body")], vec![])
+        .expect("options")
+        .with_storage(storage)
+        .with_bound_ordered_open_window(1)
+        .with_tier_merge_gate(false)
+        .with_term_head_depth(PREFIX_HEAD_DEPTH);
+    if !tiers {
+        options = options.with_term_tier_entries_per_term(0);
+    }
+    let st = Supertable::create(options).expect("create");
+    let mut w = st.writer().expect("writer");
+    for s in 0..PREFIX_SUPERFILES {
+        let docs: Vec<String> = (0..PREFIX_DOCS).map(|r| prefix_document(s, r)).collect();
+        let col: ArrayRef = Arc::new(LargeStringArray::from(
+            docs.iter().map(String::as_str).collect::<Vec<_>>(),
+        ));
+        w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+    st
+}
+
+/// A prefix search's hits as `(superfile place, row, score)`, superfiles
+/// placed by their `_id` order so two tables of the same commits compare,
+/// and how many superfiles it opened.
+fn prefix_hits(st: &Supertable, prefix: &str, k: usize) -> (Vec<(usize, u32, f32)>, u64) {
+    let reader = st.reader().expect("reader");
+    let mut order: Vec<(i128, infino::supertable::manifest::SuperfileUri)> = reader
+        .manifest()
+        .superfiles
+        .iter()
+        .map(|e| (e.id_min, e.uri))
+        .collect();
+    order.sort();
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_search_prefix("body", prefix, k)
+            .expect("prefix search")
+    });
+    let rows = hits
+        .iter()
+        .map(|h| {
+            let place = order
+                .iter()
+                .position(|(_, u)| *u == h.superfile)
+                .expect("a hit names a listed superfile");
+            (place, h.local_doc_id, h.score)
+        })
+        .collect();
+    (rows, opened(&stats))
+}
+
+/// A prefix that expands past what a term mask holds merges its whole-headed
+/// words as one: it answers id for id and score for score as the table
+/// without tiers does, ties across superfiles and rows holding several of
+/// its words included, and opens fewer superfiles. Deleting the top rows
+/// leaves the rest answered the same.
+#[test]
+fn a_prefix_past_the_mask_answers_as_the_ceilings_do() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = prefix_table(&with_dir, true);
+    let without = prefix_table(&without_dir, false);
+    let compare = |label: &str| {
+        let mut fewer = false;
+        for k in [1usize, 3, 10, 100, 1000] {
+            let (a, opened_with) = prefix_hits(&with, "p", k);
+            let (b, opened_without) = prefix_hits(&without, "p", k);
+            assert!(!b.is_empty(), "{label} k={k}: hits");
+            assert_eq!(a, b, "{label} k={k}: the merge must not change the answer");
+            assert!(
+                opened_with <= opened_without,
+                "{label} k={k}: opened {opened_with}, the ceilings {opened_without}"
+            );
+            fewer |= opened_with < opened_without;
+        }
+        assert!(fewer, "{label}: the merge opened fewer superfiles at some k");
+    };
+    compare("before the delete");
+    let (top, _) = prefix_hits(&without, "p", 10);
+    for &(sf, row, _) in &top {
+        let doomed = prefix_document(sf, row as usize);
+        for st in [&with, &without] {
+            st.delete(col("body").eq(lit(doomed.as_str())))
+                .expect("delete");
+        }
+    }
+    compare("after the delete");
 }

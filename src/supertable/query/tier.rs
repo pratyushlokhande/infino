@@ -350,6 +350,10 @@ pub(crate) struct TierQuery<'a> {
     /// counted, as the kernel weights it — times the smallest member key
     /// of the document, the bound the ceiling path uses.
     pub(crate) phrases: Vec<(Vec<usize>, bool)>,
+    /// Whether every term is a bare optional term: no must, phrase or
+    /// negation. Only such a query may have more terms than a mask holds,
+    /// and `required`, `scoring` and `phrases` are then unused.
+    pub(crate) bare_or: bool,
     /// Whether the query negates terms or phrases: a document the heads
     /// show cannot then be taken as a match, so the merge bounds and
     /// orders but seeds no threshold and answers for nothing.
@@ -547,6 +551,10 @@ struct Slot {
     scale_up: f32,
     /// The average length the superfile's stored keys are computed at.
     key_avgdl: f32,
+    /// Relative widening for sums the kernel may round differently: zero
+    /// unless a folded document adds three or more contributions (see
+    /// [`fold_whole_heads`]).
+    addend_slack: f32,
     /// Rows deleted from the superfile: read past, never candidates.
     deny: Option<Arc<RoaringBitmap>>,
     /// The highest `_id` the superfile holds; `i128::MAX` until known,
@@ -567,6 +575,7 @@ impl Slot {
             ordinal: u32::MAX,
             scale_up,
             key_avgdl: 0.0,
+            addend_slack: 0.0,
             deny,
             id_max: i128::MAX,
         }
@@ -675,6 +684,8 @@ pub(crate) struct PreparedMerge<'a> {
     /// Whether the sums are the kernel's bit for bit, so a superfile whose
     /// heads were read whole can be answered from the index.
     exact_scores: bool,
+    /// Tier bytes read to fold whole heads before the first round.
+    fold_bytes: u64,
     /// Whether every chunked head the merge reads is in memory: the merge
     /// then costs no storage round trip, and is worth running before any
     /// open for the kernels it spares; one that must read from storage
@@ -696,7 +707,7 @@ pub(crate) async fn prepare_merge<'a>(
     let terms = query.terms;
     let nt = terms.len();
     let k = query.k;
-    if nt == 0 || nt > MAX_TIER_TERMS || k == 0 || kept.is_empty() {
+    if nt == 0 || (nt > MAX_TIER_TERMS && !query.bare_or) || k == 0 || kept.is_empty() {
         return Ok(None);
     }
     // The gate: the merge's first round decodes a block per term per
@@ -742,6 +753,53 @@ pub(crate) async fn prepare_merge<'a>(
     }) {
         return Ok(None);
     }
+    // The slot of a superfile the index files under `ordinal`; `None` for
+    // one the query does not keep.
+    let slot_for = |ordinal: u32| {
+        index
+            .superfile_id(ordinal)
+            .and_then(|id| slot_of.get(&id).copied())
+    };
+    // Past what a mask holds, a bare disjunction merges its terms whose
+    // heads are whole in every kept superfile as one: their documents are
+    // in hand once read, and what they contribute is known exactly. The
+    // others stay terms of their own, as many as a mask holds beside the
+    // folded one.
+    let fold = nt > MAX_TIER_TERMS;
+    let whole_everywhere = |runs: &Arc<Vec<SliceRun>>| {
+        runs.iter().all(|r| r.run.tier.is_some())
+            && runs.iter().flat_map(|r| r.run.postings.iter()).all(|p| {
+                slot_for(p.superfile).is_none() || (p.tail.is_finite() && p.tail <= 0.0)
+            })
+    };
+    let light: Vec<bool> = match fold {
+        true => runs_per_term.iter().map(whole_everywhere).collect(),
+        false => vec![false; nt],
+    };
+    let explicit: Vec<usize> = (0..nt).filter(|t| !light[*t]).collect();
+    if fold && explicit.len() >= MAX_TIER_TERMS {
+        return Ok(None);
+    }
+    // The terms the merge tracks: every term, or the explicit ones and the
+    // folded one last, which scores bare at no idf of its own.
+    let (nt, required, scoring, phrases) = match fold {
+        true => {
+            let merged = explicit.len() + 1;
+            let all: TermMask = if merged == 64 { u64::MAX } else { (1u64 << merged) - 1 };
+            (merged, 0, all, Vec::new())
+        }
+        false => (nt, query.required, query.scoring, query.phrases.clone()),
+    };
+    let tracked: Vec<usize> = match fold {
+        true => explicit.clone(),
+        false => (0..nt).collect(),
+    };
+    let merged_runs: Vec<&Arc<Vec<SliceRun>>> = tracked.iter().map(|&t| &runs_per_term[t]).collect();
+    let all_idf = idf;
+    let mut idf: Vec<f32> = tracked.iter().map(|&t| all_idf[t]).collect();
+    if fold {
+        idf.push(0.0);
+    }
     // Every kept superfile scores at the table's average length (its norm
     // table is rebuilt there when it records the average it was built at),
     // so a candidate's contribution is computed exactly as its kernel
@@ -766,19 +824,12 @@ pub(crate) async fn prepare_merge<'a>(
         slot.key_avgdl = baked;
         slots.push(slot);
     }
-    // The slot of a superfile the index files under `ordinal`; `None` for
-    // one the query does not keep.
-    let slot_for = |ordinal: u32| {
-        index
-            .superfile_id(ordinal)
-            .and_then(|id| slot_of.get(&id).copied())
-    };
     let mut sources: Vec<Vec<Source>> = (0..nt).map(|_| Vec::new()).collect();
     let mut inline: Vec<(usize, TierEntry)> = Vec::new();
     // What the first round decodes: the first block of every chunked head,
     // which holds the head's documents up to a block's worth.
     let mut first_round = 0u64;
-    for (ti, runs) in runs_per_term.iter().enumerate() {
+    for (ti, runs) in merged_runs.iter().enumerate() {
         let idf_table = idf[ti];
         for SliceRun {
             tier_object,
@@ -863,19 +914,19 @@ pub(crate) async fn prepare_merge<'a>(
     // sum is the score bit for bit (addition commutes); a longer sum can
     // land an ulp from the kernel's, which adds in its own order, so its
     // bounds take the slack a product of roundings needs.
-    let exact_scores = nt <= EXACT_SUM_TERMS && query.phrases.is_empty() && !query.negated;
-    let atoms = query.scoring.count_ones() as usize + query.phrases.len();
+    let exact_scores = nt <= EXACT_SUM_TERMS && phrases.is_empty() && !query.negated;
+    let atoms = scoring.count_ones() as usize + phrases.len();
     let shape = Shape {
         exact_sums: atoms <= EXACT_SUM_TERMS && !query.negated,
-        required: query.required,
-        scoring: query.scoring,
-        phrases: query.phrases.clone(),
+        required,
+        scoring,
+        phrases: phrases.clone(),
         // A document the heads show matches only if nothing unseen can
         // unmake it: no must-phrase whose adjacency the heads cannot
         // verify, no negated term the heads do not read — and only through
         // a bare term it scores on, since a phrase alone may not match at
         // all.
-        trusted: !query.negated && query.phrases.iter().all(|p| !p.1) && query.scoring != 0,
+        trusted: !query.negated && phrases.iter().all(|p| !p.1) && scoring != 0,
     };
     // A shape whose candidates cannot be trusted yields no threshold: before
     // any open it rules a superfile out only through a required head the
@@ -903,6 +954,78 @@ pub(crate) async fn prepare_merge<'a>(
         slots[si].absorb(*ti, e.doc_id, c, pack_tf_len(e.tf, e.len));
         entries_read += 1;
     }
+    let mut fold_bytes = 0u64;
+    if fold {
+        let light_terms: Vec<usize> = (0..all_idf.len()).filter(|t| light[*t]).collect();
+        // Every document of every folded term in every kept superfile is
+        // decoded: a query whose fold would pass the per-query entry cap
+        // keeps its ceilings.
+        let to_fold: u64 = light_terms
+            .iter()
+            .flat_map(|&t| runs_per_term[t].iter())
+            .flat_map(|r| r.run.postings.iter())
+            .filter(|p| slot_for(p.superfile).is_some())
+            .map(|p| p.df)
+            .sum();
+        if to_fold > MAX_ENTRIES_PER_QUERY {
+            return Ok(None);
+        }
+        let mut folded: Vec<Vec<FoldEntry>> = vec![Vec::new(); slots.len()];
+        let mut fetches = Vec::new();
+        for &t in &light_terms {
+            let weight = all_idf[t];
+            for SliceRun {
+                tier_object,
+                run,
+                base,
+            } in runs_per_term[t].iter()
+            {
+                let Some(tier) = &run.tier else {
+                    continue;
+                };
+                if tier.chunks.is_empty() {
+                    for e in &tier.inline {
+                        if let Some(si) = slot_for(e.superfile) {
+                            folded[si].push(FoldEntry::new(weight, e, &scoring));
+                        }
+                    }
+                    continue;
+                }
+                let Some(object) = tier_object else {
+                    return Ok(None);
+                };
+                fetches.push(async move {
+                    index
+                        .tier_chunks(object, &tier.chunks)
+                        .await
+                        .map(|fetched| (weight, *base, fetched))
+                });
+            }
+        }
+        let mut decoded: Vec<TierEntry> = Vec::new();
+        for (weight, base, (chunks, bytes)) in try_join_all(fetches).await? {
+            fold_bytes += bytes;
+            for chunk in &chunks {
+                for (block, body) in chunk.bodies.iter().enumerate() {
+                    if chunk.dir.decode_block(block, body, &mut decoded).is_err() {
+                        return Ok(None);
+                    }
+                    for e in &decoded {
+                        // Chunks store ordinals relative to their layer's base.
+                        let ordinal = e.superfile.checked_add(base);
+                        if let Some(si) = ordinal.and_then(slot_for) {
+                            folded[si].push(FoldEntry::new(weight, e, &scoring));
+                        }
+                    }
+                }
+            }
+        }
+        let rest = nt - 1;
+        for (slot, entries) in slots.iter_mut().zip(folded) {
+            entries_read += entries.len() as u64;
+            fold_whole_heads(slot, rest, explicit.len(), entries);
+        }
+    }
     let mut merge = Merge {
         slots,
         scoring,
@@ -927,6 +1050,11 @@ pub(crate) async fn prepare_merge<'a>(
             );
         }
     }
+    // A folded query may have no head left to read in rounds: its
+    // threshold comes from the documents in hand.
+    if fold {
+        merge.settle();
+    }
 
     let mut resident = true;
     for source in sources.iter().flatten() {
@@ -941,11 +1069,12 @@ pub(crate) async fn prepare_merge<'a>(
         pool,
         merge,
         sources,
-        required: query.required,
+        required,
         merge_gate: query.merge_gate,
         budget: Arc::clone(&query.budget),
         open_cost_ns: query.open_cost_ns,
         exact_scores,
+        fold_bytes,
         resident,
     }))
 }
@@ -996,6 +1125,7 @@ impl PreparedMerge<'_> {
             open_cost_ns,
             budget,
             exact_scores,
+            fold_bytes,
             ..
         } = self;
         // A round merges the next block of every live head. The blocks of one
@@ -1016,7 +1146,7 @@ impl PreparedMerge<'_> {
         // is by default, the measured costs decide its depth, forced or not.
         let open_cost_ns = if merge_gate { open_cost_ns } else { 0 };
         let whole_first: Vec<bool> = sources.iter().map(|s| read_whole_first(s)).collect();
-        let mut tier_bytes = 0u64;
+        let mut tier_bytes = fold_bytes;
         let mut merge_ns = 0u64;
         let mut merge = merge;
         let mut sources = sources;
@@ -1263,7 +1393,9 @@ impl PreparedMerge<'_> {
                 // matching documents are its candidates carrying the required
                 // terms, scored as the kernel would score them. One the merge
                 // ruled out holds none that place.
-                let whole = slot.live && slot.heads.iter().all(|h| h.done && h.tail <= 0.0);
+                let whole = slot.live
+                    && slot.addend_slack == 0.0
+                    && slot.heads.iter().all(|h| h.done && h.tail <= 0.0);
                 if whole {
                     let mut docs: Vec<(u32, f32)> = Vec::new();
                     let mut scratch = Scratch::default();
@@ -1345,6 +1477,14 @@ impl Merge {
             })
             .sum();
         self.entries_read += entries;
+        self.settle()
+    }
+
+    /// Raise the threshold to the k-th best candidate across every
+    /// superfile read, and rule out the superfiles whose bound falls below
+    /// it. Returns how many it ruled out.
+    fn settle(&mut self) -> usize {
+        let k = self.k;
         // Threshold: the k-th best sum over documents the query returns,
         // across every superfile read, in play or not. Each superfile's
         // top candidates are sorted, so a k-way walk finds it in k steps.
@@ -1529,6 +1669,7 @@ impl Slot {
             }
         }
         let heads = &self.heads;
+        let addend_slack = self.addend_slack;
         // Zero where the superfile's key average is unknown: its tails then
         // bound by their scaled keys alone.
         let avgdl = self.key_avgdl;
@@ -1620,9 +1761,9 @@ impl Slot {
                     }
                 }
             }
-            match exact {
+            match exact && addend_slack == 0.0 {
                 true => ub,
-                false => ub * ub_slack,
+                false => ub * ub_slack * (1.0 + addend_slack),
             }
         };
         scratch.zero.clear();
@@ -1657,8 +1798,8 @@ impl Slot {
             ub = ub.max(doc_ub(mask, contrib, tf_len));
             if shape.trusted && mask & shape.required == shape.required {
                 let bare = bare_sum(contrib, shape.scoring);
-                lb = lb.max(bare);
-                candidates.push(bare * lb_slack);
+                lb = lb.max(bare * (1.0 - addend_slack));
+                candidates.push(bare * lb_slack * (1.0 - addend_slack));
             }
         });
         self.top.clear();
@@ -1729,6 +1870,59 @@ fn phrase_atom_bound(
         score_with_dl_norm_k1(idf_sum, tf, norm),
         norm >= PHRASE_EXACT_MIN_NORM,
     ))
+}
+
+/// One document of a folded term in one superfile: its row, the term's
+/// contribution, frequency and length bucket.
+#[derive(Clone, Copy)]
+struct FoldEntry {
+    row: u32,
+    contribution: f32,
+    tf: u32,
+    len: u8,
+}
+
+impl FoldEntry {
+    fn new(idf: f32, e: &TierEntry, scoring: &Scoring) -> Self {
+        Self {
+            row: e.doc_id,
+            contribution: score_with_dl_norm_k1(idf, e.tf, scoring.norm[usize::from(e.len)]),
+            tf: e.tf,
+            len: e.len,
+        }
+    }
+}
+
+/// Take a superfile's folded entries into its head `rest` as one term:
+/// a document under several folded terms holds their contributions summed
+/// and their frequencies added, which are distinct tokens of it. A sum the
+/// kernel may round otherwise, past two addends with the `explicit` terms
+/// counted, widens the superfile's bounds and keeps it from being answered
+/// from the index.
+fn fold_whole_heads(slot: &mut Slot, rest: usize, explicit: usize, mut entries: Vec<FoldEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_unstable_by_key(|e| e.row);
+    let mut most_addends = 1usize;
+    let mut at = 0;
+    while at < entries.len() {
+        let first = entries[at];
+        let (mut contribution, mut tf, mut addends) = (first.contribution, first.tf, 1usize);
+        at += 1;
+        while at < entries.len() && entries[at].row == first.row {
+            contribution += entries[at].contribution;
+            tf = tf.saturating_add(entries[at].tf);
+            addends += 1;
+            at += 1;
+        }
+        most_addends = most_addends.max(addends);
+        slot.absorb(rest, first.row, contribution, pack_tf_len(tf, first.len));
+    }
+    let addends = most_addends + explicit;
+    if most_addends > 1 && addends > EXACT_SUM_TERMS {
+        slot.addend_slack = (8 + addends) as f32 * f32::EPSILON;
+    }
 }
 
 /// The longest a document whose length is quantized to bucket `len` can
