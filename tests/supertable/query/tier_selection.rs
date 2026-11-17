@@ -308,9 +308,9 @@ fn rows_of(st: &Supertable, sql: &str) -> Vec<(String, u32)> {
     out
 }
 
-/// A `WHERE` the index bounds admits only some rows, and the tiers' bounds
-/// and threshold are over every row: a scoped search answers as the table
-/// without tiers does, with every admitted hit.
+/// A `WHERE` the index bounds admits only some rows: the merge reads past
+/// the others, so a scoped search answers as the table without tiers does,
+/// with every admitted hit.
 #[test]
 fn a_scoped_search_answers_as_its_twin_does() {
     let (with, without) = (TempDir::new().expect("dir"), TempDir::new().expect("dir"));
@@ -1027,6 +1027,17 @@ fn prefix_document(superfile: usize, row: usize) -> String {
 }
 
 fn prefix_table(dir: &TempDir, tiers: bool) -> Supertable {
+    corpus_table(dir, tiers, PREFIX_HEAD_DEPTH, prefix_document)
+}
+
+/// A table of [`PREFIX_SUPERFILES`] commits of `document`'s rows, its heads
+/// cut at `head_depth`, with or without tiers.
+fn corpus_table(
+    dir: &TempDir,
+    tiers: bool,
+    head_depth: usize,
+    document: fn(usize, usize) -> String,
+) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let mut options = SupertableOptions::new(schema(), vec![FtsConfig::new("body")], vec![])
@@ -1034,14 +1045,14 @@ fn prefix_table(dir: &TempDir, tiers: bool) -> Supertable {
         .with_storage(storage)
         .with_bound_ordered_open_window(1)
         .with_tier_merge_gate(false)
-        .with_term_head_depth(PREFIX_HEAD_DEPTH);
+        .with_term_head_depth(head_depth);
     if !tiers {
         options = options.with_term_tier_entries_per_term(0);
     }
     let st = Supertable::create(options).expect("create");
     let mut w = st.writer().expect("writer");
     for s in 0..PREFIX_SUPERFILES {
-        let docs: Vec<String> = (0..PREFIX_DOCS).map(|r| prefix_document(s, r)).collect();
+        let docs: Vec<String> = (0..PREFIX_DOCS).map(|r| document(s, r)).collect();
         let col: ArrayRef = Arc::new(LargeStringArray::from(
             docs.iter().map(String::as_str).collect::<Vec<_>>(),
         ));
@@ -1120,4 +1131,56 @@ fn a_prefix_past_the_mask_answers_as_the_ceilings_do() {
         }
     }
     compare("after the delete");
+}
+
+/// Common words sharing the prefix `q`, each in more rows of every
+/// superfile than [`COMMON_HEAD_DEPTH`]: more than a term mask holds.
+const COMMON_WORDS: u64 = 80;
+/// Head depth of the common-word table.
+const COMMON_HEAD_DEPTH: usize = 8;
+
+/// The commonest `q` words, past the rarer ones a term mask holds.
+const COMMONEST_WORDS: u64 = 17;
+/// Filler tokens in each long row of the common-word corpus.
+const LONG_ROW_FILLER: usize = 19;
+
+/// A row of the common-word corpus. The last superfile holds one of the
+/// commonest words alone in every row: short rows that place in a small
+/// top k, kept in play only by the bound on the words the mask leaves
+/// out. The others hold long rows of one common word, and a rare word in
+/// one row in a hundred.
+fn common_document(superfile: usize, row: usize) -> String {
+    let mut next = infino::test_helpers::xorshift(
+        ((superfile * PREFIX_DOCS + row) as u64 + 7).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    );
+    if superfile == PREFIX_SUPERFILES - 1 {
+        return format!("qc{:02}", next() % COMMONEST_WORDS);
+    }
+    let mut words = vec![format!("qc{:02}", next() % COMMON_WORDS)];
+    if next().is_multiple_of(100) {
+        words.push(format!("q{}", next() % 400));
+    }
+    words.extend(std::iter::repeat_n("filler".to_owned(), LONG_ROW_FILLER));
+    words.join(" ")
+}
+
+/// A prefix whose common words, their heads cut everywhere, outnumber what
+/// a term mask holds: the rarest stay terms of their own, the rest are
+/// bounded together, and the answer is the table's without tiers.
+#[test]
+fn a_prefix_of_more_common_words_than_the_mask_answers_as_the_ceilings_do() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = corpus_table(&with_dir, true, COMMON_HEAD_DEPTH, common_document);
+    let without = corpus_table(&without_dir, false, COMMON_HEAD_DEPTH, common_document);
+    for k in [1usize, 3, 10, 100, 1000] {
+        let (a, opened_with) = prefix_hits(&with, "q", k);
+        let (b, opened_without) = prefix_hits(&without, "q", k);
+        assert!(!b.is_empty(), "k={k}: hits");
+        assert_eq!(a, b, "k={k}: the merge must not change the answer");
+        assert!(
+            opened_with <= opened_without,
+            "k={k}: opened {opened_with}, the ceilings {opened_without}"
+        );
+    }
 }

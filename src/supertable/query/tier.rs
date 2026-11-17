@@ -78,7 +78,7 @@ use crate::{
         fts::{
             bm25::{
                 Bm25Params, ORDERED_SUM_ATOMS, PHRASE_EXACT_MIN_NORM, PHRASE_TF_EXACT_MAX,
-                dequantize_len, score_at_most, score_with_dl_norm_k1, sum_at_least, sum_at_most,
+                dequantize_len, MONOTONE_SLACK, score_at_most, score_with_dl_norm_k1, sum_at_least, sum_at_most,
                 tf_factor,
             },
             reader::{GlobalTermIdf, norm_table},
@@ -364,6 +364,10 @@ pub(crate) struct TierQuery<'a> {
     /// any: a deleted document is in the tiers but not in the table, so
     /// the merge reads past it as a kernel's tombstone filter drops it.
     pub(crate) deny: Vec<Option<Arc<RoaringBitmap>>>,
+    /// Per kept superfile, the rows a scoped search admits, when it admits
+    /// fewer than all: the merge reads past the others, so its threshold
+    /// and answers are over the admitted rows, as the kernels' are.
+    pub(crate) allow: Vec<Option<Arc<RoaringBitmap>>>,
     /// The average length every kept superfile scores at.
     pub(crate) table_avgdl: f32,
     /// The column's declared parameters, which every kept superfile scores
@@ -556,8 +560,14 @@ struct Slot {
     /// unless a folded document adds three or more contributions (see
     /// [`fold_whole_heads`]).
     addend_slack: f32,
+    /// The query's terms the merge neither tracks nor folds that have
+    /// postings here, bounded together.
+    residual: Residual,
     /// Rows deleted from the superfile: read past, never candidates.
     deny: Option<Arc<RoaringBitmap>>,
+    /// Rows outside a scoped search: read past, never candidates. `None`
+    /// admits every row.
+    allow: Option<Arc<RoaringBitmap>>,
     /// The highest `_id` the superfile holds; `i128::MAX` until known,
     /// which never lets a threshold it sets justify a skip.
     id_max: i128,
@@ -577,7 +587,9 @@ impl Slot {
             scale_up,
             key_avgdl: 0.0,
             addend_slack: 0.0,
+            residual: Residual::default(),
             deny,
+            allow: None,
             id_max: i128::MAX,
         }
     }
@@ -777,9 +789,15 @@ pub(crate) async fn prepare_merge<'a>(
         true => runs_per_term.iter().map(whole_everywhere).collect(),
         false => vec![false; nt],
     };
-    let explicit: Vec<usize> = (0..nt).filter(|t| !light[*t]).collect();
+    // Past what a mask holds beside the folded term, the rarest terms stay
+    // explicit and the rest are bounded together: a term's weight caps what
+    // any of its occurrences adds, so the common ones cost least to bound.
+    let mut explicit: Vec<usize> = (0..nt).filter(|t| !light[*t]).collect();
+    let mut residual_terms: Vec<usize> = Vec::new();
     if fold && explicit.len() >= MAX_TIER_TERMS {
-        return Ok(None);
+        explicit.sort_by(|a, b| idf[*b].total_cmp(&idf[*a]).then(a.cmp(b)));
+        residual_terms = explicit.split_off(MAX_TIER_TERMS - 1);
+        explicit.sort_unstable();
     }
     // The terms the merge tracks: every term, or the explicit ones and the
     // folded one last, which scores bare at no idf of its own.
@@ -821,6 +839,7 @@ pub(crate) async fn prepare_merge<'a>(
             1.0
         };
         let mut slot = Slot::new(nt, scale_up, query.deny.get(slots.len()).cloned().flatten());
+        slot.allow = query.allow.get(slots.len()).cloned().flatten();
         slot.id_max = e.id_max;
         slot.key_avgdl = baked;
         slots.push(slot);
@@ -960,19 +979,37 @@ pub(crate) async fn prepare_merge<'a>(
     }
     let mut fold_bytes = 0u64;
     if fold {
-        let light_terms: Vec<usize> = (0..all_idf.len()).filter(|t| light[*t]).collect();
         // Every document of every folded term in every kept superfile is
-        // decoded: a query whose fold would pass the per-query entry cap
-        // keeps its ceilings.
-        let to_fold: u64 = light_terms
-            .iter()
-            .flat_map(|&t| runs_per_term[t].iter())
-            .flat_map(|r| r.run.postings.iter())
-            .filter(|p| slot_for(p.superfile).is_some())
-            .map(|p| p.df)
-            .sum();
-        if to_fold > MAX_ENTRIES_PER_QUERY {
-            return Ok(None);
+        // decoded: the rarest fold up to the per-query entry cap, and the
+        // rest are bounded with the terms left out of the mask.
+        let mut light_terms: Vec<usize> = (0..all_idf.len()).filter(|t| light[*t]).collect();
+        light_terms.sort_by(|a, b| all_idf[*b].total_cmp(&all_idf[*a]).then(a.cmp(b)));
+        let mut to_fold = 0u64;
+        let mut folding = 0usize;
+        for &t in &light_terms {
+            let df: u64 = runs_per_term[t]
+                .iter()
+                .flat_map(|r| r.run.postings.iter())
+                .filter(|p| slot_for(p.superfile).is_some())
+                .map(|p| p.df)
+                .sum();
+            if to_fold + df > MAX_ENTRIES_PER_QUERY {
+                break;
+            }
+            to_fold += df;
+            folding += 1;
+        }
+        residual_terms.extend(light_terms.split_off(folding));
+        for &t in &residual_terms {
+            let weight = all_idf[t];
+            for p in runs_per_term[t].iter().flat_map(|r| r.run.postings.iter()) {
+                if let Some(si) = slot_for(p.superfile) {
+                    let slot = &mut slots[si];
+                    let ceiling = p.bound * weight * slot.scale_up * BOUND_SLACK;
+                    slot.residual.add(weight, ceiling);
+                    slot.touched = true;
+                }
+            }
         }
         let mut folded: Vec<Vec<FoldEntry>> = vec![Vec::new(); slots.len()];
         let mut fetches = Vec::new();
@@ -1399,6 +1436,7 @@ impl PreparedMerge<'_> {
                 // ruled out holds none that place.
                 let whole = slot.live
                     && slot.addend_slack == 0.0
+                    && slot.residual.is_empty()
                     && slot.heads.iter().all(|h| h.done && h.tail <= 0.0);
                 if whole {
                     let mut docs: Vec<(u32, f32)> = Vec::new();
@@ -1579,7 +1617,9 @@ impl Slot {
     /// refresh merges it into the term's documents.
     fn absorb(&mut self, ti: usize, row: u32, c: f32, tf_len: u32) {
         self.heads[ti].seen = true;
-        if self.deny.as_ref().is_some_and(|d| d.contains(row)) {
+        if self.deny.as_ref().is_some_and(|d| d.contains(row))
+            || self.allow.as_ref().is_some_and(|a| !a.contains(row))
+        {
             return;
         }
         self.heads[ti].pending.push((row, c, tf_len));
@@ -1674,6 +1714,7 @@ impl Slot {
         }
         let heads = &self.heads;
         let addend_slack = self.addend_slack;
+        let residual = &self.residual;
         // Zero where the superfile's key average is unknown: its tails then
         // bound by their scaled keys alone.
         let avgdl = self.key_avgdl;
@@ -1765,10 +1806,25 @@ impl Slot {
                     }
                 }
             }
-            match exact && addend_slack == 0.0 {
-                true => atoms.at_most(),
-                false => atoms.sum * ub_slack * (1.0 + addend_slack),
+            if residual.is_empty() {
+                return match exact && addend_slack == 0.0 {
+                    true => atoms.at_most(),
+                    false => atoms.sum * ub_slack * (1.0 + addend_slack),
+                };
             }
+            // The terms left out add at most what the length leaves room
+            // for, each occurrence a rounding more in the kernel's sum.
+            let (extra, adds) = match fit {
+                Some((len, left)) => (
+                    residual.bound(left, norm[usize::from(len)]),
+                    left.min(residual.terms),
+                ),
+                None => (residual.ceiling_sum, residual.terms),
+            };
+            (atoms.sum + extra)
+                * ub_slack
+                * (1.0 + addend_slack)
+                * (1.0 + adds as f32 * f32::EPSILON)
         };
         scratch.zero.clear();
         scratch.zero.resize(nt, 0.0);
@@ -1783,7 +1839,9 @@ impl Slot {
                 true => {
                     let mut tfs = Vec::with_capacity(nt);
                     let by_length = (0..=u8::MAX)
-                        .map(|len| unseen_bound_at(heads, shape, scoring, avgdl, len, &mut tfs))
+                        .map(|len| {
+                            unseen_bound_at(heads, residual, shape, scoring, avgdl, len, &mut tfs)
+                        })
                         .fold(f32::NEG_INFINITY, f32::max);
                     by_tails.min(by_length)
                 }
@@ -1987,6 +2045,7 @@ const MAX_SPLIT_BUDGET: u32 = 64;
 /// is split greedily.
 fn unseen_bound_at(
     heads: &[HeadState],
+    residual: &Residual,
     shape: &Shape,
     scoring: &Scoring,
     avgdl: f32,
@@ -2005,8 +2064,13 @@ fn unseen_bound_at(
     let scoring_terms = || (0..heads.len()).filter(|t| shape.scoring & (1 << t) != 0);
     let budget_used: u64 = scoring_terms().map(|t| u64::from(tfs[t])).sum();
     let mut atoms = OrderedAtoms::default();
+    let gain = residual.token_gain(norm);
+    // Occurrences given to the terms left out of the mask.
+    let mut left_out = 0u32;
     let split = match max_len {
-        Some(m) if budget_used > u64::from(m) && m <= MAX_SPLIT_BUDGET => {
+        Some(m)
+            if (budget_used > u64::from(m) || !residual.is_empty()) && m <= MAX_SPLIT_BUDGET =>
+        {
             // Spend the length one occurrence at a time where it adds the
             // most: optimal for scores concave in the frequency, up to the
             // roundings the widening covers.
@@ -2021,8 +2085,19 @@ fn unseen_bound_at(
                         (t, gain)
                     })
                     .max_by(|a, b| a.1.total_cmp(&b.1));
-                let Some((t, _)) = best else { break };
-                given[t] += 1;
+                // The left-out terms gain at most one first occurrence per
+                // token, until their ceilings are spent.
+                let spent = left_out as f32 * gain;
+                let left_out_gain = match residual.is_empty() || spent >= residual.ceiling_sum {
+                    true => None,
+                    false => Some(gain.min(residual.ceiling_sum - spent)),
+                };
+                match (best, left_out_gain) {
+                    (Some((t, g)), Some(r)) if g >= r => given[t] += 1,
+                    (_, Some(_)) => left_out += 1,
+                    (Some((t, _)), None) => given[t] += 1,
+                    (None, None) => break,
+                }
             }
             for t in scoring_terms() {
                 atoms.push(score_at_most(scoring.idf[t], given[t], norm));
@@ -2048,10 +2123,63 @@ fn unseen_bound_at(
         let idf_sum: f32 = members.iter().map(|&t| scoring.idf[t]).sum();
         atoms.push(score_at_most(idf_sum, tf, norm));
     }
+    if !residual.is_empty() {
+        let room = match split {
+            true => left_out,
+            false => max_len.unwrap_or(u32::MAX),
+        };
+        let adds = room.min(residual.terms) as usize;
+        let sum = atoms.sum + residual.bound(room, norm);
+        return sum * (1.0 + (8 + atoms.count + adds) as f32 * f32::EPSILON);
+    }
     // A split is optimal only up to the roundings of its gains.
     match split {
         true => atoms.sum * (1.0 + (8 + atoms.count) as f32 * f32::EPSILON),
         false => atoms.at_most(),
+    }
+}
+
+/// A superfile's share of the terms a merge neither tracks nor folds: past
+/// what its mask holds, a disjunction bounds them together.
+#[derive(Clone, Copy, Default)]
+struct Residual {
+    /// The highest weight among them.
+    idf_max: f32,
+    /// Their ceilings here, summed and rounded up.
+    ceiling_sum: f32,
+    /// How many of them have postings here.
+    terms: u32,
+}
+
+impl Residual {
+    fn add(&mut self, idf: f32, ceiling: f32) {
+        self.idf_max = self.idf_max.max(idf);
+        self.ceiling_sum = (f64::from(self.ceiling_sum) + f64::from(ceiling)) as f32;
+        self.ceiling_sum = self.ceiling_sum.next_up();
+        self.terms += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.terms == 0
+    }
+
+    /// The most one occurrence of any of them adds at length norm `norm`:
+    /// a term's score is concave in its frequency and zero at none, so no
+    /// occurrence adds more than its first.
+    fn token_gain(&self, norm: f32) -> f32 {
+        match self.is_empty() {
+            true => 0.0,
+            false => score_with_dl_norm_k1(self.idf_max, 1, norm) * MONOTONE_SLACK,
+        }
+    }
+
+    /// The most they add to a document of length norm `norm` with `room`
+    /// occurrences left for them.
+    fn bound(&self, room: u32, norm: f32) -> f32 {
+        match self.is_empty() {
+            true => 0.0,
+            false => (room as f32 * self.token_gain(norm)).min(self.ceiling_sum),
+        }
     }
 }
 
@@ -2809,6 +2937,30 @@ mod tests {
         slot.heads[0].done = true;
         slot.refresh(&shape, &flat(&[1.0]), 2, 1.0, 1.0, &mut Scratch::default());
         assert_eq!(slot.top, vec![0.6], "row 4 is deleted");
+        assert!((slot.ub - 0.6).abs() < 1e-6);
+    }
+
+    /// A row outside a scoped search's set is read past: it is neither a
+    /// candidate nor a bound, so the threshold is over the admitted rows.
+    #[test]
+    fn a_row_outside_the_scope_is_read_past() {
+        let shape = Shape {
+            required: 0,
+            scoring: 0b1,
+            phrases: Vec::new(),
+            trusted: true,
+            exact_sums: false,
+        };
+        let mut slot = Slot::new(1, 1.0, None);
+        slot.allow = Some(Arc::new([2u32, 7].into_iter().collect()));
+        for (doc, c) in [(4u32, 0.8f32), (2, 0.6), (7, 0.5)] {
+            slot.absorb(0, doc, c, UNREAD_TF_LEN);
+        }
+        slot.heads[0].tail = 0.0;
+        slot.heads[0].ceiling = 0.8;
+        slot.heads[0].done = true;
+        slot.refresh(&shape, &flat(&[1.0]), 2, 1.0, 1.0, &mut Scratch::default());
+        assert_eq!(slot.top, vec![0.6, 0.5], "row 4 is outside the scope");
         assert!((slot.ub - 0.6).abs() < 1e-6);
     }
 

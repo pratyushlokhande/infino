@@ -1347,13 +1347,16 @@ impl SupertableReader {
             .tombstone_cache
             .as_ref()
             .is_some_and(|c| kept.iter().any(|e| c.may_have_tombstones(e.superfile_id)));
-        // A scope that admits only some rows of a superfile is one the
-        // index cannot see, and the merge's threshold is the k-th score
-        // over every row: seeding the floor with it, or ruling a superfile
-        // out under it, would prune the admitted rows that score below it.
-        // Such a search keeps its ceilings; a scope that only chooses
-        // superfiles leaves the merge sound, since it works over the kept
-        // set.
+        // A scope that admits only some rows of a superfile hands the merge
+        // its sets: the merge reads past the rows outside them, so its
+        // threshold is the k-th score over the admitted rows alone, and its
+        // bounds, over every row, hold for any of them. A scope whose sets
+        // admit every row of every kept superfile gates nothing and is
+        // dropped.
+        let per_row_scope: Option<Arc<HashMap<SuperfileUri, Arc<RoaringBitmap>>>> = scope
+            .filter(|s| s.bounds_rows(&kept))
+            .and_then(|s| s.allow.clone())
+            .map(Arc::new);
         // A table of one superfile has nothing for a merge to rule out or
         // order, and its kernel seeds its own floor from its own blocks; the
         // merge would only cost its reads and rounds on every query, and the
@@ -1368,7 +1371,6 @@ impl SupertableReader {
             && negative_phrases.is_empty();
         let tiers_serve = index_column.is_some()
             && kept.len() > 1
-            && scope.is_none_or(|s| !s.bounds_rows(&kept))
             && (all_terms.len() <= tier::MAX_TIER_TERMS || bare_or)
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
@@ -1518,6 +1520,18 @@ impl SupertableReader {
                     negated: !negatives.is_empty() || !negative_phrases.is_empty(),
                     k,
                     deny,
+                    // A kept superfile the scope lists no set for admits no
+                    // row, as its unit treats it.
+                    allow: kept
+                        .iter()
+                        .map(|e| {
+                            per_row_scope.as_ref().map(|rows| {
+                                rows.get(&e.uri)
+                                    .cloned()
+                                    .unwrap_or_else(|| Arc::new(RoaringBitmap::new()))
+                            })
+                        })
+                        .collect(),
                     table_avgdl,
                     params,
                     open_cost_ns: self.open_cost_ns(),
@@ -1583,13 +1597,7 @@ impl SupertableReader {
         // Phrase-bearing queries stay per-superfile: the ranged
         // kernel is the pure term-union fast path. So does a search
         // with a per-row scope — the ranged union kernel carries no
-        // admission gate, only the clause kernels do. A scope whose
-        // candidate sets admit every row of every kept superfile gates
-        // nothing, so it is dropped here and the fast path stays open.
-        let per_row_scope: Option<Arc<HashMap<SuperfileUri, Arc<RoaringBitmap>>>> = scope
-            .filter(|s| s.bounds_rows(&kept))
-            .and_then(|s| s.allow.clone())
-            .map(Arc::new);
+        // admission gate, only the clause kernels do.
         // An exact count walks each superfile whole: the ranged union
         // kernel prunes and does not count. A superfile with deleted rows
         // is walked by the clause kernels, which admit only its live rows;
