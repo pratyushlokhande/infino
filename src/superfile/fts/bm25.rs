@@ -271,6 +271,42 @@ pub(crate) fn score_at_most(idf: f32, tf: u32, norm: f32) -> f32 {
     }
 }
 
+/// Additions up to which a sum of atoms has only three possible
+/// roundings: every f32 sum of three non-negative atoms, in any order and
+/// through any lane reduction, is one of their three pairings.
+pub(crate) const ORDERED_SUM_ATOMS: usize = 3;
+
+/// The most the kernel's f32 sum of the non-negative `atoms` can round to,
+/// in whatever order it adds them: the sum for two or fewer, the largest
+/// pairing for three, and past that the sum widened by a rounding per
+/// addition.
+pub(crate) fn sum_at_most(atoms: &[f32]) -> f32 {
+    match *atoms {
+        [] => 0.0,
+        [a] => a,
+        [a, b] => a + b,
+        [a, b, c] => ((a + b) + c).max((a + c) + b).max((b + c) + a),
+        _ => atoms.iter().sum::<f32>() * (1.0 + sum_slack(atoms.len())),
+    }
+}
+
+/// The least the kernel's f32 sum of the non-negative `atoms` can round
+/// to; the counterpart of [`sum_at_most`].
+pub(crate) fn sum_at_least(atoms: &[f32]) -> f32 {
+    match *atoms {
+        [] => 0.0,
+        [a] => a,
+        [a, b] => a + b,
+        [a, b, c] => ((a + b) + c).min((a + c) + b).min((b + c) + a),
+        _ => atoms.iter().sum::<f32>() * (1.0 - sum_slack(atoms.len())),
+    }
+}
+
+/// Relative error bound of an f32 sum of `n` non-negative terms in any order.
+fn sum_slack(n: usize) -> f32 {
+    (8 + n) as f32 * f32::EPSILON
+}
+
 /// BM25 score using a precomputed `dl_norm_k1 = K1 * (1 - B + B * dl/avgdl)`
 /// and `idf_weight = idf` (folding in any query-term-frequency weight).
 ///

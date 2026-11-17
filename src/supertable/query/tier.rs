@@ -77,8 +77,9 @@ use crate::{
         format::fts::DOC_LENGTH_STORED_MAX,
         fts::{
             bm25::{
-                Bm25Params, PHRASE_EXACT_MIN_NORM, PHRASE_TF_EXACT_MAX, dequantize_len,
-                score_at_most, score_with_dl_norm_k1, tf_factor,
+                Bm25Params, ORDERED_SUM_ATOMS, PHRASE_EXACT_MIN_NORM, PHRASE_TF_EXACT_MAX,
+                dequantize_len, score_at_most, score_with_dl_norm_k1, sum_at_least, sum_at_most,
+                tf_factor,
             },
             reader::{GlobalTermIdf, norm_table},
         },
@@ -518,10 +519,10 @@ struct Shape {
     scoring: TermMask,
     phrases: Vec<(Vec<usize>, bool)>,
     trusted: bool,
-    /// Whether a document's score is a sum of at most two atoms — bare
-    /// terms and phrases, each scored as the kernel scores it — with
-    /// nothing negated: such a sum is the kernel's bit for bit, since two
-    /// additions commute, and its bound needs no slack.
+    /// Whether a document's score is a sum of at most three atoms (bare
+    /// terms and phrases, each scored as the kernel scores it) with nothing
+    /// negated: its bound is then the most the kernel's sum can round to
+    /// ([`sum_at_most`]), with no slack.
     exact_sums: bool,
 }
 
@@ -917,7 +918,7 @@ pub(crate) async fn prepare_merge<'a>(
     let exact_scores = nt <= EXACT_SUM_TERMS && phrases.is_empty() && !query.negated;
     let atoms = scoring.count_ones() as usize + phrases.len();
     let shape = Shape {
-        exact_sums: atoms <= EXACT_SUM_TERMS && !query.negated,
+        exact_sums: atoms <= ORDERED_SUM_ATOMS && !query.negated,
         required,
         scoring,
         phrases: phrases.clone(),
@@ -940,8 +941,11 @@ pub(crate) async fn prepare_merge<'a>(
     // when the kernel may add it in another order, by a rounding per
     // addition — the upper bound per document, as [`Shape::exact_sums`]
     // and the phrases it scores decide.
+    // Up to three bare terms, a candidate's sum is the least the kernel's
+    // can round to ([`sum_at_least`]) and needs no lower slack.
+    let exact_lbs = nt <= ORDERED_SUM_ATOMS && phrases.is_empty() && !query.negated;
     let slack = (8 + nt) as f32 * f32::EPSILON;
-    let lb_slack = if exact_scores { 1.0 } else { 1.0 - slack };
+    let lb_slack = if exact_lbs { 1.0 } else { 1.0 - slack };
     let ub_slack = 1.0 + slack;
     let scoring = Scoring::new(idf, query.params, query.table_avgdl);
     // Inline heads are whole: their entries are in hand before any read.
@@ -1706,12 +1710,12 @@ impl Slot {
         // phrase bounded by its members' keys rather than scored as the
         // kernel scores it.
         let doc_ub = |mask: TermMask, c: &[f32], tf_len: &[u32]| -> f32 {
-            let mut ub = 0.0f32;
+            let mut atoms = OrderedAtoms::default();
             let mut exact = shape.exact_sums;
             let fit = room(mask, tf_len);
             for (t, h) in heads.iter().enumerate() {
                 if shape.scoring & (1 << t) != 0 {
-                    ub += if mask & (1 << t) != 0 {
+                    atoms.push(if mask & (1 << t) != 0 {
                         c[t]
                     } else if let Some((len, left)) = fit {
                         // At most the occurrences the tail's key and the
@@ -1722,7 +1726,7 @@ impl Slot {
                             .min(score_at_most(idf[t], tf, norm[usize::from(len)]))
                     } else {
                         h.tail
-                    };
+                    });
                 }
             }
             for (members, _) in &shape.phrases {
@@ -1753,17 +1757,17 @@ impl Slot {
                 match phrase_atom_bound(members, mask, tf_len, idf, norm) {
                     Some((score, exact_score)) if score <= by_keys * ub_slack => {
                         exact &= exact_score;
-                        ub += score;
+                        atoms.push(score);
                     }
                     _ => {
                         exact = false;
-                        ub += by_keys;
+                        atoms.push(by_keys);
                     }
                 }
             }
             match exact && addend_slack == 0.0 {
-                true => ub,
-                false => ub * ub_slack * (1.0 + addend_slack),
+                true => atoms.at_most(),
+                false => atoms.sum * ub_slack * (1.0 + addend_slack),
             }
         };
         scratch.zero.clear();
@@ -2000,7 +2004,8 @@ fn unseen_bound_at(
     );
     let scoring_terms = || (0..heads.len()).filter(|t| shape.scoring & (1 << t) != 0);
     let budget_used: u64 = scoring_terms().map(|t| u64::from(tfs[t])).sum();
-    let mut ub = match max_len {
+    let mut atoms = OrderedAtoms::default();
+    let split = match max_len {
         Some(m) if budget_used > u64::from(m) && m <= MAX_SPLIT_BUDGET => {
             // Spend the length one occurrence at a time where it adds the
             // most: optimal for scores concave in the frequency, up to the
@@ -2019,14 +2024,17 @@ fn unseen_bound_at(
                 let Some((t, _)) = best else { break };
                 given[t] += 1;
             }
-            let sum: f32 = scoring_terms()
-                .map(|t| score_at_most(scoring.idf[t], given[t], norm))
-                .sum();
-            sum * (1.0 + (8 + heads.len()) as f32 * f32::EPSILON)
+            for t in scoring_terms() {
+                atoms.push(score_at_most(scoring.idf[t], given[t], norm));
+            }
+            true
         }
-        _ => scoring_terms()
-            .map(|t| score_at_most(scoring.idf[t], tfs[t], norm))
-            .sum(),
+        _ => {
+            for t in scoring_terms() {
+                atoms.push(score_at_most(scoring.idf[t], tfs[t], norm));
+            }
+            false
+        }
     };
     for (members, _) in &shape.phrases {
         let m = members.len() as u32;
@@ -2038,19 +2046,62 @@ fn unseen_bound_at(
             tf = tf.min(l + 1 - m);
         }
         let idf_sum: f32 = members.iter().map(|&t| scoring.idf[t]).sum();
-        ub += score_at_most(idf_sum, tf, norm);
+        atoms.push(score_at_most(idf_sum, tf, norm));
     }
-    ub
+    // A split is optimal only up to the roundings of its gains.
+    match split {
+        true => atoms.sum * (1.0 + (8 + atoms.count) as f32 * f32::EPSILON),
+        false => atoms.at_most(),
+    }
 }
 
-/// The sum of a document's bare-term contributions.
+/// The sum of a document's bare-term contributions: up to three, the least
+/// the kernel's sum of them can round to.
 fn bare_sum(contrib: &[f32], scoring: TermMask) -> f32 {
-    contrib
-        .iter()
-        .enumerate()
-        .filter(|(t, _)| scoring & (1 << t) != 0)
-        .map(|(_, c)| c)
-        .sum()
+    let mut atoms = OrderedAtoms::default();
+    for (t, c) in contrib.iter().enumerate() {
+        if scoring & (1 << t) != 0 {
+            atoms.push(*c);
+        }
+    }
+    atoms.at_least()
+}
+
+/// A document's atoms as they are added up: their running sum, and the
+/// atoms themselves while there are few enough for the kernel's possible
+/// roundings of their sum to be computed exactly.
+#[derive(Default)]
+struct OrderedAtoms {
+    sum: f32,
+    count: usize,
+    first: [f32; ORDERED_SUM_ATOMS],
+}
+
+impl OrderedAtoms {
+    fn push(&mut self, atom: f32) {
+        if let Some(slot) = self.first.get_mut(self.count) {
+            *slot = atom;
+        }
+        self.count += 1;
+        self.sum += atom;
+    }
+
+    /// The most the kernel's sum can round to.
+    fn at_most(&self) -> f32 {
+        match self.first.get(..self.count) {
+            Some(atoms) => sum_at_most(atoms),
+            None => self.sum * (1.0 + (8 + self.count) as f32 * f32::EPSILON),
+        }
+    }
+
+    /// The least the kernel's sum can round to; past three atoms the plain
+    /// sum, which the caller narrows by its own slack.
+    fn at_least(&self) -> f32 {
+        match self.first.get(..self.count) {
+            Some(atoms) => sum_at_least(atoms),
+            None => self.sum,
+        }
+    }
 }
 
 /// How a tier entry's contribution to a query is computed: the kernel's
@@ -2333,7 +2384,7 @@ mod tests {
                     Vec::new()
                 },
                 trusted: false,
-                exact_sums: !phrase && nt <= EXACT_SUM_TERMS,
+                exact_sums: !phrase && nt <= ORDERED_SUM_ATOMS,
             };
             let baked = 2.0 + (next() % 1000) as f32 / 125.0;
             let scale_up = match baked < ORACLE_TABLE_AVGDL {
@@ -2381,9 +2432,16 @@ mod tests {
                             false => 0.0,
                         }
                     }
-                    false => (0..nt)
-                        .map(|t| score_with_dl_norm_k1(idf[t], tf(t), norm))
-                        .sum(),
+                    // Bare terms in every order the kernel may add three in.
+                    false => {
+                        let atoms: Vec<f32> = (0..nt)
+                            .map(|t| score_with_dl_norm_k1(idf[t], tf(t), norm))
+                            .collect();
+                        match *atoms.as_slice() {
+                            [a, b, c] => ((a + b) + c).max((a + c) + b).max((b + c) + a),
+                            _ => atoms.iter().sum(),
+                        }
+                    }
                 };
                 assert!(
                     score <= slot.ub,
@@ -2425,6 +2483,40 @@ mod tests {
         slot.refresh(&shape, &scoring, 10, 1.0, 1.0, &mut Scratch::default());
         let norm = scoring.norm[2];
         let best = score_with_dl_norm_k1(idf[0], 1, norm) + score_with_dl_norm_k1(idf[1], 1, norm);
+        assert_eq!(slot.ub.to_bits(), best.to_bits());
+    }
+
+    /// Three terms, the best document read under one of them: the bound is
+    /// the largest of the three roundings the kernel's sum can take, with
+    /// no slack, so a tie with a document scored the same way is skipped.
+    #[test]
+    fn a_three_term_tie_bounds_at_the_largest_pairing() {
+        let params = Bm25Params::default();
+        let idf = vec![3.1f32, 2.3, 1.7];
+        let scoring = Scoring::new(idf.clone(), params, ORACLE_TABLE_AVGDL);
+        let shape = Shape {
+            required: 0,
+            scoring: 0b111,
+            phrases: Vec::new(),
+            trusted: true,
+            exact_sums: true,
+        };
+        // Document 0 holds all three terms in three tokens; the other
+        // terms' heads show only their one-token documents.
+        let corpus = OracleCorpus {
+            lens: vec![3, 1, 1],
+            tfs: vec![vec![1, 0, 0], vec![1, 1, 0], vec![1, 0, 1]],
+        };
+        let baked = ORACLE_TABLE_AVGDL;
+        let mut slot = Slot::new(3, 1.0, None);
+        let mut depths = [3u64, 1, 1].into_iter();
+        cut_heads(&mut slot, &corpus, &scoring, baked, &mut || {
+            depths.next().unwrap_or(0)
+        });
+        slot.refresh(&shape, &scoring, 10, 1.0, 1.0, &mut Scratch::default());
+        let norm = scoring.norm[3];
+        let [a, b, c] = [0, 1, 2].map(|t| score_with_dl_norm_k1(idf[t], 1, norm));
+        let best = ((a + b) + c).max((a + c) + b).max((b + c) + a);
         assert_eq!(slot.ub.to_bits(), best.to_bits());
     }
 

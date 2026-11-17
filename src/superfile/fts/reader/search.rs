@@ -2367,7 +2367,10 @@ impl PostingCeiling {
                     atoms.push(bm25::score_at_most(*idf_sum, tf, norm));
                 }
             }
-            let bound = sum_bound(&atoms);
+            let bound = match atoms.is_empty() {
+                true => f32::NEG_INFINITY,
+                false => bm25::sum_at_most(&atoms),
+            };
             if bound > bar {
                 return f32::INFINITY;
             }
@@ -2383,23 +2386,6 @@ fn slot<'a>(term: &'a str, terms: &mut Vec<&'a str>) -> usize {
         None => {
             terms.push(term);
             terms.len() - 1
-        }
-    }
-}
-
-/// An upper bound on the kernel's sum of `atoms` in whatever order it adds
-/// them: the sum itself for two or fewer, the largest of the three pairings
-/// for three, and the sum widened by a rounding per addition past that.
-/// `NEG_INFINITY` for a document no atom matches, which no kernel returns.
-fn sum_bound(atoms: &[f32]) -> f32 {
-    match *atoms {
-        [] => f32::NEG_INFINITY,
-        [a] => a,
-        [a, b] => a + b,
-        [a, b, c] => ((a + b) + c).max((a + c) + b).max((b + c) + a),
-        _ => {
-            let sum: f32 = atoms.iter().sum();
-            sum * (1.0 + (8 + atoms.len()) as f32 * f32::EPSILON)
         }
     }
 }
